@@ -1,10 +1,39 @@
 # Erabi Roadmap
 
-The roadmap is split into focused public documents so MVP scope and later bets remain easy to review.
+This roadmap separates the implementation target from later product expansion.
 
-1. [Roadmap principles and current specification stage](roadmap/README.md)
-2. [MVP 0.1 — Crawler Studio](roadmap/01-mvp-0.1.md)
-3. [Post-MVP milestones 0.2 → 1.0](roadmap/02-post-mvp.md)
-4. [Deferred feature ledger and graduation rules](roadmap/03-feature-ledger.md)
+Erabi is specification-first. Roadmap order communicates dependency and product intent, not a promise of release dates.
 
-The roadmap describes product direction, not calendar commitments. Milestone order may change as real crawler workloads expose better priorities.
+## Roadmap documents
+
+- [MVP 0.1](roadmap/01-mvp-0.1.md) — the first implementation target.
+- [Post-MVP](roadmap/02-post-mvp.md) — capabilities intentionally deferred until the Crawler Studio core is stable.
+- [Feature Ledger](roadmap/03-feature-ledger.md) — quick scope lookup for major features.
+
+## Phase map
+
+```text
+0.1  Crawler Studio MVP
+  ↓
+0.2  Operational Automation
+  ↓
+0.3  Advanced Browser Workflows
+  ↓
+0.4  Source & Pagination Expansion
+  ↓
+0.5  Data/Export Ecosystem
+  ↓
+0.6  Intelligence Assistance
+  ↓
+0.7  Sharing & Reuse
+  ↓
+0.8  Desktop Distribution
+  ↓
+0.9  Scale & Multi-instance Foundations
+  ↓
+1.x  Research / long-term bets
+```
+
+Every milestone should have explicit outcome/exit criteria before implementation begins.
+
+Implementation plans are created separately only after the relevant specification is stable.
