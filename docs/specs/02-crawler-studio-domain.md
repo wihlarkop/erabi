@@ -18,6 +18,12 @@ Crawler
 
 Every major entity uses UUIDv7 generated application-side and represented as canonical UUID strings at API boundaries.
 
+### 1.1 Source boundary
+
+`Source` is a supporting durable identity for a web target or direct-file target encountered through Quick Scrape or retained crawl history. It may retain original/canonical URL, target type, lifecycle state, Collection association where applicable, related Crawl Runs, and artifact references.
+
+A Source is not the reusable crawling design. It MUST NOT replace a Crawler, Seed, Page Type, Dataset, or Crawl Run. Quick Scrape may create or reuse Sources without a Crawler. A Crawler Seed remains explicit versioned configuration and is never silently rewritten merely because Source metadata changes.
+
 ## 2. Crawler Version lifecycle
 
 Crawler configuration is versioned.
@@ -99,15 +105,29 @@ PageType
 
 A URL may match zero, one, or multiple Page Types.
 
-Match resolution order:
+Match resolution is lexicographic and fully explainable:
 
-1. explicit Page Type priority;
-2. matcher specificity;
-3. if still tied, mark `AMBIGUOUS_PAGE_TYPE`.
+1. higher explicit Page Type priority wins;
+2. when priorities tie, compare the best matching URL matcher using the deterministic specificity key below;
+3. when the complete specificity key ties, classify as `AMBIGUOUS_PAGE_TYPE`.
 
-Erabi MUST NOT silently choose between equally valid ambiguous Page Types.
+For MVP, matcher-kind specificity is ordered from most to least constrained:
 
-The Test Lab and Discovery Preview show all candidate matches, their priority, and why a winner was selected.
+1. exact canonical URL;
+2. exact host plus path/template constraints;
+3. path glob/prefix constraints;
+4. regular-expression matcher.
+
+Within the same matcher kind, compare in this order:
+
+1. more literal path segments;
+2. more explicit query-key/value constraints;
+3. more literal characters;
+4. fewer wildcard/capture tokens.
+
+The resulting specificity key is derived only from the validated matcher definition and MUST be persisted or reproducibly recomputed. Runtime matching MUST NOT use map iteration order, creation time, database row order, matcher insertion order, UUID ordering, or another hidden tie-breaker.
+
+Erabi MUST NOT silently choose between Page Types whose complete resolution keys tie. The Test Lab and Discovery Preview show all candidate matches, explicit priority, matcher kind, specificity components, and why a winner was selected or why ambiguity remains.
 
 ### 4.2 Unmatched URLs
 
@@ -318,5 +338,3 @@ Publish UI can use this evidence to show which Page Types and transitions have r
 ## 13. Crawler and generic-framework boundary
 
 Crawler configuration is domain-specific. Erabi will not generalize Page Types, Dataset relationships, or Studio panels into an arbitrary application-schema framework merely because they can be represented generically in code.
-
-Internal reuse is welcome; public generic-framework semantics are not an MVP goal.
