@@ -92,6 +92,18 @@ fn artifact_store_rejects_traversal_and_absolute_paths() -> Result<(), Box<dyn s
         Err(ArtifactStoreError::UnsafePath { .. })
     ));
     assert!(matches!(
+        store.write_bytes(Path::new("/outside"), "report.html", b"x"),
+        Err(ArtifactStoreError::UnsafePath { .. })
+    ));
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn artifact_store_rejects_windows_absolute_paths() -> Result<(), Box<dyn std::error::Error>> {
+    let root = TemporaryRoot::new()?;
+    let store = ArtifactStore::new(&root.path)?;
+    assert!(matches!(
         store.write_bytes(Path::new("C:\\outside"), "report.html", b"x"),
         Err(ArtifactStoreError::UnsafePath { .. })
     ));
@@ -119,6 +131,24 @@ fn artifact_store_rejects_a_symlink_escape() -> Result<(), Box<dyn std::error::E
             return Err("could not create a symbolic-link or junction test fixture".into());
         }
     }
+    let store = ArtifactStore::new(&root.path)?;
+
+    assert!(matches!(
+        store.write_bytes("escape", "report.html", b"x"),
+        Err(ArtifactStoreError::UnsafePath { .. })
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_store_rejects_a_unix_symlink_escape() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let root = TemporaryRoot::new()?;
+    let outside = TemporaryRoot::new()?;
+    let escape = root.path.join("escape");
+    symlink(&outside.path, &escape)?;
     let store = ArtifactStore::new(&root.path)?;
 
     assert!(matches!(

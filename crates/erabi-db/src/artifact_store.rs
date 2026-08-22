@@ -4,6 +4,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::fs::File;
+
 use erabi_domain::ArtifactId;
 use sha2::{Digest, Sha256};
 
@@ -106,6 +109,8 @@ impl ArtifactStore {
             let _ = fs::remove_file(&temporary_path);
             return Err(ArtifactStoreError::Io(error));
         }
+        #[cfg(unix)]
+        sync_published_directory(&parent)?;
 
         Ok(StoredArtifact {
             id,
@@ -272,6 +277,12 @@ where
     output.sync_all()?;
     drop(output);
     Ok((hex_encode(digest.finalize().as_slice()), byte_size))
+}
+
+#[cfg(unix)]
+fn sync_published_directory(directory: &Path) -> Result<(), ArtifactStoreError> {
+    File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
