@@ -121,11 +121,13 @@ Future deployment may split `serve` and `worker` modes while preserving the same
 The internal application database stores structured application/domain state:
 
 - Collections;
+- Sources and Source lifecycle/history metadata;
 - Crawlers and Crawler Versions;
 - Seeds;
 - Page Types;
 - Discovery Transitions;
 - Run Profiles;
+- Test Evidence;
 - Crawl Runs and durable jobs;
 - discovered URL metadata/status;
 - datasets/records/versions;
@@ -204,19 +206,30 @@ Saved destinations store the **name of the environment variable** containing a s
 
 Non-secret settings live in the internal database and are editable in UI.
 
-Resolution hierarchy:
+Every inheritable ordinary setting at an applicable layer uses exactly one of three explicit states:
+
+- `INHERIT` — continue to the next lower-precedence layer;
+- `CUSTOM(value)` — use the value supplied by this layer;
+- `RESET_TO_BUILT_IN` — stop inheritance and use the built-in product default.
+
+Operational setting resolution precedence is:
 
 ```text
 per-run override
-→ Run Profile / Crawler operational default
+→ Run Profile
+→ Crawler operational default
 → Collection override
 → Global setting
 → built-in default
 ```
 
+Only layers applicable to the current run participate. Quick Scrape without a Crawler skips Crawler and Run Profile layers unless equivalent ad-hoc run configuration explicitly supplies a value.
+
+`RESET_TO_BUILT_IN` is not the same as `INHERIT`: it intentionally bypasses lower-precedence stored customizations and resolves to the product built-in. Nullable values MUST NOT be used to encode both meanings implicitly.
+
 Semantic crawler configuration belongs to Crawler Version and cannot be altered by operational settings layers.
 
-Collection/global settings support explicit inheritance semantics and the UI shows the source of the active value.
+The UI shows each layer state and the source of the effective value. The immutable resolved run snapshot stores both the final value and its effective source.
 
 ## 11. Configuration snapshots
 
@@ -232,6 +245,8 @@ The snapshot is immutable for:
 Changing settings later affects only newly created runs.
 
 Configuration hashes are used to decide whether a checkpoint remains resumable.
+
+A robots override, when active, includes its explicit reason in the immutable run snapshot so retries/resume preserve the audited decision without allowing an unrelated new run to reuse it silently.
 
 ## 12. Crawl4AI adapter
 
