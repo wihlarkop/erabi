@@ -4,4 +4,6 @@ Use only [`2026-08-22-erabi-mvp-plan-index.md`](2026-08-22-erabi-mvp-plan-index.
 
 The ten active subsystem plans are numbered `2026-08-22-01-*` through `2026-08-22-10-*` and must be executed in order.
 
+Erabi's default execution workflow is **implementation-first, verification-after**: implement the scoped feature, build/check it, add or update meaningful tests, run verification/gates, then commit. TDD/RED-GREEN sequencing is not required unless the user explicitly requests it.
+
 Canonical product requirements live in `docs/specs/`. Repository-wide agent instructions live in `AGENTS.md`.
