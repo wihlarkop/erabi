@@ -9,7 +9,7 @@
 
 **PASS — no unresolved current-document contradiction remains in the audited correction scope.**
 
-July design and implementation documents are `HISTORICAL_ONLY`; they are explicitly superseded/stale and are not current implementation instructions.
+The current working tree intentionally contains only the canonical August public specification and the active August implementation-plan set. Superseded July design/plan files and temporary reconciliation design/plan documents have been removed from the working tree so coding agents have a single execution path.
 
 ## 1. Reconciliation acceptance criteria
 
@@ -23,9 +23,9 @@ July design and implementation documents are `HISTORICAL_ONLY`; they are explici
 | 6 | Direct-file URLs have a defined non-HTML path | FIXED | Confident non-HTML direct files use Source/Asset intake and do not enter HTML extraction. |
 | 7 | `SCHEMA_DRIFT` cannot bypass production trust semantics | FIXED | Production-breaking drift prevents trusted complete/missing semantics and requires new Draft/test/publish correction. |
 | 8 | Destination DB separation remains intact | PASS | Internal Erabi DB remains separate from SQLite/Turso export destinations; atomic typed publication retained. |
-| 9 | Current planning does not instruct agents to build July product | FIXED | All July plans contain `STALE — DO NOT EXECUTE`; all July designs are superseded. |
-| 10 | Replacement plans reference exact corrected spec SHA | PASS | New plan index and all subsystem plans use `679b499e617fcef14e4e40b9a7fc826b379b8a30`. |
-| 11 | Required MVP E2E journeys map to plan tasks/tests | PASS | Replacement plan 10 Task 3 enumerates every journey; related subsystem plans establish lower-level tests. |
+| 9 | Current tree exposes one implementation path to agents | PASS | Superseded July design/plans and temporary reconciliation docs are absent; `AGENTS.md` points to one spec index and one plan index. |
+| 10 | Replacement plans reference exact corrected spec SHA | PASS | Active plan index and all ten subsystem plans use `679b499e617fcef14e4e40b9a7fc826b379b8a30`. |
+| 11 | Required MVP E2E journeys map to plan tasks/tests | PASS | Active Plan 10 Task 3 enumerates every journey; related subsystem plans establish lower-level tests. |
 | 12 | Terminology audit has no unresolved role conflict | PASS | Canonical role matrix below is consistent across current August docs/plans. |
 
 ## 2. Canonical terminology matrix
@@ -46,7 +46,7 @@ July design and implementation documents are `HISTORICAL_ONLY`; they are explici
 
 ## 3. Run semantics audit
 
-**PASS.** Current documents and replacement plans use exactly:
+**PASS.** Current documents and active plans use exactly:
 
 ```text
 QUICK_SCRAPE
@@ -77,7 +77,7 @@ Normal Production Runs require Published Crawler Versions. Test Run and Discover
 
 ## 5. Required MVP E2E mapping
 
-All journeys in `docs/specs/08-ux-accessibility-and-verification.md` map to replacement Plan 10 (`2026-08-22-10-ci-e2e-and-release.md`, Task 3), with subsystem coverage as follows:
+All journeys in `docs/specs/08-ux-accessibility-and-verification.md` map to active Plan 10 (`2026-08-22-10-ci-e2e-and-release.md`, Task 3), with subsystem coverage as follows:
 
 | Journey | Primary implementation/test plan |
 |---|---|
@@ -104,16 +104,19 @@ All journeys in `docs/specs/08-ux-accessibility-and-verification.md` map to repl
 | Remote bind rejected without token | 03 Task 1, 10 Task 3 |
 | Low-storage blocks without auto-delete | 04 Task 5, 08 Task 4, 10 Task 3 |
 
-## 6. Historical-document audit
+## 6. Agent-facing tree audit
 
-**HISTORICAL_ONLY.** The following are not current contracts:
+The current implementation input surface is deliberately small:
 
-- `docs/superpowers/specs/2026-07-22-*`
-- `docs/superpowers/plans/01-*` through `12-*`
-- `docs/superpowers/plans/2026-07-22-erabi-mvp-plan-index.md`
-- `docs/superpowers/plans/2026-07-22-erabi-mvp-implementation-plan-complete.md`
+- `AGENTS.md` — repository-wide execution rules;
+- `docs/specs/README.md` — canonical product-spec entry point;
+- `docs/specs/01-*` through `08-*` — canonical product contracts;
+- `docs/ROADMAP.md` and `docs/roadmap/` — MVP/deferred boundaries;
+- `docs/superpowers/plans/2026-08-22-erabi-mvp-plan-index.md` — only implementation-plan entry point;
+- `docs/superpowers/plans/2026-08-22-01-*` through `10-*` — active ordered subsystem plans;
+- this audit document.
 
-Every July plan file contains the literal warning `STALE — DO NOT EXECUTE`. Historical content remains retrievable from Git revision `54800bb33754a07afccbd1f369f15f43a2cb3629`.
+Superseded July files are not present in the working tree. Temporary reconciliation design/plan files are also not present. Historical revisions remain available through Git history for human archaeology only and must not be treated as current implementation requirements.
 
 ## 7. Current implementation entry point
 
@@ -121,10 +124,10 @@ Use only:
 
 `docs/superpowers/plans/2026-08-22-erabi-mvp-plan-index.md`
 
-The replacement plan set is intentionally Crawler-centered, contains no independent global Schema approval subsystem, does not use Inbox as primary navigation, and does not invent a Batch run type.
+The active plan set is Crawler-centered, contains no independent global Schema approval subsystem, does not use Inbox as primary navigation, and does not invent a Batch run type.
 
 ## 8. Open findings
 
 **None in the correction scope.**
 
-Future specification changes that alter persisted data contracts, Crawler lifecycle, run semantics, approval semantics, or security invariants must repeat the reconciliation rule: update the canonical public spec first, record its exact revision, then reconcile active plans explicitly.
+Future specification changes that alter persisted data contracts, Crawler lifecycle, run semantics, approval semantics, or security invariants must update the canonical public spec first, record its exact revision, then reconcile the active plan explicitly before implementation continues.
