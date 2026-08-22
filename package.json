@@ -1,0 +1,13 @@
+{
+  "name": "erabi",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.3.14",
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "bun run --cwd apps/web dev",
+    "check": "bun scripts/verify-workspace.ts && bun run --cwd apps/web check",
+    "test": "cargo test --workspace && bun run --cwd apps/web test",
+    "build": "cargo build --workspace && bun run --cwd apps/web build"
+  }
+}
