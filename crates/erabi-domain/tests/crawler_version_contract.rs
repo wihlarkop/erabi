@@ -1,7 +1,7 @@
 use erabi_domain::{
     CanonicalizationPolicyId, Crawler, CrawlerId, CrawlerVersion, CrawlerVersionId,
-    CrawlerVersionState, DiscoveryTransitionId, DomainScopeId, OperationalOverrides, PageTypeId,
-    RunProfile, Seed,
+    CrawlerVersionState, DiscoveryTransitionId, DomainScopeId, LayerValue, OperationalOverrides,
+    PageTypeId, RunProfile, Seed,
 };
 fn seed() -> Result<Seed, url::ParseError> {
     Ok(Seed::new(
@@ -35,11 +35,6 @@ fn published_configuration_rejects_all_mutation_after_roundtrip()
     assert!(
         restored
             .set_domain_scope_id(Some(DomainScopeId::new()))
-            .is_err()
-    );
-    assert!(
-        restored
-            .set_operational_defaults(OperationalOverrides::default())
             .is_err()
     );
     assert_eq!(restored.state(), CrawlerVersionState::Published);
@@ -131,10 +126,15 @@ fn draft_configuration_workflow_uses_typed_references() -> Result<(), Box<dyn st
     version.set_transition_ids(vec![transition])?;
     version.set_canonicalization_policy_id(Some(CanonicalizationPolicyId::new()))?;
     version.set_domain_scope_id(Some(DomainScopeId::new()))?;
-    version.set_operational_defaults(OperationalOverrides {
-        max_pages: Some(5),
+    let mut crawler = Crawler::new("Operational defaults");
+    crawler.set_operational_defaults(OperationalOverrides {
+        max_pages: LayerValue::Custom(5),
         ..OperationalOverrides::default()
-    })?;
+    });
+    assert_eq!(
+        crawler.operational_defaults().max_pages,
+        LayerValue::Custom(5)
+    );
     assert_eq!(version.page_type_ids(), &[page_type]);
     assert_eq!(version.transition_ids(), &[transition]);
     let profile = RunProfile::new("Bounded", OperationalOverrides::default());

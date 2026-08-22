@@ -1,6 +1,7 @@
 //! Core, dependency-light Crawler Studio domain contracts.
 
 mod collection;
+mod crawl_snapshot;
 mod crawler;
 mod crawler_version;
 mod error;
@@ -10,6 +11,7 @@ mod naming;
 mod page_type;
 mod run_profile;
 mod seed;
+mod settings;
 mod source;
 mod status;
 mod test_evidence;
@@ -17,6 +19,10 @@ mod transition;
 mod url_matcher;
 
 pub use collection::Collection;
+pub use crawl_snapshot::{
+    CrawlRunSnapshot, CrawlRunSnapshotDraft, RobotsAudit, RobotsDecision, RunConfiguration,
+    SnapshotError, SnapshotOperationalSettings, canonical_sha256,
+};
 pub use crawler::Crawler;
 pub use crawler_version::{CrawlerVersion, CrawlerVersionState};
 pub use error::{ErrorCode, ProductError, SuggestedAction};
@@ -30,6 +36,7 @@ pub use naming::{derive_dataset_name, derive_source_name};
 pub use page_type::PageType;
 pub use run_profile::{OperationalOverrides, RunProfile};
 pub use seed::Seed;
+pub use settings::{LayerValue, ResolvedValue, SettingLayers, SettingSource};
 pub use source::Source;
 pub use status::{CrawlRunStatus, CrawlRunType, SourceStatus, SourceTargetType};
 pub use test_evidence::TestEvidence;
