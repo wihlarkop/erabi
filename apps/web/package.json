@@ -1,0 +1,25 @@
+{
+  "name": "@erabi/web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "svelte": "^5.56.10"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@types/node": "^26.2.0",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  }
+}
