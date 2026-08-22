@@ -1,6 +1,6 @@
 use crate::{
     CanonicalizationPolicyId, CrawlerId, CrawlerVersionId, DiscoveryTransitionId, DomainScopeId,
-    OperationalOverrides, PageTypeId, ProductError, Seed,
+    PageTypeId, ProductError, Seed,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -18,7 +18,6 @@ pub struct CrawlerVersion {
     transition_ids: Vec<DiscoveryTransitionId>,
     canonicalization_policy_id: Option<CanonicalizationPolicyId>,
     domain_scope_id: Option<DomainScopeId>,
-    operational_defaults: OperationalOverrides,
 }
 impl CrawlerVersion {
     #[must_use]
@@ -32,7 +31,6 @@ impl CrawlerVersion {
             transition_ids: Vec::new(),
             canonicalization_policy_id: None,
             domain_scope_id: None,
-            operational_defaults: OperationalOverrides::default(),
         }
     }
     #[must_use]
@@ -66,10 +64,6 @@ impl CrawlerVersion {
     #[must_use]
     pub const fn domain_scope_id(&self) -> Option<DomainScopeId> {
         self.domain_scope_id
-    }
-    #[must_use]
-    pub const fn operational_defaults(&self) -> &OperationalOverrides {
-        &self.operational_defaults
     }
     fn ensure_draft(&self) -> Result<(), ProductError> {
         if self.state == CrawlerVersionState::Published {
@@ -129,18 +123,6 @@ impl CrawlerVersion {
     pub fn set_domain_scope_id(&mut self, id: Option<DomainScopeId>) -> Result<(), ProductError> {
         self.ensure_draft()?;
         self.domain_scope_id = id;
-        Ok(())
-    }
-    /// Sets Draft crawler-level operational defaults.
-    ///
-    /// # Errors
-    /// Returns a conflict when the version is Published.
-    pub fn set_operational_defaults(
-        &mut self,
-        defaults: OperationalOverrides,
-    ) -> Result<(), ProductError> {
-        self.ensure_draft()?;
-        self.operational_defaults = defaults;
         Ok(())
     }
     /// Publishes a Draft and freezes its configuration.

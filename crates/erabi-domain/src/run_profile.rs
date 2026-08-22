@@ -1,14 +1,15 @@
-use crate::RunProfileId;
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+use crate::{LayerValue, RunProfileId};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OperationalOverrides {
-    pub max_pages: Option<u64>,
-    pub max_depth: Option<u32>,
-    pub max_duration_seconds: Option<u64>,
-    pub concurrency: Option<u32>,
-    pub request_delay_ms: Option<u64>,
-    pub timeout_ms: Option<u64>,
-    pub screenshot: Option<bool>,
-    pub asset_download_limit_bytes: Option<u64>,
+    pub max_pages: LayerValue<u64>,
+    pub max_depth: LayerValue<u32>,
+    pub max_duration_seconds: LayerValue<u64>,
+    pub concurrency: LayerValue<u32>,
+    pub request_delay_ms: LayerValue<u64>,
+    pub timeout_ms: LayerValue<u64>,
+    pub screenshot: LayerValue<bool>,
+    pub asset_download_limit_bytes: LayerValue<u64>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RunProfile {

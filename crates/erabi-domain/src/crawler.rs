@@ -1,5 +1,6 @@
 use crate::{
-    CollectionId, CrawlerId, CrawlerVersion, CrawlerVersionId, CrawlerVersionState, ProductError,
+    CollectionId, CrawlerId, CrawlerVersion, CrawlerVersionId, CrawlerVersionState,
+    OperationalOverrides, ProductError,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -7,6 +8,7 @@ pub struct Crawler {
     id: CrawlerId,
     pub name: String,
     collection_id: Option<CollectionId>,
+    operational_defaults: OperationalOverrides,
     active_published_version_id: Option<CrawlerVersionId>,
     active_draft_version_id: Option<CrawlerVersionId>,
 }
@@ -17,6 +19,7 @@ impl Crawler {
             id: CrawlerId::new(),
             name: name.into(),
             collection_id: None,
+            operational_defaults: OperationalOverrides::default(),
             active_published_version_id: None,
             active_draft_version_id: None,
         }
@@ -36,6 +39,17 @@ impl Crawler {
     #[must_use]
     pub const fn active_published_version_id(&self) -> Option<CrawlerVersionId> {
         self.active_published_version_id
+    }
+    #[must_use]
+    pub const fn operational_defaults(&self) -> &OperationalOverrides {
+        &self.operational_defaults
+    }
+    /// Replaces the Crawler-level operational settings layer.
+    ///
+    /// These settings are intentionally outside `CrawlerVersion`: they affect
+    /// future runs through resolution and never mutate a published version.
+    pub fn set_operational_defaults(&mut self, defaults: OperationalOverrides) {
+        self.operational_defaults = defaults;
     }
     /// Activates the sole editable version for this crawler.
     ///
