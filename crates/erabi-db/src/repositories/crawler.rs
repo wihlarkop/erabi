@@ -222,13 +222,13 @@ async fn save_draft_in_transaction(
     }
     let activated = connection
         .execute(
-            "UPDATE crawlers SET active_draft_version_id = ?1 WHERE id = ?2",
+            "UPDATE crawlers SET active_draft_version_id = ?1 WHERE id = ?2 AND (active_draft_version_id IS NULL OR active_draft_version_id = ?1)",
             (version.id().to_string(), version.crawler_id().to_string()),
         )
         .await?;
     if activated != 1 {
         return Err(DbError::Invariant(
-            "the Draft cannot be activated because its Crawler does not exist".into(),
+            "the Draft cannot be activated because the Crawler has another active Draft or does not exist".into(),
         ));
     }
     insert_audit_event(
@@ -341,6 +341,64 @@ fn serialize(value: &impl serde::Serialize) -> Result<String, DbError> {
 mod tests {
     use super::*;
     use crate::MigrationRunner;
+
+    #[tokio::test]
+    async fn activating_a_different_draft_rolls_back_without_replacing_the_active_draft()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = ErabiDatabase::in_memory().await?;
+        MigrationRunner::default().apply(&database).await?;
+        let repository = CrawlerRepository::new(&database);
+        let crawler = Crawler::new("Catalog");
+        repository.create(&crawler).await?;
+
+        let draft_a = CrawlerVersion::draft(crawler.id());
+        repository
+            .save_draft(&draft_a, "operator", "2026-08-23T00:00:00Z")
+            .await?;
+        assert_eq!(
+            repository.pointers(&crawler).await?.active_draft_version_id,
+            Some(draft_a.id().to_string())
+        );
+
+        let draft_b = CrawlerVersion::draft(crawler.id());
+        assert!(matches!(
+            repository
+                .save_draft(&draft_b, "operator", "2026-08-23T00:01:00Z")
+                .await,
+            Err(DbError::Invariant(_))
+        ));
+        assert_eq!(
+            repository.pointers(&crawler).await?.active_draft_version_id,
+            Some(draft_a.id().to_string())
+        );
+
+        let connection = database.connection().await?;
+        let draft_b_count: i64 = connection
+            .prepare("SELECT COUNT(*) FROM crawler_versions WHERE id = ?1")
+            .await?
+            .query_row([draft_b.id().to_string()])
+            .await?
+            .get(0)?;
+        assert_eq!(draft_b_count, 0);
+        let draft_b_audit_count: i64 = connection
+            .prepare(
+                "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION' AND entity_id = ?1 AND event_type = 'CRAWLER_DRAFT_ACTIVATED'",
+            )
+            .await?
+            .query_row([draft_b.id().to_string()])
+            .await?
+            .get(0)?;
+        assert_eq!(draft_b_audit_count, 0);
+
+        repository
+            .save_draft(&draft_a, "operator", "2026-08-23T00:02:00Z")
+            .await?;
+        assert_eq!(
+            repository.pointers(&crawler).await?.active_draft_version_id,
+            Some(draft_a.id().to_string())
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn published_versions_freeze_semantic_child_rows_but_not_test_evidence()
