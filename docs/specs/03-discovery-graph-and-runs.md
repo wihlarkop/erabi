@@ -16,9 +16,12 @@ All four share the same durable job, logging, progress, artifact, cancellation, 
 ### QUICK_SCRAPE
 
 - ad-hoc configuration, no Crawler Version required;
-- meant for immediate single-page exploration;
+- optimized for immediate one-URL exploration;
+- a bounded pasted URL batch is a submission envelope that creates one independent `QUICK_SCRAPE` run per accepted URL, not a fifth run type;
 - may become a saved Crawler draft later;
 - produces reviewable data and provenance.
+
+A Quick Scrape batch preserves input order and per-item validation/outcome. Each accepted URL has its own immutable run snapshot, lifecycle, artifacts, cancellation/retry state, and review result. Failure of one item does not silently roll back unrelated accepted items.
 
 ### TEST_RUN
 
@@ -62,9 +65,10 @@ A run stores at creation time:
 - crawler/crawler-version reference when applicable;
 - selected seeds;
 - Run Profile reference when applicable;
-- all resolved operational values;
+- all resolved operational values and their effective sources;
 - full crawler semantic configuration hash/snapshot reference;
 - robots policy decision;
+- robots override reason when an override is active;
 - active User-Agent;
 - Crawl4AI connection reference;
 - retention/screenshot settings;
@@ -196,7 +200,7 @@ Test Lab supports small, focused tests against a Draft Crawler Version.
 MVP capabilities:
 
 - Test URL canonicalization;
-- Test Page Type matching;
+- Test Page Type matching, including deterministic specificity rationale and ambiguity ties;
 - Test extraction;
 - Test selector coverage;
 - Test pagination detection/config;
@@ -242,7 +246,19 @@ Safe crawling is the default.
 
 ### robots.txt
 
-Erabi respects robots policy by default. An advanced explicit override may be supported when legally/operationally appropriate, but the action must be visible and audited.
+Erabi respects robots policy by default. An advanced explicit override may be supported when legally/operationally appropriate, but it requires an explicit non-empty user-provided reason before a run can be created or resumed with the override.
+
+The immutable run snapshot and audit trail store at minimum:
+
+- override decision;
+- reason;
+- actor;
+- timestamp;
+- affected origin/scope;
+- active User-Agent;
+- Crawler/Crawler Version when applicable.
+
+The UI must make the override state prominent. A prior override reason MUST NOT be silently reused for a later independent run.
 
 ### User-Agent
 
@@ -291,6 +307,8 @@ Checkpoint data includes completed/pending URLs, pagination state, failed units,
 
 Resume is allowed only when the semantic configuration required by the checkpoint still matches. Changing Page Types, transitions, canonicalization, unique keys, or extraction contracts requires a new run.
 
+A resumed run that uses a robots override still requires the override reason already captured in that run's immutable snapshot. A new independent run cannot inherit the old run's reason silently.
+
 MVP supports:
 
 - Retry Failed Parts;
@@ -308,6 +326,7 @@ A production run can be considered a complete snapshot only when all required co
 - pagination was not truncated unexpectedly;
 - critical extraction did not fail;
 - required schema/unique-key health is acceptable;
+- no production-breaking `SCHEMA_DRIFT` remains unresolved;
 - no unresolved partial task invalidates completeness;
 - run was not cancelled;
 - Page Type ambiguity affecting expected records is not unresolved.
@@ -315,6 +334,10 @@ A production run can be considered a complete snapshot only when all required co
 Only a complete snapshot may create `MISSING_CANDIDATE` records.
 
 `PARTIAL_RESULT`, `FAILED`, `CANCELLED`, `TEST_RUN`, and `DISCOVERY_PREVIEW` MUST NOT trigger missing/deletion candidates.
+
+When `SCHEMA_DRIFT` breaks required extraction or identity health in a `PRODUCTION_RUN`, Erabi may retain artifacts and diagnostic/partial results, but the run MUST NOT be treated as a trusted complete snapshot and MUST NOT use a generic `USE_ANYWAY` path to create trusted change/missing semantics. Correction requires a new Crawler Draft, applicable validation/Test Lab evidence, and a later published Crawler Version for normal production.
+
+`TEST_RUN`, `DISCOVERY_PREVIEW`, and ad-hoc Quick Scrape may inspect drift output for diagnosis. Diagnosis does not mutate or repair a published Crawler Version and does not auto-approve data.
 
 ## 14. No-change runs
 
