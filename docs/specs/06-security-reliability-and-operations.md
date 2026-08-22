@@ -45,6 +45,22 @@ JSON mutation endpoints accept `application/json`; upload endpoints explicitly a
 
 Sensitive/destructive actions such as restore backup, permanent delete, security-setting changes, and empty Trash require dedicated confirmation flows.
 
+### 3.1 Crawl safety overrides
+
+Robots policy is respected by default. A robots override is a security-relevant run decision and cannot be represented as a bare Boolean toggle.
+
+Before a run is created or resumed with a robots override, Erabi requires an explicit non-empty user-provided reason. The immutable run snapshot and durable audit history record:
+
+- the override decision;
+- the reason exactly as submitted, subject only to safe length/storage validation;
+- actor;
+- timestamp;
+- affected origin/scope;
+- active User-Agent;
+- Crawler/Crawler Version when applicable.
+
+The UI must display the active override prominently. A reason from an older independent run MUST NOT be silently copied into a new run. Retry/resume of the same immutable run may reuse the reason already frozen in that run snapshot.
+
 ## 4. Security headers
 
 Production responses use a strict security baseline including:
@@ -62,7 +78,7 @@ The sanitized crawl preview is isolated from the primary application DOM/origin 
 
 ## 5. Untrusted downloaded files
 
-All files acquired from crawled websites are untrusted.
+All files acquired from crawled websites are untrusted, including files reached directly from a pasted URL.
 
 Requirements:
 
@@ -80,7 +96,7 @@ Requirements:
 - serve downloads using attachment semantics;
 - never automatically extract archives.
 
-Executable-like content requires explicit user action and warning if download is allowed at all.
+Executable-like content requires explicit user action and warning if download is allowed at all. Direct-file URL handling MUST NOT route non-HTML content into the HTML preview/extraction pipeline merely because the URL was pasted into Start.
 
 ## 6. Log privacy and structure
 
@@ -144,6 +160,8 @@ Examples include:
 - migration/integrity failure.
 
 API errors include a user-readable message, structured details, recoverability/suggested safe actions where useful, and trace ID.
+
+For `SCHEMA_DRIFT` that breaks required extraction or identity health in production, a suggested action may lead to a new Crawler Draft/Test Lab correction. It MUST NOT offer a generic production `USE_ANYWAY` path that would restore trusted complete-snapshot or missing-record semantics without fixing and publishing the crawler configuration.
 
 ## 9. Panic isolation
 
