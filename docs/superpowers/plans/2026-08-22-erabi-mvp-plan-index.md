@@ -1,6 +1,6 @@
 # Erabi MVP Implementation Plan Index — Crawler Studio
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement these plans in order. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement these plans in numerical order using an implementation-first, verification-after workflow. Use `superpowers:executing-plans` or equivalent execution support when useful, but do not default to test-driven-development/RED-GREEN sequencing.
 
 **Goal:** Build Erabi MVP from the canonical Crawler Studio public specification using one ordered, reviewable implementation path.
 
@@ -15,20 +15,23 @@
 
 Repository-level agent instructions live in [`AGENTS.md`](../../../AGENTS.md). Read them before starting implementation.
 
-This file is the only MVP implementation-plan entry point in the current tree. Execute the ten plans below in numerical order. Every plan is written as reviewable TDD tasks with exact file ownership, interfaces, RED verification, implementation steps, GREEN verification, commit boundaries, and a plan gate.
+This file is the only MVP implementation-plan entry point in the current tree. Execute the ten plans below in numerical order. Every plan defines exact scope, file ownership, important interfaces, feature implementation requirements, verification commands, commit boundaries, and a plan gate.
 
 Execution rules:
 
-1. read the plan's referenced canonical spec sections before its first task;
-2. execute tasks and checkbox steps in order;
-3. write the specified failing test before implementing behavior;
-4. run the RED command and confirm the expected failure is caused by missing behavior—not an unrelated environment failure;
-5. implement only the scoped behavior for that task;
-6. run every GREEN command specified by the task;
-7. commit only after GREEN verification passes;
-8. run the plan gate from a clean checkout before beginning the next plan;
-9. if a plan conflicts with `docs/specs/`, stop and reconcile the plan to the canonical spec before implementing the conflict;
-10. do not use Git history, deleted documents, old branches, or roadmap-only ideas as alternate current requirements.
+1. read the plan's referenced canonical spec sections before implementation;
+2. understand the complete task/feature boundary before changing code;
+3. implement the scoped feature end-to-end first;
+4. build/compile/type-check the implementation;
+5. add or update meaningful tests after implementation for important behavior, invariants, regressions, and acceptance criteria;
+6. run all verification commands required by the task and fix failures;
+7. run formatting/linting and the plan gate before declaring completion;
+8. commit completed working features at sensible task boundaries;
+9. do not begin the next plan until the current plan gate passes from a clean checkout;
+10. if a plan conflicts with `docs/specs/`, stop and reconcile the plan to the canonical spec before implementing the conflict;
+11. do not use Git history, deleted documents, old branches, or roadmap-only ideas as alternate current requirements.
+
+Do **not** intentionally create failing tests first, perform RED/GREEN ceremony, or split a feature into artificial micro-steps merely to satisfy a TDD process. Tests are still required where specified; they verify the implemented behavior.
 
 ## Global Constraints
 
@@ -61,25 +64,6 @@ Execution rules:
 9. [SvelteKit Product UI](2026-08-22-09-sveltekit-product-ui.md)
 10. [CI, E2E, and Release](2026-08-22-10-ci-e2e-and-release.md)
 
-## Required Cross-Plan Interface Handoffs
-
-These interfaces are intentionally introduced before all implementations that consume them. Later plans extend or register implementations; they do not invent parallel contracts.
-
-| Producer | Consumer | Fixed handoff |
-|---|---|---|
-| Plan 02 | Plans 03–08 | typed repositories, immutable `RunConfigSnapshot`, resolved settings, atomic artifact store |
-| Plan 03 | Plan 04 | `Runtime` startup hooks and one `ShutdownCoordinator` checkpoint-flush/cancellation integration point |
-| Plan 04 | Plan 06 | `JobRuntime`/`JobHandler`, durable progress publisher, checkpoint/cancel/retry/resume model |
-| Plan 05 | Plan 06 | `DiscoveryPageProvider`/Discovery Engine and canonical discovery pipeline; Crawl4AI output adapts into this port rather than replacing it |
-| Plan 05 | Plan 07 | `VersionValidationContributor`; Plan 07 MUST register an extraction/Dataset/unique-key contributor after those types are introduced |
-| Plan 05 | Plans 06–07 | `SnapshotHealth`; execution and extraction/drift signals extend the final Complete/Incomplete decision |
-| Plan 06 | Plan 07 | persisted crawl page/artifact evidence and extraction-queue handoff |
-| Plan 07 | Plans 08–09 | immutable Approved Dataset/Record versions, provenance, review/candidate APIs |
-| Plans 03–08 | Plan 09 | backend API DTO/error/SSE contracts; frontend renders decisions rather than reimplementing domain resolution |
-| Plans 01–09 | Plan 10 | executable tests/routes/commands consumed by deterministic CI/E2E/release gates |
-
-When implementing Plan 07 Task 2, create an `ExtractionValidationContributor` (or equally explicit name) implementing Plan 05 `VersionValidationContributor`; it validates Page Type extraction definitions, shared Dataset compatibility, and unique-key contracts and is registered in the same `PublishValidator` used by the publish API. Plan 07's gate is not complete until a publish test proves this contributor can block invalid extraction/Dataset configuration.
-
 ## Migration Ownership
 
 Migration numbering is reserved by the plan that owns the bounded persistence model. Do not reuse or renumber an already-committed migration after implementation begins.
@@ -95,6 +79,19 @@ Migration numbering is reserved by the plan that owns the bounded persistence mo
 | `0007_assets_exports_backups.sql` | Plan 08 | Assets, Export Runs/destinations, backups, retention/integrity metadata |
 
 A later task that needs a new persisted concept after its owning migration is committed creates the next additive migration rather than editing historical migration semantics silently.
+
+## Cross-plan interface handoffs
+
+- Plan 01 defines core domain identities, Crawler/CrawlerVersion, Source, Page Type matcher primitives, lifecycle enums, and error codes.
+- Plan 02 persists those contracts and defines immutable run snapshots/settings resolution.
+- Plan 03 defines runtime/API/security/recovery boundaries consumed by later route modules.
+- Plan 04 provides durable job/progress/checkpoint services used by crawling/export/backup work.
+- Plan 05 owns Crawler Studio semantic validation and exposes `VersionValidationContributor` so later semantic modules can add publish-blocking validation without circular ownership.
+- Plan 06 installs the Crawl4AI adapter, Source intake, Quick Scrape, and production crawl execution.
+- Plan 07 defines Page Type-owned extraction/Dataset contracts and must register an `ExtractionValidationContributor` implementation with the Plan 05 publication validator for extraction, unique-key, and Dataset compatibility checks.
+- Plan 08 adds asset/export/backup persistence and workers without mixing destination database tables with Erabi internal tables.
+- Plan 09 consumes the stable `/api/v1` contracts; it does not recreate domain semantics client-side.
+- Plan 10 enforces the complete integration/release contract and all 22 canonical MVP E2E journeys.
 
 ## Fixed Domain Contracts
 
