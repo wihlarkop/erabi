@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement these plans in order. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build Erabi MVP from the canonical Crawler Studio public specification without reintroducing superseded July Source/Schema-centric contracts.
+**Goal:** Build Erabi MVP from the canonical Crawler Studio public specification using one ordered, reviewable implementation path.
 
 **Architecture:** Rust/Axum modular monolith + Tokio durable jobs + local Turso + filesystem artifacts + SvelteKit/Bun SPA + unmodified Crawl4AI HTTP adapter. `Crawler`/`CrawlerVersion` are the reusable design center; `Source` is supporting durable input/history identity.
 
@@ -10,6 +10,14 @@
 
 **Spec:** [`docs/specs/README.md`](../../specs/README.md)  
 **Spec revision:** `679b499e617fcef14e4e40b9a7fc826b379b8a30`
+
+## Agent execution contract
+
+Repository-level agent instructions live in [`AGENTS.md`](../../../AGENTS.md). Read them before starting implementation.
+
+This file is the only MVP implementation-plan entry point in the current tree. Execute the ten plans below in numerical order. Each plan has a gate; do not begin the next plan until its predecessor passes from a clean checkout.
+
+If a plan conflicts with `docs/specs/`, the canonical specification wins. Reconcile the plan before implementing the conflicting behavior. Do not use Git history as an alternative source of current product requirements.
 
 ## Global Constraints
 
@@ -27,6 +35,7 @@
 - Internal Erabi DB and export destination DBs remain separate.
 - Non-loopback bind requires `ERABI_ACCESS_TOKEN`; no telemetry by default; graceful shutdown deadline is 3 seconds.
 - Use current compatible stable dependencies at execution time; Bun is the JS package manager; commit Cargo/Bun lockfiles.
+- Roadmap-only capabilities are not implemented opportunistically.
 
 ## Execution Order
 
@@ -40,8 +49,6 @@
 8. [Assets, Exports, and Backups](2026-08-22-08-assets-exports-and-backups.md)
 9. [SvelteKit Product UI](2026-08-22-09-sveltekit-product-ui.md)
 10. [CI, E2E, and Release](2026-08-22-10-ci-e2e-and-release.md)
-
-Each plan has a gate. Do not begin the next plan until its predecessor passes from a clean checkout.
 
 ## Fixed Domain Contracts
 
@@ -69,4 +76,4 @@ TestEvidence = durable confidence evidence
 
 ## Final Definition of Done
 
-All ten plan gates pass; every required journey in `docs/specs/08-ux-accessibility-and-verification.md` is automated; Docker Compose is healthy; real Crawl4AI smoke tests pass against deterministic fixtures; no stale July plan is executed; current documentation contains no unresolved role conflict among Crawler, Source, Seed, Page Type, Dataset, and Crawl Run.
+All ten plan gates pass from a clean checkout; every required journey in `docs/specs/08-ux-accessibility-and-verification.md` is automated; Docker Compose is healthy; real Crawl4AI smoke tests pass against deterministic fixtures; current documentation contains no unresolved role conflict among Crawler, Source, Seed, Page Type, Dataset, and Crawl Run; and no deleted/superseded planning material is used as implementation input.
