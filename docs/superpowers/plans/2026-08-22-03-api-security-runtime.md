@@ -29,13 +29,14 @@
 ```text
 crates/erabi-cli/src/config.rs
 crates/erabi-cli/src/runtime.rs
-crates/erabi-cli/src/main.rs
+crates/erabi-cli/src/process_lock.rs
+crates/erabi-cli/src/startup.rs
+crates/erabi-cli/src/shutdown.rs
 crates/erabi-api/src/app.rs
 crates/erabi-api/src/error.rs
 crates/erabi-api/src/security/
 crates/erabi-api/src/routes/
 crates/erabi-api/src/openapi.rs
-crates/erabi-api/tests/
 ```
 
 ---
@@ -49,10 +50,10 @@ crates/erabi-api/tests/
 - Test: `crates/erabi-cli/tests/config_loading.rs`
 
 **Interfaces:**
-- Produces `BootstrapConfig::load()` and `BootstrapConfig::from_pairs()`.
+- Produces `BootstrapConfig::load()` / `BootstrapConfig::from_pairs()`.
 - Produces `BindMode::{Loopback, Remote}` and secret-wrapped access/Crawl4AI/Turso tokens.
 
-- [ ] **Step 1: Add stable configuration dependencies**
+- [ ] **Step 1: Add stable dependencies**
 
 ```bash
 cargo add -p erabi dotenvy
@@ -68,7 +69,7 @@ cargo add -p erabi url
 use erabi::{BootstrapConfig, ConfigError};
 
 #[test]
-fn loopback_bind_does_not_require_access_token() {
+fn loopback_does_not_require_access_token() {
     let config = BootstrapConfig::from_pairs([
         ("ERABI_HOST", "127.0.0.1"),
         ("ERABI_PORT", "7878"),
@@ -77,23 +78,16 @@ fn loopback_bind_does_not_require_access_token() {
 }
 
 #[test]
-fn remote_bind_without_token_is_rejected() {
+fn remote_without_token_is_rejected() {
     let error = BootstrapConfig::from_pairs([
         ("ERABI_HOST", "0.0.0.0"),
         ("ERABI_PORT", "7878"),
     ]).unwrap_err();
     assert!(matches!(error, ConfigError::MissingAccessToken));
 }
-
-#[test]
-fn empty_remote_token_is_rejected() {
-    let error = BootstrapConfig::from_pairs([
-        ("ERABI_HOST", "0.0.0.0"),
-        ("ERABI_ACCESS_TOKEN", ""),
-    ]).unwrap_err();
-    assert!(matches!(error, ConfigError::MissingAccessToken));
-}
 ```
+
+Add an empty-token case and invalid host/port cases.
 
 - [ ] **Step 3: Run RED**
 
@@ -104,8 +98,6 @@ cargo test -p erabi --test config_loading
 Expected: compile failure for missing configuration types.
 
 - [ ] **Step 4: Implement typed bootstrap configuration**
-
-`BootstrapConfig` fields:
 
 ```rust
 pub struct BootstrapConfig {
@@ -122,9 +114,7 @@ pub struct BootstrapConfig {
 }
 ```
 
-`load()` calls `dotenvy::dotenv().ok()` then reads OS environment so OS values override `.env`. Parse host as `IpAddr`; reject invalid/zero port and empty token values. `bind_mode()` returns Loopback only when `host.is_loopback()`.
-
-Do not derive `Debug` for secret-bearing structures unless secret fields are explicitly redacted.
+`load()` calls `dotenvy::dotenv().ok()` before OS env reads so OS env wins. Parse host as `IpAddr`; reject invalid/zero port and empty remote token. `bind_mode()` returns Loopback only for `host.is_loopback()`. Do not derive secret-revealing Debug output.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -132,12 +122,12 @@ Do not derive `Debug` for secret-bearing structures unless secret fields are exp
 cargo test -p erabi --test config_loading
 cargo clippy -p erabi --all-targets -- -D warnings
 git add Cargo.lock crates/erabi-cli
- git commit -m "feat(runtime): validate secure bootstrap configuration"
+git commit -m "feat(runtime): validate secure bootstrap configuration"
 ```
 
 ---
 
-### Task 2: Build Axum application shell, auth middleware, request hardening, and stable API errors
+### Task 2: Build the Axum shell, auth/request-hardening middleware, security headers, and stable API errors
 
 **Files:**
 - Create: `crates/erabi-api/src/app.rs`
@@ -151,7 +141,6 @@ git add Cargo.lock crates/erabi-cli
 - Test: `crates/erabi-api/tests/security_shell.rs`
 
 **Interfaces:**
-- Consumes `BootstrapConfig`, `ProductError`, database/application state.
 - Produces `build_router(AppState, SecurityConfig) -> axum::Router`.
 - Produces stable JSON `ApiErrorEnvelope`.
 
@@ -170,19 +159,13 @@ cargo add -p erabi-api --path crates/erabi-domain erabi-domain
 cargo add -p erabi-api --path crates/erabi-db erabi-db
 ```
 
-- [ ] **Step 2: Write failing HTTP security tests**
-
-Use `tower::ServiceExt::oneshot` against the router; do not open real sockets for these tests.
+- [ ] **Step 2: Write failing router-security tests using `tower::ServiceExt::oneshot`**
 
 ```rust
 #[tokio::test]
 async fn remote_router_rejects_missing_bearer_token() {
     let app = erabi_api::test_support::remote_router("secret-token").await;
-    let response = app.oneshot(
-        axum::http::Request::builder()
-            .uri("/api/v1/health")
-            .body(axum::body::Body::empty()).unwrap()
-    ).await.unwrap();
+    let response = app.oneshot(erabi_api::test_support::get("/api/v1/health")).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
 }
 
@@ -194,7 +177,7 @@ async fn loopback_router_allows_health_without_auth() {
 }
 ```
 
-Also test: wildcard CORS + bearer config is rejected during router construction; malformed mutation Content-Type returns 415; oversized JSON returns 413; disallowed Origin returns 403; security headers are present.
+Also test wildcard CORS + bearer config rejected during construction, malformed mutation Content-Type → 415, oversized JSON → 413, disallowed Origin → 403, and security headers present.
 
 - [ ] **Step 3: Run RED**
 
@@ -202,11 +185,7 @@ Also test: wildcard CORS + bearer config is rejected during router construction;
 cargo test -p erabi-api --test security_shell
 ```
 
-Expected: compile failure for missing router/security contracts.
-
-- [ ] **Step 4: Implement exact security behavior**
-
-`ApiErrorEnvelope`:
+- [ ] **Step 4: Implement exact error/security behavior**
 
 ```rust
 #[derive(serde::Serialize)]
@@ -220,9 +199,7 @@ pub struct ApiErrorEnvelope {
 }
 ```
 
-Generate a request trace UUID for every request and include it in errors/structured spans. Remote auth compares `Authorization: Bearer <token>` without logging either provided or expected token. Apply auth consistently to protected route groups; later SSE/file routes inherit the same security layer.
-
-Default CSP/security headers must reject arbitrary inline execution and include `nosniff`, restrictive referrer policy, permissions policy, and frame restrictions. Preview CSP is implemented separately in Plan 07.
+Generate a request trace UUID for each request. Compare Bearer tokens without logging either token. Protect later SSE/file routes by placing them in the same security layer. Default headers include strict CSP appropriate to app shell, `nosniff`, restrictive referrer/permissions/frame policy. Sanitized preview gets its separate stricter policy in Plan 07.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -230,12 +207,12 @@ Default CSP/security headers must reject arbitrary inline execution and include 
 cargo test -p erabi-api --test security_shell
 cargo clippy -p erabi-api --all-targets -- -D warnings
 git add Cargo.lock crates/erabi-api
- git commit -m "feat(api): add hardened Axum security shell"
+git commit -m "feat(api): add hardened Axum security shell"
 ```
 
 ---
 
-### Task 3: Implement privacy-safe structured logs, durable audit events, and robots override validation
+### Task 3: Implement redaction/audit primitives and robots override reason validation
 
 **Files:**
 - Create: `crates/erabi-api/src/security/redaction.rs`
@@ -247,37 +224,24 @@ git add Cargo.lock crates/erabi-api
 - Test: `crates/erabi-api/tests/redaction.rs`
 
 **Interfaces:**
-- Produces `RobotsOverrideInput { enabled, reason }` validation.
-- Produces `ValidatedRobotsDecision` convertible to domain `RobotsDecision`.
-- Produces redaction helpers for URLs/headers/JSON metadata.
+- Produces `RobotsOverrideInput` validation and `ValidatedRobotsDecision` convertible to Plan 02 `RobotsDecision`.
+- Produces URL/header/JSON redaction helpers.
 
 - [ ] **Step 1: Write failing robots-reason tests**
 
 ```rust
 #[tokio::test]
-async fn robots_override_requires_non_empty_reason() {
-    let app = erabi_api::test_support::loopback_router().await;
-    let response = erabi_api::test_support::post_json(
-        app,
-        "/api/v1/run-safety/validate",
-        serde_json::json!({"override_robots": true, "reason": "   "}),
-    ).await;
+async fn override_requires_non_empty_reason() {
+    let response = erabi_api::test_support::validate_robots_override("   ").await;
     assert_eq!(response.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn valid_override_returns_frozen_decision_fields() {
-    let response = erabi_api::test_support::validate_robots_override("Public research exception").await;
-    assert_eq!(response.reason, "Public research exception");
-    assert!(!response.affected_origin.is_empty());
 }
 ```
 
-Add tests that a new independent run request does not default its reason from prior history; retry/resume behavior is covered in Plan 04 against the frozen snapshot.
+Valid result must carry submitted reason, actor, timestamp, affected origin/scope, User-Agent, optional Crawler/Version IDs. A new independent run request must not inherit a previous reason.
 
 - [ ] **Step 2: Write failing redaction tests**
 
-Assert default formatting removes Authorization/Cookie values, query parameter values, secret-looking JSON fields, extracted values, and raw page content. Preserve scheme/host/path when logging URLs, replacing the query with a safe marker or omitting it.
+Assert default logs omit/redact Authorization/Cookie values, token/password/secret-like fields, body/extracted values/raw page content, and URL query values while preserving safe scheme/host/path context.
 
 - [ ] **Step 3: Run RED**
 
@@ -287,9 +251,7 @@ cargo test -p erabi-api --test robots_override --test redaction
 
 - [ ] **Step 4: Implement validation/redaction/audit append**
 
-Validate reason after trimming for emptiness; store the submitted reason text subject only to a documented max UTF-8 byte/character limit. The validated decision includes actor, timestamp, affected origin/scope, User-Agent, and optional Crawler/Crawler Version IDs before snapshot creation.
-
-Append audit events through `AuditRepository`; event payloads contain IDs/safe metadata, not bearer tokens or extracted content. Required audit categories include Crawler publication, robots override, destructive deletion/restore, security-setting changes, and diagnostic-mode enable/disable.
+Reject blank-after-trim reason; bound UTF-8 length but preserve accepted submitted text. Append audit events through `AuditRepository`; security event payloads use safe IDs/metadata only. Required categories include Crawler publication, robots override, destructive deletion/restore, security changes, diagnostic-mode enable/disable.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -297,40 +259,40 @@ Append audit events through `AuditRepository`; event payloads contain IDs/safe m
 cargo test -p erabi-api --test robots_override --test redaction
 cargo test -p erabi-api
 git add crates/erabi-api crates/erabi-db
- git commit -m "feat(security): audit crawl overrides and redact sensitive data"
+git commit -m "feat(security): audit overrides and redact sensitive data"
 ```
 
 ---
 
-### Task 4: Implement ordered startup, single-instance lock, integrity checks, and Recovery Mode
+### Task 4: Create runtime orchestration, ordered startup, process lock, integrity checks, and Recovery Mode
 
 **Files:**
+- Create: `crates/erabi-cli/src/runtime.rs`
 - Create: `crates/erabi-cli/src/process_lock.rs`
 - Create: `crates/erabi-cli/src/startup.rs`
 - Create: `crates/erabi-api/src/recovery.rs`
 - Create: `crates/erabi-api/src/routes/diagnostics.rs`
-- Modify: `crates/erabi-cli/src/runtime.rs`
 - Test: `crates/erabi-cli/tests/startup_sequence.rs`
 - Test: `crates/erabi-api/tests/recovery_mode.rs`
 
 **Interfaces:**
-- Produces `ProcessLockGuard`.
-- Produces `StartupState::{Ready, DegradedCrawlerUnavailable, RecoveryMode}`.
-- Produces read-only Recovery Mode router surface.
+- Produces `Runtime`, `ProcessLockGuard`, `StartupState::{Ready, DegradedCrawlerUnavailable, RecoveryMode}`.
+- Produces read-only Recovery Mode route surface.
+- Creates the `runtime.rs` file consumed by Plans 04 and 06.
 
-- [ ] **Step 1: Write failing startup-order and Recovery Mode tests**
+- [ ] **Step 1: Write failing startup-order and lock tests**
 
-Use an injected `StartupProbe`/fake services to record step order without depending on a real Crawl4AI server:
+Use injected fake services/`StartupProbe`:
 
 ```rust
 #[tokio::test]
-async fn startup_runs_integrity_before_workers_and_routes() {
+async fn integrity_precedes_workers_and_routes() {
     let events = erabi::test_support::run_startup_probe().await;
     assert!(events.position("integrity.checked") < events.position("runtime.started"));
 }
 ```
 
-Add tests: second process lock acquisition fails while first guard is alive; stale lock is reclaimed only after owner liveness check; migration/integrity failure enters Recovery Mode; Crawl4AI health failure results in degraded-but-usable state rather than Recovery Mode.
+Also test second live lock acquisition fails, stale lock reclaim requires owner-liveness check, migration/integrity failure → RecoveryMode, and Crawl4AI outage → DegradedCrawlerUnavailable rather than RecoveryMode.
 
 - [ ] **Step 2: Run RED**
 
@@ -341,24 +303,22 @@ cargo test -p erabi-api --test recovery_mode
 
 - [ ] **Step 3: Implement the fixed startup sequence**
 
-Implement exactly:
-
 ```text
-resolve/canonicalize data directory
+canonicalize data directory
 → acquire exclusive process lock
-→ validate bootstrap configuration
+→ validate bootstrap config
 → open DB
-→ acquire migration lock + apply migrations
-→ lightweight integrity check
-→ verify artifact directories/permissions
-→ recover stale jobs hook (Plan 04 plugs implementation here)
-→ rebuild concurrency hook
-→ health-check Crawl4AI
-→ start routes/workers
+→ migration lock + migrations
+→ lightweight integrity
+→ verify artifact directories
+→ stale-job recovery hook (Plan 04 supplies implementation)
+→ concurrency rebuild hook
+→ Crawl4AI health check
+→ routes/workers
 → readiness
 ```
 
-Process lock metadata includes PID, start time, Erabi version, and bind address. Recovery Mode exposes diagnostics, migration retry hooks, backup verify/restore hooks, and safe read-only state where possible; it rejects normal mutation/job routes and retention cleanup.
+Lock metadata includes PID, start time, Erabi version, bind address. Recovery Mode exposes only diagnostics/migration retry/backup verify-restore/safe reads where possible and rejects normal mutations/jobs/retention cleanup.
 
 - [ ] **Step 4: Run GREEN and commit**
 
@@ -366,7 +326,7 @@ Process lock metadata includes PID, start time, Erabi version, and bind address.
 cargo test -p erabi --test startup_sequence
 cargo test -p erabi-api --test recovery_mode
 git add crates/erabi-cli crates/erabi-api
- git commit -m "feat(runtime): add startup integrity and recovery mode"
+git commit -m "feat(runtime): add startup integrity and recovery mode"
 ```
 
 ---
@@ -375,33 +335,23 @@ git add crates/erabi-cli crates/erabi-api
 
 **Files:**
 - Create: `crates/erabi-cli/src/shutdown.rs`
-- Create: `crates/erabi-api/src/openapi.rs`
 - Modify: `crates/erabi-cli/src/runtime.rs`
+- Create: `crates/erabi-api/src/openapi.rs`
 - Modify: `crates/erabi-api/src/app.rs`
 - Test: `crates/erabi-cli/tests/graceful_shutdown.rs`
 - Test: `crates/erabi-api/tests/openapi_policy.rs`
 
 **Interfaces:**
-- Produces `ShutdownCoordinator` with a fixed `Duration::from_secs(3)` deadline.
+- Produces `ShutdownCoordinator` with fixed `Duration::from_secs(3)` deadline and checkpoint-flush registration hook for Plan 04.
 - Produces OpenAPI route policy based on bind mode + explicit remote opt-in.
 
 - [ ] **Step 1: Write failing shutdown tests with paused Tokio time**
 
-```rust
-#[tokio::test(start_paused = true)]
-async fn shutdown_deadline_is_three_seconds() {
-    let coordinator = erabi::ShutdownCoordinator::test_fixture();
-    let handle = tokio::spawn(async move { coordinator.shutdown().await });
-    tokio::time::advance(std::time::Duration::from_secs(3)).await;
-    assert!(handle.await.unwrap().deadline_reached_or_completed());
-}
-```
+Assert shutdown order: stop mutations/new work → signal cancellation → settle/rollback active DB transactions → invoke checkpoint hook → flush critical logs → release process lock. A long handler cannot extend the 3-second deadline.
 
-Also assert shutdown order: stop mutations/new work → signal cancellation → settle/rollback transactions → persist checkpoint hook → flush critical logs → release process lock. Long crawl work must not extend the deadline.
+- [ ] **Step 2: Write failing OpenAPI exposure tests**
 
-- [ ] **Step 2: Write OpenAPI policy tests**
-
-Loopback + default enabled exposes docs/schema. Remote bind + no explicit opt-in does not expose docs. Remote opt-in still requires bearer auth. Example payloads must be synthetic and contain no user secrets/content.
+Loopback + default exposes schema/docs. Remote without explicit opt-in returns 404/not mounted. Remote with opt-in still requires bearer auth. Generated examples contain synthetic data only.
 
 - [ ] **Step 3: Run RED**
 
@@ -410,13 +360,11 @@ cargo test -p erabi --test graceful_shutdown
 cargo test -p erabi-api --test openapi_policy
 ```
 
-- [ ] **Step 4: Implement shutdown coordinator and OpenAPI policy**
+- [ ] **Step 4: Implement shutdown/OpenAPI policy**
 
-Use one cancellation token/broadcast mechanism owned by runtime. Keep Plan 04 worker checkpointing behind a hook registered with `ShutdownCoordinator`; do not invent a second worker shutdown path later.
+Use one runtime cancellation mechanism; Plan 04 registers its worker checkpoint flush with this coordinator rather than adding a second shutdown model. Generate OpenAPI from real route contracts with a current stable compatible crate selected via `cargo add` at execution time.
 
-Generate OpenAPI from real route contracts using a current stable compatible library selected at execution time with `cargo add`; do not hand-maintain a divergent JSON schema file.
-
-- [ ] **Step 5: Run the full Plan 03 gate and commit**
+- [ ] **Step 5: Run Plan 03 gate and commit**
 
 ```bash
 cargo fmt --all --check
@@ -425,11 +373,11 @@ cargo test -p erabi-api
 cargo test -p erabi
 ```
 
-Expected: all exit 0 and cover loopback/remote auth, CORS/origin/body policy, redaction, robots reason, startup/recovery, OpenAPI remote protection, and 3-second shutdown.
+Expected: loopback/remote auth, CORS/origin/body policy, redaction, robots reason, startup/recovery, remote OpenAPI protection, and 3-second shutdown all pass.
 
 ```bash
 git add Cargo.lock crates/erabi-api crates/erabi-cli
- git commit -m "feat(runtime): enforce graceful shutdown and API exposure policy"
+git commit -m "feat(runtime): enforce shutdown and API exposure policy"
 ```
 
 ## Plan 03 Gate
