@@ -24,14 +24,25 @@ Start only from:
 
 Execute the ten linked subsystem plans in numerical order. Do not begin a later plan until the previous plan's gate passes from a clean checkout.
 
-Within a plan:
+## Implementation-first workflow
 
-1. read the canonical spec sections referenced by the task;
-2. follow the task order and TDD steps;
-3. use the Superpowers skill named by the plan when available in Codex;
-4. run the exact verification commands required by the task;
-5. commit only after verification passes;
-6. preserve task boundaries so each commit is independently reviewable.
+Erabi uses an **implementation-first, verification-after** workflow.
+
+Do not use test-driven development, RED/GREEN ceremony, or intentionally failing tests as the default implementation method. The `superpowers:test-driven-development` skill is explicitly not required for Erabi unless the user asks for TDD in a future task.
+
+Within each plan/task:
+
+1. read the referenced canonical spec and understand the complete scoped feature;
+2. implement the feature/task end-to-end within its defined boundary;
+3. build/compile/type-check the implementation;
+4. add or update meaningful tests for important behavior, invariants, regressions, and acceptance criteria after the implementation exists;
+5. run the task's verification commands and fix every real failure;
+6. run formatting, linting, tests, and the plan gate before declaring completion;
+7. commit completed working features at sensible task boundaries.
+
+Tests remain mandatory where the plan/spec requires them. What changes is sequencing: tests verify completed behavior rather than driving implementation through deliberately failing test-first cycles.
+
+Do not weaken tests, skip verification, or claim completion because implementation looks plausible.
 
 ## Conflict rule
 
