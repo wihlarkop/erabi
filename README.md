@@ -6,7 +6,7 @@
 
 Erabi is a local-first, self-hosted crawling studio for turning websites into structured, reviewable, provenance-rich datasets. It is designed for people who need more than a one-shot scraper but do not want to build and debug crawler orchestration, extraction, review, versioning, and export tooling from scratch.
 
-Erabi is currently in the **public specification / implementation-planning / pre-implementation** stage. The canonical specifications in `docs/specs/` are the source of truth for the first implementation. The current implementation plan set is derived from corrected public-spec revision `679b499e617fcef14e4e40b9a7fc826b379b8a30`; older July design/planning documents are explicitly archived as superseded/stale.
+Erabi is currently in the **public specification / implementation-planning / pre-implementation** stage. The canonical specifications in `docs/specs/` are the product source of truth. The active implementation plan set is derived from corrected public-spec revision `679b499e617fcef14e4e40b9a7fc826b379b8a30`.
 
 ## What Erabi is
 
@@ -64,19 +64,28 @@ Crawler
 
 Dependency policy: use the latest compatible **stable package release** available when implementation happens, add Rust dependencies with `cargo add`, frontend dependencies with `bun add`, and avoid alpha/beta/RC package releases or Git dependencies by default. The official `turso` crate is an explicit product decision and is paired with mandatory backup, integrity-check, and recovery safeguards.
 
-## Documentation
+## Documentation and implementation
 
-Start with the [Specification Index](docs/specs/README.md).
+For Codex or another coding agent, read [`AGENTS.md`](AGENTS.md) first.
 
-The current execution plan starts at the [2026-08-22 MVP Plan Index](docs/superpowers/plans/2026-08-22-erabi-mvp-plan-index.md).
+Product specification entry point:
 
-The [Public Spec Reconciliation Design](docs/superpowers/specs/2026-08-22-public-spec-reconciliation-design.md) records why the July design/plan set was retired.
+- [Specification Index](docs/specs/README.md)
 
-The detailed [Roadmap](docs/ROADMAP.md) separates MVP requirements from post-MVP capabilities and long-term bets.
+Implementation entry point:
+
+- [2026-08-22 MVP Plan Index](docs/superpowers/plans/2026-08-22-erabi-mvp-plan-index.md)
+
+Supporting documents:
+
+- [Specification/plan consistency audit](docs/superpowers/audits/2026-08-22-spec-plan-consistency.md)
+- [Roadmap](docs/ROADMAP.md)
+
+The current working tree intentionally contains no superseded July design or implementation-plan set. Git history remains available for archaeology, but it is not an implementation source of truth.
 
 ## Status
 
-No production implementation is claimed yet. The corrected specification and replacement implementation plans are ready for implementation; roadmap-only capabilities remain explicitly deferred.
+No production implementation is claimed yet. The corrected specification and active implementation plans are ready to execute in order; roadmap-only capabilities remain explicitly deferred.
 
 ## License
 
