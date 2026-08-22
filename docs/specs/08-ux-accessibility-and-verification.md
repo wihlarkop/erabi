@@ -64,12 +64,14 @@ Each focused test presents:
 - exact Draft Version/config hash;
 - input URL;
 - canonicalization explanation;
-- matched Page Types and specificity rationale;
+- matched Page Types and deterministic specificity rationale;
 - extraction preview;
 - selector coverage;
 - discovered links/Transition result;
 - warnings/errors;
 - saved Test Evidence.
+
+When multiple Page Types tie through the complete resolution key, Test Lab must show the competing candidates and `AMBIGUOUS_PAGE_TYPE`; it must not hide an implicit insertion/database-order winner.
 
 Users can compare relevant results against the active Published Version.
 
@@ -181,7 +183,9 @@ Progress surfaces show:
 
 Reconnect uses SSE replay to avoid losing visible progress events.
 
-## 12. Error UX
+For pasted URL batches, the batch surface shows ordered per-item status and links each accepted item to its own `QUICK_SCRAPE` run. It must not present the envelope as a fifth run type.
+
+## 12. Error and safety UX
 
 Errors use stable codes internally and useful human explanations in UI.
 
@@ -198,6 +202,12 @@ CRAWLER_UNAVAILABLE
 ```
 
 The UI should avoid exposing raw stack traces by default.
+
+A production-breaking `SCHEMA_DRIFT` must route the user toward a new Crawler Draft/Test Lab fix. The UI must not offer a generic `USE_ANYWAY` action that restores trusted complete-snapshot or missing-record semantics.
+
+A robots override control requires a non-empty reason before the run can start. The override state and reason context are visibly distinguishable from default robots-respecting operation.
+
+Settings controls for inheritable values explicitly distinguish **Inherit**, **Custom**, and **Reset to built-in** and show the effective source/value after resolution.
 
 ## 13. Testing strategy
 
@@ -230,24 +240,27 @@ Tests MUST NOT depend on arbitrary public websites for correctness.
 At minimum verify:
 
 1. first-run Start → Quick Scrape → Review;
-2. pasted URL batch;
-3. direct file URL → Asset handling;
+2. pasted URL batch → independent ordered Quick Scrape outcomes;
+3. direct file URL → Source/Asset handling without HTML extraction;
 4. Quick Scrape → Save as Crawler Draft;
 5. multi-Seed / multi-Page-Type Draft → Test Lab → Publish;
 6. Page Type ambiguity blocks publish;
-7. Discovery Preview contains a cycle without runaway traversal;
-8. external URL stays outside Domain Scope;
-9. canonicalization prevents tracking-parameter duplicate crawling;
-10. Production Run → live SSE → Cancel → recover/resume;
-11. Listing + Detail enrich shared Dataset without silent overwrite;
-12. schema drift produces diagnostics and requires a new Draft fix;
-13. record duplicate candidates are never auto-merged;
-14. complete snapshot creates missing candidates, partial snapshot does not;
-15. provenance traces an approved value to source/artifact/version;
-16. approved-only export + provenance bundle verification;
-17. backup → verify → restore;
-18. remote bind is rejected without access token;
-19. low-storage safety blocks artifact-heavy work without auto-deletion.
+7. equal-priority Page Types with equal complete specificity key remain `AMBIGUOUS_PAGE_TYPE` regardless of creation/insertion/database order;
+8. Discovery Preview contains a cycle without runaway traversal;
+9. external URL stays outside Domain Scope;
+10. canonicalization prevents tracking-parameter duplicate crawling;
+11. Production Run → live SSE → Cancel → recover/resume;
+12. robots override cannot start without a reason, and retry/resume preserves the original run reason while a new run requires an explicit reason;
+13. Listing + Detail enrich shared Dataset without silent overwrite;
+14. schema drift produces diagnostics, blocks trusted complete-snapshot semantics, and requires a new Draft fix;
+15. record duplicate candidates are never auto-merged;
+16. complete snapshot creates missing candidates, partial snapshot does not;
+17. provenance traces an approved value to source/artifact/version;
+18. approved-only export + provenance bundle verification;
+19. backup → verify → restore;
+20. setting inheritance distinguishes Inherit, Custom, and Reset to built-in across Global → Collection → Crawler → Run Profile → per-run precedence;
+21. remote bind is rejected without access token;
+22. low-storage safety blocks artifact-heavy work without auto-deletion.
 
 ## 15. Release verification gate
 

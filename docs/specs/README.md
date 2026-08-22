@@ -1,8 +1,9 @@
 # Erabi Public Specification Index
 
-**Status:** Approved product direction; implementation plan intentionally deferred until this specification stabilizes.
+**Status:** Approved product direction; corrected and reconciled before implementation-plan regeneration.
 
-**Specification date:** 2026-08-20
+**Specification date:** 2026-08-20  
+**Correction pass:** 2026-08-22
 
 This directory is the public source of truth for the Erabi Crawler Studio design. Requirements use the terms **MUST**, **SHOULD**, and **MAY** in their usual normative sense.
 
@@ -45,6 +46,7 @@ Crawler
 └── Run Profiles
 
 OPERATE
+├── Quick Scrape
 ├── Test Lab
 ├── Discovery Preview
 ├── Production Runs
@@ -65,6 +67,8 @@ CURATE
 └── Export
 ```
 
+`Source` is supporting durable input/history identity for a web or direct-file target. It is not the reusable crawler definition and does not replace Crawler, Seed, Page Type, Dataset, or Crawl Run.
+
 ## MVP boundary
 
 The MVP is deliberately broad enough to prove the complete Studio workflow, but it is not a generic browser automation platform, a hosted crawler network, or a generic admin framework.
@@ -76,17 +80,26 @@ The following are specifically **not required for MVP** and are tracked in the r
 These rules apply across every specification:
 
 - Every major entity uses UUIDv7 generated application-side.
+- `Crawler` is the primary reusable design object; `Source` is supporting input/history identity only.
 - Published crawler versions are immutable.
+- MVP has exactly four first-class run types: `QUICK_SCRAPE`, `TEST_RUN`, `DISCOVERY_PREVIEW`, and `PRODUCTION_RUN`.
+- A bounded pasted URL batch is a submission envelope over independent `QUICK_SCRAPE` runs; it is not a fifth run type.
 - Normal production runs use a published crawler version; draft versions are exercised through Test Run and Discovery Preview.
 - A Crawl Run stores an immutable resolved configuration snapshot at creation time, including queued runs.
+- Every inheritable ordinary setting uses `INHERIT`, `CUSTOM(value)`, or `RESET_TO_BUILT_IN`; effective precedence is per-run → Run Profile → Crawler operational default → Collection → Global → built-in for applicable layers.
 - Changes to global, Collection, Crawler, Run Profile, or per-run settings never mutate an existing run.
+- A robots override requires an explicit non-empty reason stored in the immutable run snapshot and durable audit history; a new independent run cannot silently reuse a prior run's reason.
+- Page Type matching uses deterministic priority/specificity keys and never hidden insertion/database order to break a complete tie.
+- Direct non-HTML file URLs follow Source/Asset handling rather than the HTML extraction pipeline.
+- Production-breaking `SCHEMA_DRIFT` cannot be bypassed into trusted complete-snapshot or missing-record semantics; correction requires a new Crawler Draft and later published version.
 - Crawl4AI is treated as a crawler engine behind an adapter. Erabi does not fork it or depend on its internal Python implementation.
 - Approved curated record versions are immutable.
 - Raw artifacts and curated data are separate; Erabi never overwrites raw evidence with curated values.
-- Missing/deleted candidates are created only from complete, healthy snapshots.
+- Missing/deleted candidates are created only from complete, healthy production snapshots.
 - Validation errors block approval and cannot be overridden. Warnings do not block approval.
 - No silent data merge, no silent field overwrite, and no silent Page Type conflict resolution.
 - Secrets come from environment variables / `.env`, not the internal database.
+- The internal Erabi application database remains separate from user dataset export destinations.
 - Default network bind is loopback. Non-loopback binding requires an access token.
 - Detailed logs redact sensitive content by default.
 - Graceful shutdown is mandatory with a three-second deadline.
@@ -99,3 +112,5 @@ These rules apply across every specification:
 Until implementation starts, specification changes are expected. When implementation planning begins, the plan must reference the exact specification revision or commit SHA it was derived from.
 
 Once implementation is in progress, a spec change that alters persisted data contracts, crawler lifecycle, run semantics, approval semantics, or security invariants must be explicitly reconciled with the active implementation plan rather than silently edited underneath it.
+
+Historical July design documents and plans under `docs/superpowers/` are not allowed to override this public specification. Replacement implementation planning must be derived from the corrected public-spec revision and must link that exact commit SHA.

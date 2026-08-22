@@ -36,6 +36,10 @@ Advanced configuration is secondary and collapsible. A first-time user should no
 
 Quick Scrape is a first-class run type. It MUST work without creating a reusable Crawler.
 
+One URL is the default Start interaction. Erabi MAY also accept a bounded pasted URL batch as a convenience submission. A batch is not a separate run type: every accepted URL creates its own independent `QUICK_SCRAPE` Crawl Run with an immutable configuration snapshot, status, artifacts, provenance, review outcome, cancellation, retry, and error history.
+
+Batch submission MUST preserve input order and return a per-item outcome. Validation or crawl failure for one URL MUST NOT silently roll back unrelated accepted items. CSV/JSONL upload, sitemap ingestion, and RSS ingestion are not part of this MVP batch contract.
+
 Quick Scrape stores the same evidence and operational metadata as other runs:
 
 - immutable resolved run configuration;
@@ -48,9 +52,28 @@ Quick Scrape stores the same evidence and operational metadata as other runs:
 
 After a useful Quick Scrape, Erabi SHOULD offer **Save as Crawler**, allowing the ad-hoc work to become a reusable Crawler draft without forcing that step up front.
 
-### 3.2 Automatic mode selection
+### 3.2 Source identity
 
-After scraping, Erabi analyzes the page and recommends one of two review modes:
+A **Source** is durable input/history identity for a web target or direct-file target encountered through Quick Scrape or retained crawl history. It may store original/canonical URL, type, lifecycle state, Collection association where applicable, related runs, and artifact references.
+
+A Source is supporting metadata, not the primary reusable crawler definition. It MUST NOT replace a Crawler, Seed, Page Type, Dataset, or Crawl Run. Quick Scrape MAY create or reuse a Source without requiring a Crawler. Crawler Seeds remain versioned Crawler configuration and are not silently rewritten from Source state.
+
+### 3.3 Direct-file URLs
+
+Before normal HTML crawling, Erabi MAY perform a bounded content-type probe when safe. A URL confidently identified as a direct PDF, CSV, JSON, archive, image, office document, or other non-HTML file follows a Source/Asset intake path rather than HTML extraction.
+
+MVP direct-file behavior:
+
+- preserve original/canonical URL and Source metadata;
+- show detected content type and a safe download action;
+- use controlled Asset storage rules when downloaded;
+- do not run HTML extraction against the file;
+- do not parse arbitrary file contents into Dataset records;
+- if probing is unavailable or ambiguous, continue through normal crawl handling and classify from the final response content type.
+
+### 3.4 Automatic mode selection
+
+After scraping HTML content, Erabi analyzes the page and recommends one of two review modes:
 
 - **Document Mode** for a primary content document such as an article, profile, or documentation page;
 - **Records Mode** for repeated containers such as products, comments, listings, table rows, directory items, or forum posts.
