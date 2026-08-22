@@ -15,9 +15,20 @@
 
 Repository-level agent instructions live in [`AGENTS.md`](../../../AGENTS.md). Read them before starting implementation.
 
-This file is the only MVP implementation-plan entry point in the current tree. Execute the ten plans below in numerical order. Each plan has a gate; do not begin the next plan until its predecessor passes from a clean checkout.
+This file is the only MVP implementation-plan entry point in the current tree. Execute the ten plans below in numerical order. Every plan is written as reviewable TDD tasks with exact file ownership, interfaces, RED verification, implementation steps, GREEN verification, commit boundaries, and a plan gate.
 
-If a plan conflicts with `docs/specs/`, the canonical specification wins. Reconcile the plan before implementing the conflicting behavior. Do not use Git history as an alternative source of current product requirements.
+Execution rules:
+
+1. read the plan's referenced canonical spec sections before its first task;
+2. execute tasks and checkbox steps in order;
+3. write the specified failing test before implementing behavior;
+4. run the RED command and confirm the expected failure is caused by missing behavior—not an unrelated environment failure;
+5. implement only the scoped behavior for that task;
+6. run every GREEN command specified by the task;
+7. commit only after GREEN verification passes;
+8. run the plan gate from a clean checkout before beginning the next plan;
+9. if a plan conflicts with `docs/specs/`, stop and reconcile the plan to the canonical spec before implementing the conflict;
+10. do not use Git history, deleted documents, old branches, or roadmap-only ideas as alternate current requirements.
 
 ## Global Constraints
 
@@ -50,6 +61,22 @@ If a plan conflicts with `docs/specs/`, the canonical specification wins. Reconc
 9. [SvelteKit Product UI](2026-08-22-09-sveltekit-product-ui.md)
 10. [CI, E2E, and Release](2026-08-22-10-ci-e2e-and-release.md)
 
+## Migration Ownership
+
+Migration numbering is reserved by the plan that owns the bounded persistence model. Do not reuse or renumber an already-committed migration after implementation begins.
+
+| Migration | Owner | Scope |
+|---|---|---|
+| `0001_system.sql` | Plan 02 | migration tracking, settings, audit/system metadata |
+| `0002_crawler_core.sql` | Plan 02 | Collections, Sources, Crawlers/Versions, Seeds, Page Types, matchers, transitions, Run Profiles, Test Evidence |
+| `0003_runs.sql` | Plan 02 | Crawl Runs, immutable snapshots, discovered URL/artifact metadata foundation |
+| `0004_jobs.sql` | Plan 04 | durable jobs, attempts, checkpoints, progress events |
+| `0005_crawl_execution.sql` | Plan 06 | crawl page results and summaries |
+| `0006_curated_data.sql` | Plan 07 | Datasets, Record versions/candidates, validation, reviews, provenance, relationships |
+| `0007_assets_exports_backups.sql` | Plan 08 | Assets, Export Runs/destinations, backups, retention/integrity metadata |
+
+A later task that needs a new persisted concept after its owning migration is committed creates the next additive migration rather than editing historical migration semantics silently.
+
 ## Fixed Domain Contracts
 
 ```text
@@ -76,4 +103,4 @@ TestEvidence = durable confidence evidence
 
 ## Final Definition of Done
 
-All ten plan gates pass from a clean checkout; every required journey in `docs/specs/08-ux-accessibility-and-verification.md` is automated; Docker Compose is healthy; real Crawl4AI smoke tests pass against deterministic fixtures; current documentation contains no unresolved role conflict among Crawler, Source, Seed, Page Type, Dataset, and Crawl Run; and no deleted/superseded planning material is used as implementation input.
+All ten plan gates pass from a clean checkout; every required journey in `docs/specs/08-ux-accessibility-and-verification.md` is automated; Docker Compose is healthy; explicit real official Crawl4AI smoke tests pass against deterministic fixtures for the exact release candidate/image digest; current documentation contains no unresolved role conflict among Crawler, Source, Seed, Page Type, Dataset, and Crawl Run; documentation topology checks expose only this active plan path; and no deleted/superseded planning material or roadmap-only capability is used as implementation input.
