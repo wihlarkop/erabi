@@ -1,10 +1,12 @@
 //! Bounded Turso persistence adapters for Erabi domain contracts.
 
+mod artifact_store;
 mod migrate;
 pub mod repositories;
 
 use std::path::Path;
 
+pub use artifact_store::{ArtifactStore, ArtifactStoreError, StoredArtifact};
 pub use migrate::{Migration, MigrationReport, MigrationRunner, SchemaVersion};
 
 /// A structured migration failure suitable for a later Recovery Mode surface.
