@@ -32,7 +32,7 @@ pub struct SpecificityKey {
     pub inverse_wildcards: Reverse<u32>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum UrlMatcher {
+enum Definition {
     ExactUrl {
         url: url::Url,
     },
@@ -53,10 +53,46 @@ pub enum UrlMatcher {
         pattern: String,
     },
 }
+#[derive(Clone, Debug)]
+pub struct UrlMatcher {
+    definition: Definition,
+}
+impl serde::Serialize for UrlMatcher {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.definition.serialize(serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for UrlMatcher {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let definition = Definition::deserialize(deserializer)?;
+        Self::validated(definition).map_err(serde::de::Error::custom)
+    }
+}
 impl UrlMatcher {
+    fn validated(definition: Definition) -> Result<Self, ProductError> {
+        match &definition {
+            Definition::PathGlob { pattern, .. } if pattern.is_empty() => {
+                Err(ProductError::conflict("URL glob cannot be empty"))
+            }
+            Definition::Regex { pattern } => {
+                regex::Regex::new(pattern)
+                    .map_err(|_| ProductError::conflict("invalid URL matcher regex"))?;
+                Ok(Self { definition })
+            }
+            _ => Ok(Self { definition }),
+        }
+    }
     #[must_use]
     pub fn exact_url(url: url::Url) -> Self {
-        Self::ExactUrl { url }
+        Self {
+            definition: Definition::ExactUrl { url },
+        }
     }
     #[must_use]
     pub fn exact_host_path_template(
@@ -64,80 +100,82 @@ impl UrlMatcher {
         path_template: impl Into<String>,
         query: BTreeMap<String, String>,
     ) -> Self {
-        Self::ExactHostPathTemplate {
-            host: host.into(),
-            path_template: path_template.into(),
-            query,
+        Self {
+            definition: Definition::ExactHostPathTemplate {
+                host: host.into(),
+                path_template: path_template.into(),
+                query,
+            },
         }
     }
     #[must_use]
     pub fn path_prefix(host: Option<String>, prefix: impl Into<String>) -> Self {
-        Self::PathPrefix {
-            host,
-            prefix: prefix.into(),
+        Self {
+            definition: Definition::PathPrefix {
+                host,
+                prefix: prefix.into(),
+            },
         }
     }
-    /// Creates a non-empty path glob matcher.
+    /// Creates a validated, non-empty path glob matcher.
     ///
     /// # Errors
-    ///
     /// Returns a conflict when the glob is empty.
     pub fn path_glob(
         host: Option<String>,
         pattern: impl Into<String>,
     ) -> Result<Self, ProductError> {
-        let pattern = pattern.into();
-        if pattern.is_empty() {
-            return Err(ProductError::conflict("URL glob cannot be empty"));
-        }
-        Ok(Self::PathGlob { host, pattern })
+        Self::validated(Definition::PathGlob {
+            host,
+            pattern: pattern.into(),
+        })
     }
     /// Creates a validated regular-expression matcher.
     ///
     /// # Errors
-    ///
     /// Returns a conflict when the expression is invalid.
     pub fn regex(pattern: impl Into<String>) -> Result<Self, ProductError> {
-        let pattern = pattern.into();
-        regex::Regex::new(&pattern)
-            .map_err(|_| ProductError::conflict("invalid URL matcher regex"))?;
-        Ok(Self::Regex { pattern })
+        Self::validated(Definition::Regex {
+            pattern: pattern.into(),
+        })
     }
     #[must_use]
     pub const fn kind(&self) -> UrlMatcherKind {
-        match self {
-            Self::ExactUrl { .. } => UrlMatcherKind::ExactUrl,
-            Self::ExactHostPathTemplate { .. } => UrlMatcherKind::ExactHostPathTemplate,
-            Self::PathPrefix { .. } | Self::PathGlob { .. } => UrlMatcherKind::PathPrefixOrGlob,
-            Self::Regex { .. } => UrlMatcherKind::Regex,
+        match self.definition {
+            Definition::ExactUrl { .. } => UrlMatcherKind::ExactUrl,
+            Definition::ExactHostPathTemplate { .. } => UrlMatcherKind::ExactHostPathTemplate,
+            Definition::PathPrefix { .. } | Definition::PathGlob { .. } => {
+                UrlMatcherKind::PathPrefixOrGlob
+            }
+            Definition::Regex { .. } => UrlMatcherKind::Regex,
         }
     }
     #[must_use]
     pub fn pattern(&self) -> String {
-        match self {
-            Self::ExactUrl { url } => url.as_str().to_owned(),
-            Self::ExactHostPathTemplate {
+        match &self.definition {
+            Definition::ExactUrl { url } => url.as_str().to_owned(),
+            Definition::ExactHostPathTemplate {
                 host,
                 path_template,
                 ..
             } => format!("{host}{path_template}"),
-            Self::PathPrefix { prefix, .. } => prefix.clone(),
-            Self::PathGlob { pattern, .. } | Self::Regex { pattern } => pattern.clone(),
+            Definition::PathPrefix { prefix, .. } => prefix.clone(),
+            Definition::PathGlob { pattern, .. } | Definition::Regex { pattern } => pattern.clone(),
         }
     }
     #[must_use]
     pub fn specificity(&self) -> SpecificityKey {
-        let path = match self {
-            Self::ExactUrl { url } => url.path(),
-            Self::ExactHostPathTemplate { path_template, .. } => path_template,
-            Self::PathPrefix { prefix, .. } => prefix,
-            Self::PathGlob { pattern, .. } | Self::Regex { pattern } => pattern,
+        let path = match &self.definition {
+            Definition::ExactUrl { url } => url.path(),
+            Definition::ExactHostPathTemplate { path_template, .. } => path_template,
+            Definition::PathPrefix { prefix, .. } => prefix,
+            Definition::PathGlob { pattern, .. } | Definition::Regex { pattern } => pattern,
         };
-        let wildcard_count =
+        let wildcards =
             path.matches('*').count() + path.matches('{').count() + path.matches('(').count();
         SpecificityKey {
             matcher_kind_rank: self.kind().rank(),
-            literal_path_segments: bounded_count(
+            literal_path_segments: count(
                 path.split('/')
                     .filter(|part| {
                         !part.is_empty()
@@ -147,28 +185,26 @@ impl UrlMatcher {
                     })
                     .count(),
             ),
-            explicit_query_constraints: match self {
-                Self::ExactUrl { url } => bounded_count(url.query_pairs().count()),
-                Self::ExactHostPathTemplate { query, .. } => bounded_count(query.len()),
+            explicit_query_constraints: match &self.definition {
+                Definition::ExactUrl { url } => count(url.query_pairs().count()),
+                Definition::ExactHostPathTemplate { query, .. } => count(query.len()),
                 _ => 0,
             },
-            literal_characters: bounded_count(
-                path.chars().filter(char::is_ascii_alphanumeric).count(),
-            ),
-            inverse_wildcards: Reverse(bounded_count(wildcard_count)),
+            literal_characters: count(path.chars().filter(char::is_ascii_alphanumeric).count()),
+            inverse_wildcards: Reverse(count(wildcards)),
         }
     }
     #[must_use]
     pub fn matches(&self, url: &url::Url) -> bool {
-        match self {
-            Self::ExactUrl { url: expected } => expected == url,
-            Self::ExactHostPathTemplate {
+        match &self.definition {
+            Definition::ExactUrl { url: expected } => expected == url,
+            Definition::ExactHostPathTemplate {
                 host,
                 path_template,
                 query,
             } => {
                 url.host_str()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(host))
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(host))
                     && template_matches(path_template, url.path())
                     && query.iter().all(|(key, value)| {
                         url.query_pairs().any(|(actual_key, actual_value)| {
@@ -176,25 +212,25 @@ impl UrlMatcher {
                         })
                     })
             }
-            Self::PathPrefix { host, prefix } => {
+            Definition::PathPrefix { host, prefix } => {
                 host.as_ref().is_none_or(|expected| {
                     url.host_str()
                         .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
                 }) && url.path().starts_with(prefix)
             }
-            Self::PathGlob { host, pattern } => {
+            Definition::PathGlob { host, pattern } => {
                 host.as_ref().is_none_or(|expected| {
                     url.host_str()
                         .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
                 }) && glob_matches(pattern, url.path())
             }
-            Self::Regex { pattern } => {
+            Definition::Regex { pattern } => {
                 regex::Regex::new(pattern).is_ok_and(|expression| expression.is_match(url.as_str()))
             }
         }
     }
 }
-fn bounded_count(value: usize) -> u32 {
+fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 fn template_matches(template: &str, actual: &str) -> bool {

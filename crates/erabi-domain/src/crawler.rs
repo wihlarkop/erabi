@@ -25,20 +25,20 @@ impl Crawler {
     ///
     /// Returns a conflict when the version is not this crawler's Draft or another Draft is active.
     pub fn activate_draft(&mut self, version: &CrawlerVersion) -> Result<(), ProductError> {
-        if version.crawler_id != self.id || version.state != CrawlerVersionState::Draft {
+        if version.crawler_id() != self.id || version.state() != CrawlerVersionState::Draft {
             return Err(ProductError::conflict(
                 "draft version does not belong to this crawler",
             ));
         }
         if self
             .active_draft_version_id
-            .is_some_and(|id| id != version.id)
+            .is_some_and(|id| id != version.id())
         {
             return Err(ProductError::conflict(
                 "crawler already has an active draft",
             ));
         }
-        self.active_draft_version_id = Some(version.id);
+        self.active_draft_version_id = Some(version.id());
         Ok(())
     }
 
@@ -48,12 +48,12 @@ impl Crawler {
     ///
     /// Returns a conflict when the version is not this crawler's Published version.
     pub fn reactivate_published(&mut self, version: &CrawlerVersion) -> Result<(), ProductError> {
-        if version.crawler_id != self.id || version.state != CrawlerVersionState::Published {
+        if version.crawler_id() != self.id || version.state() != CrawlerVersionState::Published {
             return Err(ProductError::conflict(
                 "published version does not belong to this crawler",
             ));
         }
-        self.active_published_version_id = Some(version.id);
+        self.active_published_version_id = Some(version.id());
         Ok(())
     }
 }

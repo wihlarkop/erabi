@@ -98,3 +98,48 @@ fn unmatched_url_is_preserved_as_unmatched_decision() -> Result<(), Box<dyn std:
     ));
     Ok(())
 }
+
+#[test]
+fn invalid_matchers_are_rejected_at_construction_and_deserialization() {
+    assert!(UrlMatcher::regex("[").is_err());
+    assert!(UrlMatcher::path_glob(None, "").is_err());
+    assert!(serde_json::from_str::<UrlMatcher>(r#"{"Regex":{"pattern":"["}}"#).is_err());
+    assert!(
+        serde_json::from_str::<UrlMatcher>(r#"{"PathGlob":{"host":null,"pattern":""}}"#).is_err()
+    );
+}
+
+#[test]
+fn valid_matcher_round_trips_through_serde() -> Result<(), Box<dyn std::error::Error>> {
+    let matcher = UrlMatcher::path_glob(Some("example.test".into()), "/products/*")?;
+    let restored: UrlMatcher = serde_json::from_str(&serde_json::to_string(&matcher)?)?;
+    assert_eq!(restored.pattern(), "/products/*");
+    Ok(())
+}
+
+#[test]
+fn equal_best_matcher_evidence_is_order_independent() -> Result<(), Box<dyn std::error::Error>> {
+    let a = UrlMatcher::exact_host_path_template("example.test", "/products/{id}", BTreeMap::new());
+    let b = UrlMatcher::exact_host_path_template("example.test", "/products/{xx}", BTreeMap::new());
+    let forward = PageType::new("Product", 0, vec![a.clone(), b.clone()]);
+    let reverse = PageType {
+        id: forward.id,
+        name: forward.name.clone(),
+        priority: forward.priority,
+        matchers: vec![b, a],
+    };
+    let first = resolve_page_type(&url()?, &[forward]);
+    let second = resolve_page_type(&url()?, &[reverse]);
+    assert_eq!(first, second);
+    match first {
+        PageTypeMatchDecision::Matched(candidate) => assert_eq!(
+            candidate.matched_patterns,
+            vec![
+                "example.test/products/{id}".to_owned(),
+                "example.test/products/{xx}".to_owned(),
+            ]
+        ),
+        _ => panic!("fixture must resolve to its single Page Type"),
+    }
+    Ok(())
+}
