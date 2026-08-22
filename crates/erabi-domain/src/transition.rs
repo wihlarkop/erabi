@@ -1,4 +1,4 @@
-use crate::EntityId;
+use crate::{DiscoveryTransitionId, PageTypeId, TestEvidenceId};
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionBudget {
     pub max_links_per_source_page: u32,
@@ -7,9 +7,9 @@ pub struct TransitionBudget {
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveryTransition {
-    pub id: EntityId,
-    pub source_page_type_id: EntityId,
-    pub target_page_type_id: EntityId,
+    pub id: DiscoveryTransitionId,
+    pub source_page_type_id: PageTypeId,
+    pub target_page_type_id: PageTypeId,
     pub name: String,
     pub enabled: bool,
     pub link_selector: String,
@@ -17,7 +17,7 @@ pub struct DiscoveryTransition {
     pub priority: i32,
     pub budget: TransitionBudget,
     pub deduplicate: bool,
-    pub latest_test_evidence_id: Option<EntityId>,
+    pub latest_test_evidence_id: Option<TestEvidenceId>,
 }
 impl DiscoveryTransition {
     /// Validates transition-local budget guardrails.

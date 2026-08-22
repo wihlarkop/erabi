@@ -1,7 +1,7 @@
-use crate::{EntityId, PageType, SpecificityKey, UrlMatcher, UrlMatcherKind};
+use crate::{PageType, PageTypeId, SpecificityKey, UrlMatcher, UrlMatcherKind};
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PageTypeCandidate {
-    pub page_type_id: EntityId,
+    pub page_type_id: PageTypeId,
     pub page_type_name: String,
     pub priority: i32,
     pub matcher_kind: UrlMatcherKind,

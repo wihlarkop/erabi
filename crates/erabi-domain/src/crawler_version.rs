@@ -1,30 +1,30 @@
-use crate::{EntityId, OperationalOverrides, ProductError, Seed};
-
+use crate::{
+    CanonicalizationPolicyId, CrawlerId, CrawlerVersionId, DiscoveryTransitionId, DomainScopeId,
+    OperationalOverrides, PageTypeId, ProductError, Seed,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CrawlerVersionState {
     Draft,
     Published,
 }
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CrawlerVersion {
-    id: EntityId,
-    crawler_id: EntityId,
+    id: CrawlerVersionId,
+    crawler_id: CrawlerId,
     state: CrawlerVersionState,
     seeds: Vec<Seed>,
-    page_type_ids: Vec<EntityId>,
-    transition_ids: Vec<EntityId>,
-    canonicalization_policy_id: Option<EntityId>,
-    domain_scope_id: Option<EntityId>,
+    page_type_ids: Vec<PageTypeId>,
+    transition_ids: Vec<DiscoveryTransitionId>,
+    canonicalization_policy_id: Option<CanonicalizationPolicyId>,
+    domain_scope_id: Option<DomainScopeId>,
     operational_defaults: OperationalOverrides,
 }
-
 impl CrawlerVersion {
     #[must_use]
-    pub fn draft(crawler_id: EntityId) -> Self {
+    pub fn draft(crawler_id: CrawlerId) -> Self {
         Self {
-            id: EntityId::new(),
+            id: CrawlerVersionId::new(),
             crawler_id,
             state: CrawlerVersionState::Draft,
             seeds: Vec::new(),
@@ -36,17 +36,11 @@ impl CrawlerVersion {
         }
     }
     #[must_use]
-    pub fn fixture_published() -> Self {
-        let mut version = Self::draft(EntityId::new());
-        version.state = CrawlerVersionState::Published;
-        version
-    }
-    #[must_use]
-    pub const fn id(&self) -> EntityId {
+    pub const fn id(&self) -> CrawlerVersionId {
         self.id
     }
     #[must_use]
-    pub const fn crawler_id(&self) -> EntityId {
+    pub const fn crawler_id(&self) -> CrawlerId {
         self.crawler_id
     }
     #[must_use]
@@ -58,19 +52,19 @@ impl CrawlerVersion {
         &self.seeds
     }
     #[must_use]
-    pub fn page_type_ids(&self) -> &[EntityId] {
+    pub fn page_type_ids(&self) -> &[PageTypeId] {
         &self.page_type_ids
     }
     #[must_use]
-    pub fn transition_ids(&self) -> &[EntityId] {
+    pub fn transition_ids(&self) -> &[DiscoveryTransitionId] {
         &self.transition_ids
     }
     #[must_use]
-    pub const fn canonicalization_policy_id(&self) -> Option<EntityId> {
+    pub const fn canonicalization_policy_id(&self) -> Option<CanonicalizationPolicyId> {
         self.canonicalization_policy_id
     }
     #[must_use]
-    pub const fn domain_scope_id(&self) -> Option<EntityId> {
+    pub const fn domain_scope_id(&self) -> Option<DomainScopeId> {
         self.domain_scope_id
     }
     #[must_use]
@@ -99,27 +93,30 @@ impl CrawlerVersion {
     ///
     /// # Errors
     /// Returns a conflict when the version is Published.
-    pub fn set_page_type_ids(&mut self, ids: Vec<EntityId>) -> Result<(), ProductError> {
+    pub fn set_page_type_ids(&mut self, ids: Vec<PageTypeId>) -> Result<(), ProductError> {
         self.ensure_draft()?;
         self.page_type_ids = ids;
         Ok(())
     }
-    /// Replaces Draft discovery-transition references.
+    /// Replaces Draft transition references.
     ///
     /// # Errors
     /// Returns a conflict when the version is Published.
-    pub fn set_transition_ids(&mut self, ids: Vec<EntityId>) -> Result<(), ProductError> {
+    pub fn set_transition_ids(
+        &mut self,
+        ids: Vec<DiscoveryTransitionId>,
+    ) -> Result<(), ProductError> {
         self.ensure_draft()?;
         self.transition_ids = ids;
         Ok(())
     }
-    /// Sets the Draft canonicalization-policy reference.
+    /// Sets the Draft canonicalization policy reference.
     ///
     /// # Errors
     /// Returns a conflict when the version is Published.
     pub fn set_canonicalization_policy_id(
         &mut self,
-        id: Option<EntityId>,
+        id: Option<CanonicalizationPolicyId>,
     ) -> Result<(), ProductError> {
         self.ensure_draft()?;
         self.canonicalization_policy_id = id;
@@ -129,7 +126,7 @@ impl CrawlerVersion {
     ///
     /// # Errors
     /// Returns a conflict when the version is Published.
-    pub fn set_domain_scope_id(&mut self, id: Option<EntityId>) -> Result<(), ProductError> {
+    pub fn set_domain_scope_id(&mut self, id: Option<DomainScopeId>) -> Result<(), ProductError> {
         self.ensure_draft()?;
         self.domain_scope_id = id;
         Ok(())
@@ -146,20 +143,28 @@ impl CrawlerVersion {
         self.operational_defaults = defaults;
         Ok(())
     }
-    /// Publishes this Draft and freezes its configuration.
+    /// Publishes a Draft and freezes its configuration.
     ///
     /// # Errors
-    /// Returns a conflict when the version is already Published.
+    /// Returns a conflict when already Published.
     pub fn publish(&mut self) -> Result<(), ProductError> {
         self.ensure_draft()?;
         self.state = CrawlerVersionState::Published;
         Ok(())
     }
-    #[must_use]
-    pub fn draft_from_published(&self) -> Self {
+    /// Clones an immutable Published version to a new editable Draft identity.
+    ///
+    /// # Errors
+    /// Returns a conflict when this version is not Published.
+    pub fn draft_from_published(&self) -> Result<Self, ProductError> {
+        if self.state != CrawlerVersionState::Published {
+            return Err(ProductError::conflict(
+                "only published crawler versions can create drafts",
+            ));
+        }
         let mut clone = self.clone();
-        clone.id = EntityId::new();
+        clone.id = CrawlerVersionId::new();
         clone.state = CrawlerVersionState::Draft;
-        clone
+        Ok(clone)
     }
 }

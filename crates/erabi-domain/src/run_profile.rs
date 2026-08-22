@@ -1,4 +1,4 @@
-use crate::EntityId;
+use crate::RunProfileId;
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct OperationalOverrides {
     pub max_pages: Option<u64>,
@@ -12,7 +12,7 @@ pub struct OperationalOverrides {
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RunProfile {
-    id: EntityId,
+    id: RunProfileId,
     name: String,
     overrides: OperationalOverrides,
 }
@@ -20,10 +20,14 @@ impl RunProfile {
     #[must_use]
     pub fn new(name: impl Into<String>, overrides: OperationalOverrides) -> Self {
         Self {
-            id: EntityId::new(),
+            id: RunProfileId::new(),
             name: name.into(),
             overrides,
         }
+    }
+    #[must_use]
+    pub const fn id(&self) -> RunProfileId {
+        self.id
     }
     #[must_use]
     pub fn name(&self) -> &str {

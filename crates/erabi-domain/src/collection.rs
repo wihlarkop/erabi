@@ -1,7 +1,7 @@
-use crate::EntityId;
+use crate::CollectionId;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Collection {
-    pub id: EntityId,
+    pub id: CollectionId,
     pub name: String,
     pub description: Option<String>,
     pub tags: Vec<String>,

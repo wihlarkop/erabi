@@ -1,15 +1,15 @@
-use crate::{EntityId, SourceStatus, SourceTargetType};
+use crate::{ArtifactId, CollectionId, CrawlRunId, SourceId, SourceStatus, SourceTargetType};
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Source {
-    pub id: EntityId,
-    pub collection_id: Option<EntityId>,
+    pub id: SourceId,
+    pub collection_id: Option<CollectionId>,
     pub name: String,
     pub original_url: url::Url,
     pub canonical_url: url::Url,
     pub target_type: SourceTargetType,
     pub status: SourceStatus,
-    pub run_ids: Vec<EntityId>,
-    pub artifact_ids: Vec<EntityId>,
+    pub run_ids: Vec<CrawlRunId>,
+    pub artifact_ids: Vec<ArtifactId>,
 }
 impl Source {
     #[must_use]
@@ -20,7 +20,7 @@ impl Source {
         target_type: SourceTargetType,
     ) -> Self {
         Self {
-            id: EntityId::new(),
+            id: SourceId::new(),
             collection_id: None,
             name: name.into(),
             original_url,

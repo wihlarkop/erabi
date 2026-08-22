@@ -1,10 +1,34 @@
-use erabi_domain::{CrawlRunStatus, CrawlRunType, EntityId, ErrorCode};
+use erabi_domain::{
+    ArtifactId, CanonicalizationPolicyId, CollectionId, CrawlRunId, CrawlRunStatus, CrawlRunType,
+    CrawlerId, CrawlerVersionId, DiscoveryTransitionId, DomainScopeId, ErrorCode, PageTypeId,
+    RunProfileId, SeedId, SourceId, TestEvidenceId,
+};
 
 #[test]
-fn entity_ids_are_uuid_v7_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-    let id = EntityId::new();
-    assert_eq!(id.as_uuid().get_version_num(), 7);
-    assert_eq!(id.to_string().parse::<uuid::Uuid>()?, *id.as_uuid());
+fn typed_ids_are_uuid_v7_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    macro_rules! assert_id_contract {
+        ($id_type:ty) => {{
+            let id = <$id_type>::new();
+            assert_eq!(id.as_uuid().get_version_num(), 7);
+            let restored: $id_type = serde_json::from_str(&serde_json::to_string(&id)?)?;
+            assert_eq!(restored, id);
+            assert_eq!(id.to_string().parse::<uuid::Uuid>()?, *id.as_uuid());
+        }};
+    }
+
+    assert_id_contract!(CrawlerId);
+    assert_id_contract!(CrawlerVersionId);
+    assert_id_contract!(SeedId);
+    assert_id_contract!(PageTypeId);
+    assert_id_contract!(DiscoveryTransitionId);
+    assert_id_contract!(SourceId);
+    assert_id_contract!(CollectionId);
+    assert_id_contract!(RunProfileId);
+    assert_id_contract!(TestEvidenceId);
+    assert_id_contract!(CrawlRunId);
+    assert_id_contract!(ArtifactId);
+    assert_id_contract!(CanonicalizationPolicyId);
+    assert_id_contract!(DomainScopeId);
     Ok(())
 }
 

@@ -20,7 +20,11 @@ pub use collection::Collection;
 pub use crawler::Crawler;
 pub use crawler_version::{CrawlerVersion, CrawlerVersionState};
 pub use error::{ErrorCode, ProductError, SuggestedAction};
-pub use id::EntityId;
+pub use id::{
+    ArtifactId, CanonicalizationPolicyId, CollectionId, CrawlRunId, CrawlerId, CrawlerVersionId,
+    DiscoveryTransitionId, DomainScopeId, PageTypeId, RunProfileId, SeedId, SourceId,
+    TestEvidenceId,
+};
 pub use matching::{PageTypeCandidate, PageTypeMatchDecision, resolve_page_type};
 pub use naming::{derive_dataset_name, derive_source_name};
 pub use page_type::PageType;

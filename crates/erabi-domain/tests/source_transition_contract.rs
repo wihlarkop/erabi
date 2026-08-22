@@ -1,12 +1,14 @@
 use erabi_domain::{
-    DiscoveryTransition, EntityId, Source, SourceTargetType, TransitionBudget, derive_source_name,
+    DiscoveryTransition, DiscoveryTransitionId, PageTypeId, Source, SourceTargetType,
+    TransitionBudget, derive_source_name,
 };
 #[test]
 fn budgeted_self_cycle_is_valid() {
+    let page_type = PageTypeId::new();
     let transition = DiscoveryTransition {
-        id: EntityId::new(),
-        source_page_type_id: EntityId::new(),
-        target_page_type_id: EntityId::new(),
+        id: DiscoveryTransitionId::new(),
+        source_page_type_id: page_type,
+        target_page_type_id: page_type,
         name: "pagination".into(),
         enabled: true,
         link_selector: "a[rel=next]".into(),
