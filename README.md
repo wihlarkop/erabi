@@ -6,17 +6,17 @@
 
 Erabi is a local-first, self-hosted crawling studio for turning websites into structured, reviewable, provenance-rich datasets. It is designed for people who need more than a one-shot scraper but do not want to build and debug crawler orchestration, extraction, review, versioning, and export tooling from scratch.
 
-Erabi is currently in the **public specification / pre-implementation** stage. The specifications in this repository are the source of truth for the first implementation. Implementation plans will be added only after the public specification stabilizes.
+Erabi is currently in the **public specification / implementation-planning / pre-implementation** stage. The canonical specifications in `docs/specs/` are the source of truth for the first implementation. The current implementation plan set is derived from corrected public-spec revision `679b499e617fcef14e4e40b9a7fc826b379b8a30`; older July design/planning documents are explicitly archived as superseded/stale.
 
 ## What Erabi is
 
 Erabi combines three workflows in one product:
 
 1. **Design** — define seeds, page types, URL matching, discovery transitions, canonicalization, extraction, validation, datasets, and run profiles.
-2. **Operate** — test crawler drafts, preview discovery, run published crawlers, monitor progress, inspect logs, retry/resume partial work, and compare runs.
+2. **Operate** — use Quick Scrape, test crawler drafts, preview discovery, run published crawlers, monitor progress, inspect logs, retry/resume partial work, and compare runs.
 3. **Curate** — review extracted records, resolve field conflicts, preserve field-level provenance, approve immutable versions, and export trusted data.
 
-The central reusable object is a **Crawler**. A crawler contains versioned crawling and extraction behavior. A **Crawl Run** is one immutable execution of a crawler version or an ad-hoc Quick Scrape configuration.
+The central reusable object is a **Crawler**. A crawler contains versioned crawling and extraction behavior. A **Crawl Run** is one immutable execution of a crawler version or an ad-hoc Quick Scrape configuration. A **Source** is supporting durable input/history identity for a web or direct-file target; it is not a replacement for a Crawler, Seed, Page Type, Dataset, or Crawl Run.
 
 ```text
 Crawler
@@ -68,11 +68,15 @@ Dependency policy: use the latest compatible **stable package release** availabl
 
 Start with the [Specification Index](docs/specs/README.md).
 
+The current execution plan starts at the [2026-08-22 MVP Plan Index](docs/superpowers/plans/2026-08-22-erabi-mvp-plan-index.md).
+
+The [Public Spec Reconciliation Design](docs/superpowers/specs/2026-08-22-public-spec-reconciliation-design.md) records why the July design/plan set was retired.
+
 The detailed [Roadmap](docs/ROADMAP.md) separates MVP requirements from post-MVP capabilities and long-term bets.
 
 ## Status
 
-No production implementation is claimed yet. The repository is intentionally specification-first so domain and lifecycle contracts can stabilize before implementation tasks are frozen.
+No production implementation is claimed yet. The corrected specification and replacement implementation plans are ready for implementation; roadmap-only capabilities remain explicitly deferred.
 
 ## License
 
