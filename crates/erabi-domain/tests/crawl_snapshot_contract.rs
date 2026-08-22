@@ -162,3 +162,30 @@ fn crawl_snapshot_records_auditable_crawler_version_robots_override() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn crawl_snapshot_validated_deserialization_round_trips() -> Result<(), Box<dyn std::error::Error>>
+{
+    let snapshot = CrawlRunSnapshot::new(quick_scrape_draft()?)?;
+    let restored: CrawlRunSnapshot = serde_json::from_str(&serde_json::to_string(&snapshot)?)?;
+    assert_eq!(restored, snapshot);
+    Ok(())
+}
+
+#[test]
+fn crawl_snapshot_deserialization_rejects_stale_hashes_and_invalid_robots_overrides()
+-> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = CrawlRunSnapshot::new(quick_scrape_draft()?)?;
+
+    let mut stale_hash = serde_json::to_value(&snapshot)?;
+    stale_hash["settings"]["max_pages"]["value"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<CrawlRunSnapshot>(stale_hash).is_err());
+
+    let mut invalid_override = serde_json::to_value(&snapshot)?;
+    invalid_override["robots"]["decision"] = serde_json::json!({
+        "decision": "OVERRIDE",
+        "reason": "   "
+    });
+    assert!(serde_json::from_value::<CrawlRunSnapshot>(invalid_override).is_err());
+    Ok(())
+}

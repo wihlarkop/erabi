@@ -55,6 +55,28 @@ CREATE TABLE seeds (
     entry_page_type_hint_id TEXT
 );
 
+CREATE TRIGGER seeds_published_version_no_insert
+BEFORE INSERT ON seeds
+WHEN (SELECT state FROM crawler_versions WHERE id = NEW.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER seeds_published_version_no_update
+BEFORE UPDATE ON seeds
+WHEN (SELECT state FROM crawler_versions WHERE id = OLD.crawler_version_id) = 'PUBLISHED'
+  OR (SELECT state FROM crawler_versions WHERE id = NEW.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER seeds_published_version_no_delete
+BEFORE DELETE ON seeds
+WHEN (SELECT state FROM crawler_versions WHERE id = OLD.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
 CREATE TABLE page_types (
     id TEXT PRIMARY KEY NOT NULL,
     crawler_version_id TEXT NOT NULL REFERENCES crawler_versions(id),
@@ -62,6 +84,28 @@ CREATE TABLE page_types (
     priority INTEGER NOT NULL,
     configuration_json TEXT NOT NULL
 );
+
+CREATE TRIGGER page_types_published_version_no_insert
+BEFORE INSERT ON page_types
+WHEN (SELECT state FROM crawler_versions WHERE id = NEW.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER page_types_published_version_no_update
+BEFORE UPDATE ON page_types
+WHEN (SELECT state FROM crawler_versions WHERE id = OLD.crawler_version_id) = 'PUBLISHED'
+  OR (SELECT state FROM crawler_versions WHERE id = NEW.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER page_types_published_version_no_delete
+BEFORE DELETE ON page_types
+WHEN (SELECT state FROM crawler_versions WHERE id = OLD.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
 
 CREATE TABLE url_matchers (
     id TEXT PRIMARY KEY NOT NULL,
@@ -71,11 +115,67 @@ CREATE TABLE url_matchers (
     UNIQUE (page_type_id, ordinal)
 );
 
+CREATE TRIGGER url_matchers_published_version_no_insert
+BEFORE INSERT ON url_matchers
+WHEN (SELECT crawler_versions.state
+      FROM page_types
+      JOIN crawler_versions ON crawler_versions.id = page_types.crawler_version_id
+      WHERE page_types.id = NEW.page_type_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER url_matchers_published_version_no_update
+BEFORE UPDATE ON url_matchers
+WHEN (SELECT crawler_versions.state
+      FROM page_types
+      JOIN crawler_versions ON crawler_versions.id = page_types.crawler_version_id
+      WHERE page_types.id = OLD.page_type_id) = 'PUBLISHED'
+  OR (SELECT crawler_versions.state
+      FROM page_types
+      JOIN crawler_versions ON crawler_versions.id = page_types.crawler_version_id
+      WHERE page_types.id = NEW.page_type_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER url_matchers_published_version_no_delete
+BEFORE DELETE ON url_matchers
+WHEN (SELECT crawler_versions.state
+      FROM page_types
+      JOIN crawler_versions ON crawler_versions.id = page_types.crawler_version_id
+      WHERE page_types.id = OLD.page_type_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
 CREATE TABLE discovery_transitions (
     id TEXT PRIMARY KEY NOT NULL,
     crawler_version_id TEXT NOT NULL REFERENCES crawler_versions(id),
     configuration_json TEXT NOT NULL
 );
+
+CREATE TRIGGER discovery_transitions_published_version_no_insert
+BEFORE INSERT ON discovery_transitions
+WHEN (SELECT state FROM crawler_versions WHERE id = NEW.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER discovery_transitions_published_version_no_update
+BEFORE UPDATE ON discovery_transitions
+WHEN (SELECT state FROM crawler_versions WHERE id = OLD.crawler_version_id) = 'PUBLISHED'
+  OR (SELECT state FROM crawler_versions WHERE id = NEW.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
+
+CREATE TRIGGER discovery_transitions_published_version_no_delete
+BEFORE DELETE ON discovery_transitions
+WHEN (SELECT state FROM crawler_versions WHERE id = OLD.crawler_version_id) = 'PUBLISHED'
+BEGIN
+    SELECT RAISE(ABORT, 'published crawler version semantic rows are immutable');
+END;
 
 CREATE TABLE run_profiles (
     id TEXT PRIMARY KEY NOT NULL,

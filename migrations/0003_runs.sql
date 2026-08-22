@@ -12,7 +12,7 @@ CREATE TABLE crawl_runs (
 );
 
 CREATE TRIGGER crawl_runs_snapshot_immutable
-BEFORE UPDATE OF snapshot_json, snapshot_hash, checkpoint_compatibility_hash ON crawl_runs
+BEFORE UPDATE OF run_type, crawler_id, crawler_version_id, snapshot_json, snapshot_hash, checkpoint_compatibility_hash, actor, created_at ON crawl_runs
 BEGIN
     SELECT RAISE(ABORT, 'crawl run snapshots are immutable');
 END;

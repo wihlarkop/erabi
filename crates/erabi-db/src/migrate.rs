@@ -157,7 +157,7 @@ impl MigrationRunner {
     /// # Errors
     /// Returns a Turso error when schema tracking cannot be read.
     pub async fn status(&self, database: &ErabiDatabase) -> Result<Vec<SchemaVersion>, DbError> {
-        let connection = database.connection()?;
+        let connection = database.connection().await?;
         connection.execute_batch(BOOTSTRAP_SQL).await?;
         read_schema_versions(&connection).await
     }
@@ -168,7 +168,7 @@ impl MigrationRunner {
         last_version: Option<&str>,
     ) -> Result<MigrationReport, DbError> {
         self.validate_plan()?;
-        let mut connection = database.connection()?;
+        let mut connection = database.connection().await?;
         connection.execute_batch(BOOTSTRAP_SQL).await?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)

@@ -67,7 +67,9 @@ async fn repositories_preserve_published_version_and_run_snapshot_immutability()
     let mut crawler = Crawler::new("Catalog");
     crawler_repository.create(&crawler).await?;
     let mut version = CrawlerVersion::draft(crawler.id());
-    crawler_repository.save_draft(&version).await?;
+    crawler_repository
+        .save_draft(&version, "operator", "2026-08-23T00:00:00Z")
+        .await?;
     version.publish()?;
     crawler.reactivate_published(&version)?;
     crawler_repository
@@ -85,10 +87,12 @@ async fn repositories_preserve_published_version_and_run_snapshot_immutability()
         crawler_repository
             .audit_event_count(&version.id().to_string())
             .await?,
-        1
+        2
     );
     assert!(matches!(
-        crawler_repository.save_draft(&version).await,
+        crawler_repository
+            .save_draft(&version, "operator", "2026-08-23T00:00:00Z")
+            .await,
         Err(DbError::Invariant(_))
     ));
 

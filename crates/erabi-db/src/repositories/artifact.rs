@@ -29,7 +29,7 @@ impl<'database> ArtifactRepository<'database> {
     ) -> Result<(), DbError> {
         let metadata = serde_json::to_string(metadata)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         connection
             .execute(
                 "INSERT INTO artifacts (id, crawl_run_id, source_id, content_hash, byte_size, media_type, safe_relative_path, created_at, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -59,7 +59,7 @@ impl<'database> ArtifactRepository<'database> {
         &self,
         id: erabi_domain::ArtifactId,
     ) -> Result<String, DbError> {
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         let row = connection
             .prepare("SELECT safe_relative_path FROM artifacts WHERE id = ?1")
             .await?

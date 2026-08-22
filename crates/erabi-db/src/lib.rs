@@ -70,7 +70,15 @@ impl ErabiDatabase {
         Ok(Self { database })
     }
 
-    pub(crate) fn connection(&self) -> Result<turso::Connection, DbError> {
-        Ok(self.database.connect()?)
+    /// Opens a connection with Erabi's required per-connection invariants.
+    ///
+    /// Foreign-key enforcement is connection-local in SQLite/Turso, so every
+    /// repository and migration connection must enable it before issuing normal
+    /// SQL. Keeping this factory crate-private prevents callers from obtaining
+    /// an uninitialized raw connection through the persistence boundary.
+    pub(crate) async fn connection(&self) -> Result<turso::Connection, DbError> {
+        let connection = self.database.connect()?;
+        connection.pragma_update("foreign_keys", "ON").await?;
+        Ok(connection)
     }
 }

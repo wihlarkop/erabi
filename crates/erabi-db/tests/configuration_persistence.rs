@@ -77,7 +77,8 @@ async fn configuration_secrets_are_rejected_and_destination_keeps_only_env_name(
     assert_eq!(stored, Some(destination));
     assert_eq!(
         stored
-            .and_then(|destination| destination.secret_environment_variable_name)
+            .as_ref()
+            .and_then(|destination| destination.secret_environment_variable_name())
             .map(|name| name.as_str().to_owned()),
         Some("TURSO_AUTH_TOKEN".into())
     );
@@ -118,4 +119,38 @@ fn configuration_bootstrap_defaults_to_telemetry_off_and_secret_names_only()
         "ERABI_ACCESS_TOKEN"
     );
     Ok(())
+}
+
+#[test]
+fn configuration_rejects_secret_shaped_values_from_constructors_and_deserialization() {
+    assert!(
+        PersistedSetting::new(
+            SettingScope::Global,
+            "request_policy",
+            LayerValue::Custom(serde_json::json!({"nested_token": "never-persist-this"})),
+            "2026-08-23T00:00:00Z",
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<PersistedSetting>(serde_json::json!({
+            "scope": "GLOBAL",
+            "key": "request_policy",
+            "value": {"CUSTOM": {"api_key": "never-persist-this"}},
+            "updated_at": "2026-08-23T00:00:00Z"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<PersistedDestination>(serde_json::json!({
+            "id": "destination-1",
+            "name": "Remote Turso",
+            "destination_kind": "TURSO",
+            "configuration": {"password": "never-persist-this"},
+            "secret_environment_variable_name": null,
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z"
+        }))
+        .is_err()
+    );
 }

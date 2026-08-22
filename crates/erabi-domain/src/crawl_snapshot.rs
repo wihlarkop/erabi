@@ -164,8 +164,22 @@ pub struct CrawlRunSnapshotDraft {
 }
 
 /// A fully resolved, immutable snapshot used for execution, retry, resume, and audit.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CrawlRunSnapshot {
+    run_type: CrawlRunType,
+    configuration: RunConfiguration,
+    selected_seed_ids: Vec<SeedId>,
+    run_profile_id: Option<RunProfileId>,
+    settings: SnapshotOperationalSettings,
+    robots: RobotsAudit,
+    actor: String,
+    created_at: String,
+    snapshot_hash: String,
+    checkpoint_compatibility_hash: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CrawlRunSnapshotWire {
     run_type: CrawlRunType,
     configuration: RunConfiguration,
     selected_seed_ids: Vec<SeedId>,
@@ -210,6 +224,25 @@ impl CrawlRunSnapshot {
             snapshot_hash,
             checkpoint_compatibility_hash,
         })
+    }
+
+    fn rehydrate(
+        draft: CrawlRunSnapshotDraft,
+        stored_snapshot_hash: &str,
+        stored_checkpoint_compatibility_hash: &str,
+    ) -> Result<Self, SnapshotError> {
+        let snapshot = Self::new(draft)?;
+        if snapshot.snapshot_hash != stored_snapshot_hash {
+            return Err(SnapshotError::Invalid(
+                "stored snapshot hash does not match the canonical snapshot".into(),
+            ));
+        }
+        if snapshot.checkpoint_compatibility_hash != stored_checkpoint_compatibility_hash {
+            return Err(SnapshotError::Invalid(
+                "stored checkpoint compatibility hash does not match the canonical snapshot".into(),
+            ));
+        }
+        Ok(snapshot)
     }
 
     #[must_use]
@@ -260,6 +293,30 @@ impl CrawlRunSnapshot {
     #[must_use]
     pub fn checkpoint_compatibility_hash(&self) -> &str {
         &self.checkpoint_compatibility_hash
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CrawlRunSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <CrawlRunSnapshotWire as serde::Deserialize>::deserialize(deserializer)?;
+        Self::rehydrate(
+            CrawlRunSnapshotDraft {
+                run_type: wire.run_type,
+                configuration: wire.configuration,
+                selected_seed_ids: wire.selected_seed_ids,
+                run_profile_id: wire.run_profile_id,
+                settings: wire.settings,
+                robots: wire.robots,
+                actor: wire.actor,
+                created_at: wire.created_at,
+            },
+            &wire.snapshot_hash,
+            &wire.checkpoint_compatibility_hash,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -346,7 +403,13 @@ fn validate_draft(draft: &CrawlRunSnapshotDraft) -> Result<(), SnapshotError> {
     }
 
     match (&draft.run_type, &draft.configuration) {
-        (CrawlRunType::QuickScrape, RunConfiguration::QuickScrape { .. }) => {}
+        (CrawlRunType::QuickScrape, RunConfiguration::QuickScrape { .. }) => {
+            if draft.robots.crawler_version_id().is_some() {
+                return Err(SnapshotError::Invalid(
+                    "Quick Scrape robots audit cannot reference a CrawlerVersion".into(),
+                ));
+            }
+        }
         (CrawlRunType::QuickScrape, RunConfiguration::CrawlerVersion { .. }) => {
             return Err(SnapshotError::Invalid(
                 "QUICK_SCRAPE requires an ad-hoc Quick Scrape configuration".into(),

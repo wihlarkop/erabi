@@ -21,9 +21,10 @@ impl<'database> ConfigurationRepository<'database> {
     /// # Errors
     /// Returns an error when serialization or persistence fails.
     pub async fn save_setting(&self, setting: &PersistedSetting) -> Result<(), ConfigurationError> {
-        let (scope_type, scope_id) = setting.scope.database_parts();
-        let (state, value_json) = layer_value_parts(&setting.value)?;
-        let connection = self.database.connection()?;
+        setting.validate()?;
+        let (scope_type, scope_id) = setting.scope().database_parts();
+        let (state, value_json) = layer_value_parts(setting.value())?;
+        let connection = self.database.connection().await?;
         connection
             .execute(
                 "INSERT INTO settings (id, scope_type, scope_id, setting_key, state, value_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET state = excluded.state, value_json = excluded.value_json, updated_at = excluded.updated_at",
@@ -31,10 +32,10 @@ impl<'database> ConfigurationRepository<'database> {
                     setting.id(),
                     scope_type,
                     scope_id.map_or(turso::Value::Null, |value| turso::Value::Text(value.to_owned())),
-                    setting.key.as_str(),
+                    setting.key(),
                     state,
                     value_json.map_or(turso::Value::Null, turso::Value::Text),
-                    setting.updated_at.as_str(),
+                    setting.updated_at(),
                 ),
             )
             .await?;
@@ -57,7 +58,7 @@ impl<'database> ConfigurationRepository<'database> {
             "query",
         )?
         .id();
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         let mut rows = connection
             .query(
                 "SELECT scope_type, scope_id, setting_key, state, value_json, updated_at FROM settings WHERE id = ?1",
@@ -73,12 +74,12 @@ impl<'database> ConfigurationRepository<'database> {
         let state: String = row.get(3)?;
         let value_json: Option<String> = row.get(4)?;
         let updated_at: String = row.get(5)?;
-        Ok(Some(PersistedSetting {
-            scope: SettingScope::from_database_parts(&scope_type, scope_id.as_deref())?,
+        Ok(Some(PersistedSetting::new(
+            SettingScope::from_database_parts(&scope_type, scope_id.as_deref())?,
             key,
-            value: layer_value_from_parts(&state, value_json)?,
+            layer_value_from_parts(&state, value_json)?,
             updated_at,
-        }))
+        )?))
     }
 
     /// Saves a destination configuration that references secrets only by environment-variable name.
@@ -90,20 +91,21 @@ impl<'database> ConfigurationRepository<'database> {
         &self,
         destination: &PersistedDestination,
     ) -> Result<(), ConfigurationError> {
-        let configuration = serde_json::to_string(&destination.configuration)
+        destination.validate()?;
+        let configuration = serde_json::to_string(destination.configuration())
             .map_err(|error| ConfigurationError::Serialization(error.to_string()))?;
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         connection
             .execute(
                 "INSERT INTO persisted_destinations (id, name, destination_kind, configuration_json, secret_environment_variable_name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET name = excluded.name, destination_kind = excluded.destination_kind, configuration_json = excluded.configuration_json, secret_environment_variable_name = excluded.secret_environment_variable_name, updated_at = excluded.updated_at",
                 (
-                    destination.id.as_str(),
-                    destination.name.as_str(),
-                    destination.destination_kind.as_str(),
+                    destination.id(),
+                    destination.name(),
+                    destination.destination_kind(),
                     configuration,
-                    destination.secret_environment_variable_name.as_ref().map_or(turso::Value::Null, |value| turso::Value::Text(value.as_str().to_owned())),
-                    destination.created_at.as_str(),
-                    destination.updated_at.as_str(),
+                    destination.secret_environment_variable_name().map_or(turso::Value::Null, |value| turso::Value::Text(value.as_str().to_owned())),
+                    destination.created_at(),
+                    destination.updated_at(),
                 ),
             )
             .await?;
@@ -118,7 +120,7 @@ impl<'database> ConfigurationRepository<'database> {
         &self,
         id: &str,
     ) -> Result<Option<PersistedDestination>, ConfigurationError> {
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         let mut rows = connection
             .query(
                 "SELECT name, destination_kind, configuration_json, secret_environment_variable_name, created_at, updated_at FROM persisted_destinations WHERE id = ?1",
@@ -158,7 +160,7 @@ impl<'database> ConfigurationRepository<'database> {
         &self,
         ownership: &LocalDataOwnership,
     ) -> Result<(), ConfigurationError> {
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         connection
             .execute(
                 "INSERT INTO local_data_owners (canonical_data_directory, process_id, started_at, erabi_version, bind_address, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(canonical_data_directory) DO UPDATE SET process_id = excluded.process_id, started_at = excluded.started_at, erabi_version = excluded.erabi_version, bind_address = excluded.bind_address, updated_at = excluded.updated_at",
@@ -183,7 +185,7 @@ impl<'database> ConfigurationRepository<'database> {
         &self,
         canonical_data_directory: &str,
     ) -> Result<Option<LocalDataOwnership>, ConfigurationError> {
-        let connection = self.database.connection()?;
+        let connection = self.database.connection().await?;
         let mut rows = connection
             .query(
                 "SELECT process_id, started_at, erabi_version, bind_address, updated_at FROM local_data_owners WHERE canonical_data_directory = ?1",

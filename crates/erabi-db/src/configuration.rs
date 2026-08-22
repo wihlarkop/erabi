@@ -22,7 +22,7 @@ impl From<turso::Error> for ConfigurationError {
 }
 
 /// The name of an environment variable that contains a secret; never the secret value.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(transparent)]
 pub struct SecretEnvironmentVariableName(String);
 
@@ -58,6 +58,17 @@ impl SecretEnvironmentVariableName {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for SecretEnvironmentVariableName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <String as serde::Deserialize>::deserialize(deserializer)
+            .map_err(serde::de::Error::custom)
+            .and_then(|value| Self::new(value).map_err(serde::de::Error::custom))
+    }
+}
+
 /// Bootstrap secret references and privacy-safe defaults supplied outside Turso.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BootstrapConfiguration {
@@ -78,12 +89,12 @@ pub enum SettingScope {
 }
 
 /// An ordinary persisted setting with an explicit tri-state layer value.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct PersistedSetting {
-    pub scope: SettingScope,
-    pub key: String,
-    pub value: LayerValue<serde_json::Value>,
-    pub updated_at: String,
+    scope: SettingScope,
+    key: String,
+    value: LayerValue<serde_json::Value>,
+    updated_at: String,
 }
 
 impl PersistedSetting {
@@ -97,33 +108,77 @@ impl PersistedSetting {
         value: LayerValue<serde_json::Value>,
         updated_at: impl Into<String>,
     ) -> Result<Self, ConfigurationError> {
-        let key = key.into();
-        validate_ordinary_key(&key)?;
-        let updated_at = updated_at.into();
-        require_non_empty("setting update time", &updated_at)?;
-        Ok(Self {
+        let setting = Self {
             scope,
-            key,
+            key: key.into(),
             value,
-            updated_at,
-        })
+            updated_at: updated_at.into(),
+        };
+        setting.validate()?;
+        Ok(setting)
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &SettingScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> &LayerValue<serde_json::Value> {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn updated_at(&self) -> &str {
+        &self.updated_at
     }
 
     pub(crate) fn id(&self) -> String {
         format!("{}:{}", self.scope.identifier(), self.key)
     }
+
+    pub(crate) fn validate(&self) -> Result<(), ConfigurationError> {
+        self.scope.validate()?;
+        validate_ordinary_key(&self.key)?;
+        validate_non_secret_layer_value(&self.value)?;
+        require_non_empty("setting update time", &self.updated_at)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedSettingWire {
+    scope: SettingScope,
+    key: String,
+    value: LayerValue<serde_json::Value>,
+    updated_at: String,
+}
+
+impl<'de> serde::Deserialize<'de> for PersistedSetting {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <PersistedSettingWire as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(wire.scope, wire.key, wire.value, wire.updated_at)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// A persisted destination that may reference a secret by environment-variable name.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct PersistedDestination {
-    pub id: String,
-    pub name: String,
-    pub destination_kind: String,
-    pub configuration: serde_json::Value,
-    pub secret_environment_variable_name: Option<SecretEnvironmentVariableName>,
-    pub created_at: String,
-    pub updated_at: String,
+    id: String,
+    name: String,
+    destination_kind: String,
+    configuration: serde_json::Value,
+    secret_environment_variable_name: Option<SecretEnvironmentVariableName>,
+    created_at: String,
+    updated_at: String,
 }
 
 impl PersistedDestination {
@@ -150,13 +205,82 @@ impl PersistedDestination {
             created_at: created_at.into(),
             updated_at: updated_at.into(),
         };
-        require_non_empty("destination id", &destination.id)?;
-        require_non_empty("destination name", &destination.name)?;
-        require_non_empty("destination kind", &destination.destination_kind)?;
-        require_non_empty("destination creation time", &destination.created_at)?;
-        require_non_empty("destination update time", &destination.updated_at)?;
-        validate_non_secret_json(&destination.configuration)?;
+        destination.validate()?;
         Ok(destination)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn destination_kind(&self) -> &str {
+        &self.destination_kind
+    }
+
+    #[must_use]
+    pub const fn configuration(&self) -> &serde_json::Value {
+        &self.configuration
+    }
+
+    #[must_use]
+    pub const fn secret_environment_variable_name(&self) -> Option<&SecretEnvironmentVariableName> {
+        self.secret_environment_variable_name.as_ref()
+    }
+
+    #[must_use]
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    #[must_use]
+    pub fn updated_at(&self) -> &str {
+        &self.updated_at
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ConfigurationError> {
+        require_non_empty("destination id", &self.id)?;
+        require_non_empty("destination name", &self.name)?;
+        require_non_empty("destination kind", &self.destination_kind)?;
+        require_non_empty("destination creation time", &self.created_at)?;
+        require_non_empty("destination update time", &self.updated_at)?;
+        validate_non_secret_json(&self.configuration)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedDestinationWire {
+    id: String,
+    name: String,
+    destination_kind: String,
+    configuration: serde_json::Value,
+    secret_environment_variable_name: Option<SecretEnvironmentVariableName>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl<'de> serde::Deserialize<'de> for PersistedDestination {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <PersistedDestinationWire as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(
+            wire.id,
+            wire.name,
+            wire.destination_kind,
+            wire.configuration,
+            wire.secret_environment_variable_name,
+            wire.created_at,
+            wire.updated_at,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -205,6 +329,19 @@ impl LocalDataOwnership {
 }
 
 impl SettingScope {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        match self {
+            Self::Global => Ok(()),
+            Self::Collection { collection_id } => {
+                require_non_empty("collection setting scope", collection_id)
+            }
+            Self::Crawler { crawler_id } => require_non_empty("crawler setting scope", crawler_id),
+            Self::RunProfile { run_profile_id } => {
+                require_non_empty("run profile setting scope", run_profile_id)
+            }
+        }
+    }
+
     pub(crate) fn database_parts(&self) -> (&'static str, Option<&str>) {
         match self {
             Self::Global => ("GLOBAL", None),
@@ -329,6 +466,15 @@ fn validate_non_secret_json(value: &serde_json::Value) -> Result<(), Configurati
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_non_secret_layer_value(
+    value: &LayerValue<serde_json::Value>,
+) -> Result<(), ConfigurationError> {
+    if let LayerValue::Custom(value) = value {
+        validate_non_secret_json(value)?;
     }
     Ok(())
 }
