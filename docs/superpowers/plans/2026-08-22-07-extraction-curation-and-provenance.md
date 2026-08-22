@@ -1,6 +1,6 @@
 # Erabi Extraction, Curation, and Provenance Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement each extraction/curation capability end-to-end, then compile/check, add or update meaningful tests, run verification, and commit. Do not use failing-test-first or RED/GREEN sequencing by default.
 
 **Goal:** Implement safe visual extraction owned by Page Types, typed normalization/validation, production schema-drift diagnostics, Dataset/Record review and immutable approvals, semantic recrawl candidates, relationships, and durable field-level provenance.
 
@@ -11,404 +11,130 @@
 **Spec:** `docs/specs/04-extraction-curation-and-provenance.md`, `docs/specs/03-discovery-graph-and-runs.md`, `docs/specs/08-ux-accessibility-and-verification.md`  
 **Spec revision:** `679b499e617fcef14e4e40b9a7fc826b379b8a30`
 
-## Global Constraints
-
-- Extraction configuration belongs to Page Types inside a Crawler Version.
-- Raw website HTML is untrusted and never rendered directly in the primary app DOM.
-- Raw artifacts remain immutable even when sanitized preview artifacts are generated.
-- MVP selectors are CSS selectors; field selectors are relative to the selected container where applicable.
-- Automatic selector repair is not MVP.
-- Validation `ERROR` blocks approval and cannot be overridden; `WARNING` does not block approval.
-- Shared Dataset mappings require compatible identity, field types, required semantics, normalization, and unique-key contracts.
-- Approved record versions are immutable.
-- Field-level candidate merge never silently overwrites approved values.
-- `MISSING_CANDIDATE` is allowed only after a healthy complete `PRODUCTION_RUN`.
-- Production-breaking `SCHEMA_DRIFT` blocks trusted complete/missing semantics and requires a new Crawler Draft/test/publish fix; no production `USE_ANYWAY` escape.
-- Provenance must survive ordinary artifact retention at a minimum metadata level.
-
-## Focused File Map
-
-```text
-migrations/0006_curated_data.sql
-crates/erabi-domain/src/extraction.rs
-crates/erabi-domain/src/dataset.rs
-crates/erabi-domain/src/review.rs
-crates/erabi-domain/src/provenance.rs
-crates/erabi-extraction/src/preview.rs
-crates/erabi-extraction/src/mode.rs
-crates/erabi-extraction/src/extract.rs
-crates/erabi-extraction/src/normalize.rs
-crates/erabi-extraction/src/validate.rs
-crates/erabi-extraction/src/drift.rs
-crates/erabi-api/src/routes/extraction.rs
-crates/erabi-api/src/routes/reviews.rs
-crates/erabi-db/src/repositories/datasets.rs
-crates/erabi-db/src/repositories/reviews.rs
-```
+**Migration ownership:** `migrations/0006_curated_data.sql` for Datasets, record versions/candidates, validation, reviews, provenance, and relationships.
 
 ---
 
-### Task 1: Build sanitized preview artifacts and deterministic node mapping
+### Task 1: Safe preview artifacts and deterministic node mapping
 
-**Files:**
-- Create: `crates/erabi-extraction/src/preview.rs`
-- Create: `crates/erabi-extraction/src/mode.rs`
-- Modify: `crates/erabi-extraction/src/lib.rs`
-- Create: `crates/erabi-api/src/routes/extraction.rs`
-- Test: `crates/erabi-extraction/tests/preview_security.rs`
-- Test: `crates/erabi-extraction/tests/mode_detection.rs`
-- Create: `tests/fixtures/extraction/hostile.html`
-- Create: `tests/fixtures/extraction/article.html`
-- Create: `tests/fixtures/extraction/listing.html`
+**Files:** preview/sanitizer/mode modules, extraction preview API, hostile/article/listing fixtures/tests.
 
-**Interfaces:**
-- Produces `PreviewDocument { html, nodes, base_url, artifact_hash }`.
-- Produces deterministic `PreviewNode` IDs and bounding/selector metadata for UI selection.
-- Produces `ModeSuggestion::{Document, Records}` with confidence/evidence and manual switch support.
+**Requirements:**
 
-- [ ] **Step 1: Add stable parsing/sanitizing dependencies**
+- Raw website HTML is untrusted and never inserted directly into the primary app DOM.
+- Sanitization removes active scripts/inline handlers/forms/navigation escapes/unsafe schemes/active embeds/meta refresh and isolates preview rendering.
+- Raw artifacts remain immutable evidence.
+- Generate deterministic preview node IDs from controlled evidence, not untrusted element IDs or random runtime order.
+- Produce enough safe node/selector/geometry metadata for visual highlighting plus keyboard/manual-selector workflow.
+- Deterministic/local `ModeSuggestion::{Document, Records}` is advisory and switchable without recrawl.
 
-Use `cargo add` at implementation time for the smallest compatible stable set, for example an HTML parser/selector crate plus `ammonia` or equivalent mature sanitizer. Add `url`, `serde`, `sha2`, `hex` as needed. Do not execute source-site JavaScript in Erabi preview generation.
-
-- [ ] **Step 2: Write failing hostile-preview tests**
-
-`hostile.html` must contain script tags, inline event handlers, `javascript:` URLs, forms, iframes/object/embed, meta refresh, unsafe base tags, SVG script, and top-navigation attempts. Assert sanitized preview contains none of those active capabilities while safe text/images remain.
-
-```rust
-#[test]
-fn sanitized_preview_neutralizes_active_content() {
-    let raw = include_str!("../../../tests/fixtures/extraction/hostile.html");
-    let preview = erabi_extraction::PreviewBuilder::build(raw, "https://fixture.test/").unwrap();
-    assert!(!preview.html.contains("<script"));
-    assert!(!preview.html.contains("javascript:"));
-    assert!(!preview.html.contains("onsubmit="));
-    assert!(!preview.html.contains("<iframe"));
-}
-```
-
-- [ ] **Step 3: Write failing deterministic-node and mode tests**
-
-Build the same artifact twice and assert identical node IDs/order. Node IDs derive from artifact hash + document ordinal, not untrusted source IDs. Article fixture yields high-confidence Document; listing yields Records; ambiguous fixture returns lower confidence with evidence and allows manual switch without recrawl.
-
-- [ ] **Step 4: Run RED**
-
-```bash
-cargo test -p erabi-extraction --test preview_security --test mode_detection
-```
-
-- [ ] **Step 5: Implement preview/mode services and endpoint**
-
-Sanitize via explicit allowlist. Resolve relative safe `http`/`https` image/link references against final page URL, then make navigation inert for preview. Block `javascript:`, active forms, top navigation, external embeds, executable content. Preview response uses isolated route policy/CSP and `Cache-Control: private, no-store`.
-
-`PreviewNode` stores deterministic node ID, tag, safe stable attributes/classes, text sample, parent/children IDs, candidate CSS selector, and enough geometry metadata for an overlay selection layer. Do not trust source-generated element IDs automatically when generating selectors.
-
-- [ ] **Step 6: Run GREEN and commit**
-
-```bash
-cargo test -p erabi-extraction --test preview_security --test mode_detection
-git add Cargo.lock crates/erabi-extraction crates/erabi-api tests/fixtures/extraction
- git commit -m "feat(extraction): build safe deterministic previews"
-```
+**Verification:** hostile HTML security fixtures, deterministic node-map repeatability, mode suggestion/manual switch, safe URL/resource handling.
 
 ---
 
-### Task 2: Define Page Type extraction contracts and implement typed extraction/normalization/validation
+### Task 2: Page Type-owned extraction contracts and typed extraction
 
-**Files:**
-- Create: `crates/erabi-domain/src/extraction.rs`
-- Create: `crates/erabi-domain/src/dataset.rs`
-- Modify: `crates/erabi-domain/src/page_type.rs`
-- Modify: `crates/erabi-domain/src/lib.rs`
-- Create: `crates/erabi-extraction/src/extract.rs`
-- Create: `crates/erabi-extraction/src/normalize.rs`
-- Create: `crates/erabi-extraction/src/validate.rs`
-- Test: `crates/erabi-extraction/tests/extraction_contract.rs`
-- Test: `crates/erabi-domain/tests/shared_dataset_compatibility.rs`
+**Files:** `erabi-domain` extraction/Dataset contracts, PageType integration, extraction/normalize/validate modules, tests.
 
-**Interfaces:**
-- Produces `ExtractionDefinition`, `FieldDefinition`, `FieldType`, `FieldValueSource`, `NormalizationRule`, `ValidationRule`, `UniqueKeyDefinition`, `DatasetMapping`.
-- Produces `ExtractionEngine::extract(preview, definition)`.
-- Produces raw/normalized candidate values and validation issues.
+**MVP field types:** Text, RichText, Number, Boolean, DateTime, URL, ImageURL, RawHTML.
 
-- [ ] **Step 1: Write failing type/value-source tests**
+**Value sources:** text content, inner HTML, explicit outer HTML, attribute, resolved absolute URL attribute, Boolean presence.
 
-Exact MVP field types:
+**Requirements:**
 
-```rust
-pub enum FieldType { Text, RichText, Number, Boolean, DateTime, Url, ImageUrl, RawHtml }
+- `ExtractionDefinition` belongs inside PageType semantic config and is frozen by Published CrawlerVersion.
+- Support container selector/fallbacks, relative field selectors, normalization, validation, unique-key definition, Dataset mapping, comparison policy, structural fingerprint/evidence.
+- Preserve raw and normalized values separately where representation changes.
+- No silent locale/currency inference; configuration must make parsing behavior explicit.
+- Shared Dataset compatibility checks enforce same identity meaning, compatible key order/semantics, field types, required/optional semantics, and normalization.
+- Implement `ExtractionValidationContributor` and register it with Plan 05 `VersionValidationContributor` so incompatible extraction/unique-key/Dataset contracts block publish.
+- Do not create a global `SchemaVersion`/Schema approval subsystem.
 
-pub enum FieldValueSource {
-    TextContent,
-    InnerHtml,
-    OuterHtml,
-    Attribute { name: String },
-    AbsoluteUrlAttribute { name: String },
-    BooleanPresence,
-}
-```
-
-Write fixture tests for title text, link absolute URL, image URL, boolean presence, date, number, RichText sanitation, and RawHtml explicit opt-in.
-
-- [ ] **Step 2: Write failing selector/normalization/validation tests**
-
-Selector preference tests assert stable semantic ID → semantic class → stable `data-*`/`aria-*` → semantic structure → positional fallback with fragility warning. Records Mode requires one root container and relative field selectors; Document Mode produces one logical record from document root.
-
-Normalization tests store both raw and normalized values. Do not infer locale-specific currency/number behavior silently; schema config must specify needed parsing rules. Errors: missing required, invalid configured type, empty/duplicate unique key, required rule violation. Warnings: low coverage, optional image missing, fragile selector, outlier heuristic.
-
-- [ ] **Step 3: Write failing shared-Dataset compatibility tests**
-
-Two Page Types may map to one Dataset only when unique-key identity meaning/order, field types, required/optional semantics, and normalization contracts are compatible. Assert conflicting type or key blocks publish validation hook.
-
-- [ ] **Step 4: Run RED**
-
-```bash
-cargo test -p erabi-extraction --test extraction_contract
-cargo test -p erabi-domain --test shared_dataset_compatibility
-```
-
-- [ ] **Step 5: Implement extraction definition as Page Type-owned semantic config**
-
-```rust
-pub struct ExtractionDefinition {
-    pub mode: ExtractionMode,
-    pub container_selector: Option<String>,
-    pub fallback_container_selectors: Vec<String>,
-    pub structural_fingerprint: Option<String>,
-    pub fields: Vec<FieldDefinition>,
-    pub unique_key: Option<UniqueKeyDefinition>,
-    pub dataset_mapping: Option<DatasetMapping>,
-    pub comparison_policy: ComparisonPolicy,
-}
-```
-
-Page Type draft mutations edit this definition inside Crawler Version semantic config. Publishing freezes it with the version. There is no separate global `SchemaVersion` entity/API.
-
-Extraction engine returns candidate rows with per-field `raw_value`, `normalized_value`, selector/node evidence, validation issues, and coverage counts. Unsafe URL schemes are rejected when resolving URL fields.
-
-- [ ] **Step 6: Run GREEN and commit**
-
-```bash
-cargo test -p erabi-extraction --test extraction_contract
-cargo test -p erabi-domain --test shared_dataset_compatibility
-git add Cargo.lock crates/erabi-domain crates/erabi-extraction
- git commit -m "feat(extraction): extract typed Page Type records"
-```
+**Verification:** field-type/value-source fixtures, relative selector behavior, normalization/validation, unsafe URL rejection, shared Dataset compatibility, publication contributor integration.
 
 ---
 
-### Task 3: Implement schema-drift diagnostics without production bypass
+### Task 3: Schema drift diagnostics and production trust semantics
 
-**Files:**
-- Create: `crates/erabi-extraction/src/drift.rs`
-- Modify: `crates/erabi-extraction/src/lib.rs`
-- Modify: `crates/erabi-crawler/src/snapshot_health.rs`
-- Create: `crates/erabi-api/src/routes/drift.rs`
-- Test: `crates/erabi-extraction/tests/schema_drift.rs`
-- Test: `crates/erabi-api/tests/schema_drift_actions.rs`
+**Files:** drift detector/report API, crawl snapshot-health integration, tests.
 
-**Interfaces:**
-- Produces `DriftReport`, `DriftSignal`, `DriftSeverity`.
-- Adds extraction-health input to `SnapshotHealth`.
-- Produces diagnostic action `CREATE_DRAFT_FIX`/review actions but no trust-restoring `USE_ANYWAY`.
+**Detect/report:** missing container, missing required selector, required coverage drop, type mismatch, record-count anomaly with meaningful baseline, unique-key extraction failure, structural divergence.
 
-- [ ] **Step 1: Write failing drift signal tests**
+**Requirements:**
 
-Fixtures cover missing container, missing required selector, required-field coverage drop, unexpected configured type, record-count anomaly relative to recent complete snapshots, unique-key extraction failure, structural fingerprint divergence.
+- Production-breaking drift marks run/snapshot non-complete and preserves diagnostics/artifacts/partial results.
+- It cannot create trusted missing-record semantics.
+- There is no generic production `USE_ANYWAY` action that restores trust.
+- Corrective path is new Crawler Draft → validate/Test Lab → publish new version → later production run.
+- Test/Discovery/Quick Scrape may inspect drift diagnostically without mutating Published config or auto-approving.
 
-```rust
-#[test]
-fn required_unique_key_failure_is_production_breaking_drift() {
-    let report = erabi_extraction::test_support::drift_missing_unique_key();
-    assert!(report.production_breaking());
-    assert_eq!(report.code(), erabi_domain::ErrorCode::SchemaDrift);
-}
-```
-
-- [ ] **Step 2: Write failing production action/health tests**
-
-A Production Run with production-breaking drift must have incomplete snapshot health, preserve artifacts/diagnostics, and expose action leading to new Crawler Draft/Test Lab. Assert API response does not contain action code `USE_ANYWAY`. Test Run/Discovery/Quick Scrape may inspect report without mutating Published config or auto-approving data.
-
-- [ ] **Step 3: Run RED**
-
-```bash
-cargo test -p erabi-extraction --test schema_drift
-cargo test -p erabi-api --test schema_drift_actions
-```
-
-- [ ] **Step 4: Implement drift report and snapshot-health integration**
-
-Drift detector compares current extraction evidence to the Published Page Type extraction contract and recent healthy complete snapshot statistics only where a comparison is meaningful. Record-count anomaly is diagnostic and must be combined with configured thresholds/evidence; do not treat any count change as automatic drift.
-
-Production-breaking drift adds `HealthReason::SchemaDrift` to snapshot health. It cannot be cleared by a run-level override; only a later corrected Draft that passes validation/tests and becomes Published can restore normal production trust semantics.
-
-- [ ] **Step 5: Run GREEN and commit**
-
-```bash
-cargo test -p erabi-extraction --test schema_drift
-cargo test -p erabi-api --test schema_drift_actions
-git add crates/erabi-extraction crates/erabi-crawler crates/erabi-api
- git commit -m "feat(extraction): diagnose production schema drift"
-```
+**Verification:** each drift signal, production incomplete health, no `USE_ANYWAY`, Draft-fix action, diagnostic-only non-production behavior.
 
 ---
 
-### Task 4: Persist Datasets, reviews, candidates, validation, and immutable approved Record versions
+### Task 4: Dataset/review persistence and immutable approved Record versions
 
-**Files:**
-- Create: `migrations/0006_curated_data.sql`
-- Create: `crates/erabi-domain/src/review.rs`
-- Create: `crates/erabi-domain/src/provenance.rs`
-- Modify: `crates/erabi-domain/src/lib.rs`
-- Create: `crates/erabi-db/src/repositories/datasets.rs`
-- Create: `crates/erabi-db/src/repositories/reviews.rs`
-- Create: `crates/erabi-api/src/routes/reviews.rs`
-- Test: `crates/erabi-db/tests/review_persistence.rs`
-- Test: `crates/erabi-api/tests/review_actions.rs`
+**Files:** `migrations/0006_curated_data.sql`, Dataset/review/provenance domain types, repositories/routes/tests.
 
-**Interfaces:**
-- Produces `Dataset`, `RecordVersion`, `RecordCandidate`, `Review`, `ReviewStatus`, `RecordStatus`, `ValidationIssue`.
-- Produces optimistic-concurrency Draft edit, approve/reject/bulk actions, Close/Reopen.
+**Persist:** datasets, identity/record versions, candidate values, validation issues, reviews/items, provenance rows, relationships/references as defined by MVP.
 
-- [ ] **Step 1: Define migration ownership and write failing immutable-version tests**
+**Requirements:**
 
-`0006_curated_data.sql` owns datasets, dataset fields/mappings metadata as needed, record identities, record_versions, candidate_values, validation_issues, reviews/review_items, provenance rows, and dataset_relationship definitions/references. It does not duplicate crawler or crawl-execution tables.
+- Validation `ERROR` blocks approval and cannot be overridden; `WARNING` remains approvable.
+- Review lifecycle: `OPEN`, `CLOSED`, `CLOSED_WITH_UNRESOLVED_ITEMS`, `REOPENED`.
+- Approved RecordVersion is immutable; edits create a new Draft version linked to prior history.
+- Draft editing uses optimistic concurrency; conflict never silently overwrites another edit.
+- Approve All Valid approves valid+warning rows, skips ERROR rows, and reports counts.
+- Single rejection reason optional; bulk rejection requires non-empty reason.
+- Closing unresolved review requires explicit confirmation and does not mutate record states.
 
-Test direct repository update of an Approved RecordVersion fails; manual edit creates a new Draft version linked to the Approved parent.
-
-- [ ] **Step 2: Write failing review behavior tests**
-
-Exact review states: `OPEN`, `CLOSED`, `CLOSED_WITH_UNRESOLVED_ITEMS`, `REOPENED`. Approve All Valid approves rows without ERROR, includes WARNING rows, skips ERROR rows, and reports approved/skipped/warning counts. Single reject reason optional; bulk reject requires non-empty reason. Closing unresolved review requires explicit confirmation payload and does not mutate record statuses.
-
-- [ ] **Step 3: Run RED**
-
-```bash
-cargo test -p erabi-db --test review_persistence
-cargo test -p erabi-api --test review_actions
-```
-
-- [ ] **Step 4: Implement transactional review/repository rules**
-
-Draft cell/record edits use expected revision; on mismatch return 409 conflict and never silently overwrite. Approval transaction validates current revision/issues, inserts immutable Approved version, supersedes prior current pointer where applicable without mutating history, stores approval audit event, and preserves candidate/provenance evidence.
-
-Review close/reopen is independent from record approval lifecycle. Rejected records remain persisted with evidence/provenance.
-
-- [ ] **Step 5: Run GREEN and commit**
-
-```bash
-cargo test -p erabi-db --test review_persistence
-cargo test -p erabi-api --test review_actions
-git add migrations/0006_curated_data.sql crates/erabi-domain crates/erabi-db crates/erabi-api
- git commit -m "feat(review): persist immutable curated record versions"
-```
+**Verification:** repository immutability, optimistic conflict, approval severity, bulk actions, close/reopen, evidence/history preservation.
 
 ---
 
-### Task 5: Implement semantic recrawl change detection and candidate generation
+### Task 5: Semantic recrawl change detection and candidates
 
-**Files:**
-- Create: `crates/erabi-extraction/src/change_detection.rs`
-- Create: `crates/erabi-db/src/repositories/candidates.rs`
-- Test: `crates/erabi-extraction/tests/change_detection.rs`
-- Test: `crates/erabi-db/tests/missing_candidate_guard.rs`
+**Files:** change detection/candidate repository modules and tests.
 
-**Interfaces:**
-- Produces `ChangeDecision::{Unchanged, NewCandidate, UpdatedCandidate, MissingCandidate, RestoredCandidate}`.
-- Produces field-level candidate groups without auto-merge.
+**Healthy complete Production snapshot semantics:**
 
-- [ ] **Step 1: Write failing normalized comparison tests**
+- existing key + same normalized values => unchanged;
+- existing key + changed normalized values => `UPDATED_CANDIDATE`;
+- new key => `NEW_CANDIDATE`;
+- previously approved key absent => `MISSING_CANDIDATE`;
+- previously confirmed deleted identity reappears => `RESTORED_CANDIDATE`.
 
-Test normal comparison, whitespace-normalized comparison, canonical-URL comparison, and ignore-in-change-detection. Raw HTML-only differences with identical normalized fields do not create review work.
+**Requirements:**
 
-- [ ] **Step 2: Write failing field-level shared Dataset merge tests**
+- Compare normalized values using explicit field comparison policies.
+- Field-level candidates preserve all conflicting values/source evidence; never auto-merge/silent overwrite.
+- Partial/failed/cancelled/Test/Discovery/schema-drift-invalid runs never create `MISSING_CANDIDATE`.
+- Source preference per field only ranks/recommends; it never auto-approves or discards alternatives.
 
-For same identity: absent approved field + candidate → enrichment candidate; same normalized value → unchanged; different value → preserve conflict candidate; multiple Page Types with different values preserve all candidates. Source-preference configuration ranks candidates but never auto-approves/discards.
-
-- [ ] **Step 3: Write failing complete/partial missing guard tests**
-
-```rust
-#[tokio::test]
-async fn partial_run_cannot_create_missing_candidate() {
-    let fixture = erabi_db::test_support::approved_product_then_partial_recrawl().await;
-    fixture.generate_candidates().await.unwrap();
-    assert_eq!(fixture.count_status("MISSING_CANDIDATE").await, 0);
-}
-```
-
-Repeat for Failed, Cancelled, Test Run, Discovery Preview, and production-breaking schema drift. Healthy complete Production snapshot with absent approved key creates MissingCandidate. Reappearing confirmed Deleted identity creates RestoredCandidate, not silent reactivation.
-
-- [ ] **Step 4: Run RED**
-
-```bash
-cargo test -p erabi-extraction --test change_detection
-cargo test -p erabi-db --test missing_candidate_guard
-```
-
-- [ ] **Step 5: Implement candidate generator gated by final SnapshotHealth**
-
-Candidate generation takes immutable run type + final snapshot health + extracted normalized records + approved current versions. It immediately refuses missing detection unless `(run_type == ProductionRun && health == Complete)`. Duplicate identity collisions create validation/candidate conflicts and are never auto-merged.
-
-- [ ] **Step 6: Run GREEN and commit**
-
-```bash
-cargo test -p erabi-extraction --test change_detection
-cargo test -p erabi-db --test missing_candidate_guard
-git add crates/erabi-extraction crates/erabi-db
- git commit -m "feat(review): generate safe recrawl candidates"
-```
+**Verification:** unchanged/update/new/missing/restored, partial-run missing guard, duplicate/conflict non-auto-merge, preferred-source non-approval.
 
 ---
 
-### Task 6: Implement durable field provenance and Dataset relationships
+### Task 6: Field-level provenance and Dataset relationships
 
-**Files:**
-- Modify: `crates/erabi-domain/src/provenance.rs`
-- Create: `crates/erabi-db/src/repositories/provenance.rs`
-- Create: `crates/erabi-db/src/repositories/relationships.rs`
-- Create: `crates/erabi-api/src/routes/provenance.rs`
-- Test: `crates/erabi-api/tests/provenance_trace.rs`
-- Test: `crates/erabi-db/tests/relationships.rs`
+**Files:** provenance/relationship services/repositories/APIs and tests.
 
-**Interfaces:**
-- Produces `FieldProvenance` trace API.
-- Produces field/key Dataset relationships and `UNRESOLVED_REFERENCE` diagnostics.
+**Provenance must answer:** Source original/canonical URL, Crawler/Version, CrawlRun, PageType, discovery transition/path, artifact/hash/reference, selector/node evidence, raw value, normalized value, transformations, extraction time.
 
-- [ ] **Step 1: Write failing end-to-end provenance trace test**
+Retention cleanup may remove large artifacts but approved curated values retain minimum durable lineage metadata/audit evidence.
 
-For one Approved field, load provenance and assert it identifies original URL, canonical URL, Source ID, Crawler/CrawlerVersion where applicable, Crawl Run, Page Type, transition/discovery path when relevant, artifact ID/hash, selector/node evidence, raw value, normalized value, transformations, extraction time.
+Dataset relationships use domain-specific key/field references; unresolved targets surface `UNRESOLVED_REFERENCE` without generic ORM/cascade behavior.
 
-- [ ] **Step 2: Write failing relationship diagnostics test**
+**Verification:** trace approved field back to source/artifact/version, provenance survives ordinary artifact cleanup metadata-wise, unresolved relationship warnings do not delete/block unrelated records.
 
-Define `Reviews.product_id → Products.product_id`; a missing target surfaces `UNRESOLVED_REFERENCE` warning/reference state without deleting either record or blocking unrelated data by default. Do not add generic cascade/ORM/admin semantics.
-
-- [ ] **Step 3: Run RED**
-
-```bash
-cargo test -p erabi-api --test provenance_trace
-cargo test -p erabi-db --test relationships
-```
-
-- [ ] **Step 4: Implement provenance persistence/API and retention minimum**
-
-Store field provenance when candidate extraction is persisted and link Approved RecordVersion fields to the exact candidate lineage chosen. API returns safe structured lineage and artifact reference; raw artifact download remains protected by Plan 03 routes. Minimum durable provenance metadata remains when ordinary retention later removes large artifact payloads: source/run/version/selector/value lineage, artifact hash/reference summary, audit history.
-
-- [ ] **Step 5: Run full Plan 07 gate and commit**
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p erabi-domain
-cargo test -p erabi-extraction
-cargo test -p erabi-db --test review_persistence --test missing_candidate_guard --test relationships
-cargo test -p erabi-api --test review_actions --test schema_drift_actions --test provenance_trace
-```
-
-Expected: shared Listing+Detail Dataset never silently overwrites; drift requires Draft fix; duplicate identity/candidates do not auto-merge; complete-vs-partial missing semantics pass; Approved field trace is complete.
-
-```bash
-git add crates/erabi-domain crates/erabi-extraction crates/erabi-db crates/erabi-api
- git commit -m "feat(provenance): preserve field lineage and relationships"
-```
+---
 
 ## Plan 07 Gate
 
-Do not start Plan 08 until Task 6 Step 5 passes from a clean checkout and `git status --short` is empty.
+```bash
+cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Confirm safe preview isolation, PageType-owned extraction, Plan 05 validation contributor integration, shared Dataset compatibility, production drift trust rules, immutable approvals, candidate non-auto-merge, complete-vs-partial missing semantics, and field provenance all pass. Do not begin Plan 08 until the gate passes.
