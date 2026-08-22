@@ -77,7 +77,7 @@ cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 bun install --frozen-lockfile
-bun --cwd apps/web run check
+bun run --cwd apps/web check
 ```
 
 Add/update workspace contract tests or scripts as useful to assert the required members/package manager and absence of unsupported JS lockfiles. Tests are verification, not a prerequisite to writing the workspace.
@@ -251,7 +251,7 @@ cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 bun install --frozen-lockfile
-bun --cwd apps/web run check
+bun run --cwd apps/web check
 ```
 
 Then confirm all of the following by tests/code review:
