@@ -68,6 +68,9 @@ impl Crawler {
                 "published version does not belong to this crawler",
             ));
         }
+        if self.active_draft_version_id == Some(version.id()) {
+            self.active_draft_version_id = None;
+        }
         self.active_published_version_id = Some(version.id());
         Ok(())
     }

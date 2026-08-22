@@ -83,6 +83,45 @@ fn crawler_lifecycle_operations_validate_ownership_and_state()
 }
 
 #[test]
+fn publishing_the_active_draft_clears_its_draft_pointer() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut crawler = Crawler::new("Catalog");
+    let mut draft_a = CrawlerVersion::draft(crawler.id());
+    crawler.activate_draft(&draft_a)?;
+    draft_a.publish()?;
+
+    crawler.reactivate_published(&draft_a)?;
+    assert_eq!(crawler.active_published_version_id(), Some(draft_a.id()));
+    assert_eq!(crawler.active_draft_version_id(), None);
+
+    let draft_b = draft_a.draft_from_published()?;
+    crawler.activate_draft(&draft_b)?;
+    assert_eq!(crawler.active_draft_version_id(), Some(draft_b.id()));
+    Ok(())
+}
+
+#[test]
+fn reactivating_a_different_published_version_preserves_an_active_draft()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut crawler = Crawler::new("Catalog");
+    let mut historical = CrawlerVersion::draft(crawler.id());
+    historical.publish()?;
+    let draft_b = historical.draft_from_published()?;
+    crawler.activate_draft(&draft_b)?;
+
+    let mut different_published = CrawlerVersion::draft(crawler.id());
+    different_published.publish()?;
+    crawler.reactivate_published(&different_published)?;
+
+    assert_eq!(crawler.active_draft_version_id(), Some(draft_b.id()));
+    assert_eq!(
+        crawler.active_published_version_id(),
+        Some(different_published.id())
+    );
+    Ok(())
+}
+
+#[test]
 fn draft_configuration_workflow_uses_typed_references() -> Result<(), Box<dyn std::error::Error>> {
     let mut version = CrawlerVersion::draft(CrawlerId::new());
     let page_type = PageTypeId::new();
