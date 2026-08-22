@@ -61,6 +61,25 @@ Execution rules:
 9. [SvelteKit Product UI](2026-08-22-09-sveltekit-product-ui.md)
 10. [CI, E2E, and Release](2026-08-22-10-ci-e2e-and-release.md)
 
+## Required Cross-Plan Interface Handoffs
+
+These interfaces are intentionally introduced before all implementations that consume them. Later plans extend or register implementations; they do not invent parallel contracts.
+
+| Producer | Consumer | Fixed handoff |
+|---|---|---|
+| Plan 02 | Plans 03–08 | typed repositories, immutable `RunConfigSnapshot`, resolved settings, atomic artifact store |
+| Plan 03 | Plan 04 | `Runtime` startup hooks and one `ShutdownCoordinator` checkpoint-flush/cancellation integration point |
+| Plan 04 | Plan 06 | `JobRuntime`/`JobHandler`, durable progress publisher, checkpoint/cancel/retry/resume model |
+| Plan 05 | Plan 06 | `DiscoveryPageProvider`/Discovery Engine and canonical discovery pipeline; Crawl4AI output adapts into this port rather than replacing it |
+| Plan 05 | Plan 07 | `VersionValidationContributor`; Plan 07 MUST register an extraction/Dataset/unique-key contributor after those types are introduced |
+| Plan 05 | Plans 06–07 | `SnapshotHealth`; execution and extraction/drift signals extend the final Complete/Incomplete decision |
+| Plan 06 | Plan 07 | persisted crawl page/artifact evidence and extraction-queue handoff |
+| Plan 07 | Plans 08–09 | immutable Approved Dataset/Record versions, provenance, review/candidate APIs |
+| Plans 03–08 | Plan 09 | backend API DTO/error/SSE contracts; frontend renders decisions rather than reimplementing domain resolution |
+| Plans 01–09 | Plan 10 | executable tests/routes/commands consumed by deterministic CI/E2E/release gates |
+
+When implementing Plan 07 Task 2, create an `ExtractionValidationContributor` (or equally explicit name) implementing Plan 05 `VersionValidationContributor`; it validates Page Type extraction definitions, shared Dataset compatibility, and unique-key contracts and is registered in the same `PublishValidator` used by the publish API. Plan 07's gate is not complete until a publish test proves this contributor can block invalid extraction/Dataset configuration.
+
 ## Migration Ownership
 
 Migration numbering is reserved by the plan that owns the bounded persistence model. Do not reuse or renumber an already-committed migration after implementation begins.
