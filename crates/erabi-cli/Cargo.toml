@@ -8,10 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+axum = "0.8.9"
 dotenvy = "0.15.7"
+erabi-api = { version = "0.1.0", path = "../erabi-api" }
+erabi-db = { version = "0.1.0", path = "../erabi-db" }
 secrecy = "0.10.3"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]

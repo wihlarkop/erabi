@@ -18,7 +18,6 @@ struct RecordingHooks {
     stages: Arc<Mutex<Vec<ShutdownStage>>>,
     saw_admission_disabled_before_cancellation: Arc<AtomicBool>,
     hang_cancellation: bool,
-    lock: Arc<Mutex<Option<ProcessLock>>>,
 }
 
 impl RecordingHooks {
@@ -28,24 +27,12 @@ impl RecordingHooks {
             stages: Arc::new(Mutex::new(Vec::new())),
             saw_admission_disabled_before_cancellation: Arc::new(AtomicBool::new(false)),
             hang_cancellation: false,
-            lock: Arc::new(Mutex::new(None)),
         }
     }
 
     fn with_hung_cancellation(mut self) -> Self {
         self.hang_cancellation = true;
         self
-    }
-
-    fn with_process_lock(mut self, lock: ProcessLock) -> Self {
-        self.lock = Arc::new(Mutex::new(Some(lock)));
-        self
-    }
-
-    fn stages(&self) -> Vec<ShutdownStage> {
-        self.stages
-            .lock()
-            .map_or_else(|_| Vec::new(), |stages| stages.clone())
     }
 
     fn record(&self, stage: ShutdownStage) {
@@ -88,13 +75,6 @@ impl ShutdownHooks for RecordingHooks {
     fn flush_critical_state(&self) -> ShutdownFuture<'_> {
         self.immediate(ShutdownStage::FlushCriticalState)
     }
-
-    fn release_resources(&self) {
-        self.record(ShutdownStage::ReleaseResources);
-        if let Ok(mut lock) = self.lock.lock() {
-            drop(lock.take());
-        }
-    }
 }
 
 #[tokio::test]
@@ -114,7 +94,7 @@ async fn shutdown_runs_the_canonical_order_and_completes_cleanly() {
             .load(Ordering::Acquire)
     );
     assert_eq!(
-        hooks.stages(),
+        report.completed_stages,
         vec![
             ShutdownStage::StopAcceptingMutationsAndJobs,
             ShutdownStage::MarkShuttingDown,
@@ -126,6 +106,36 @@ async fn shutdown_runs_the_canonical_order_and_completes_cleanly() {
     );
 }
 
+/// Represents a legacy user-supplied cleanup callback that never cooperates.
+/// It intentionally does not implement `ShutdownHooks`: the coordinator has
+/// no extension point that could synchronously invoke it after the deadline.
+struct NonCooperativeCleanup {
+    attempted: Arc<AtomicBool>,
+}
+
+impl NonCooperativeCleanup {
+    fn release_resources(&self) {
+        self.attempted.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn arbitrary_blocking_cleanup_is_excluded_from_the_deadline_critical_path() {
+    let coordinator = ShutdownCoordinator::new();
+    let hooks = RecordingHooks::new(coordinator.clone());
+    let legacy_cleanup = NonCooperativeCleanup {
+        attempted: Arc::new(AtomicBool::new(false)),
+    };
+    std::hint::black_box(NonCooperativeCleanup::release_resources as fn(&NonCooperativeCleanup));
+
+    let report = coordinator.shutdown(&hooks).await;
+
+    assert!(report.completed_cleanly());
+    assert_eq!(report.elapsed, Duration::ZERO);
+    assert!(!legacy_cleanup.attempted.load(Ordering::Acquire));
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_hung_hook_cannot_extend_the_exact_deadline_and_releases_the_process_lock()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -133,10 +143,9 @@ async fn a_hung_hook_cannot_extend_the_exact_deadline_and_releases_the_process_l
     let directory = std::env::temp_dir().join(format!("erabi-shutdown-test-{nonce}"));
     fs::create_dir_all(&directory)?;
     let metadata = ProcessLockMetadata::current("2026-08-23T12:00:00Z", "127.0.0.1:7878");
-    let coordinator = ShutdownCoordinator::new();
-    let hooks = RecordingHooks::new(coordinator.clone())
-        .with_hung_cancellation()
-        .with_process_lock(ProcessLock::acquire(&directory, &metadata)?);
+    let coordinator =
+        ShutdownCoordinator::with_process_lock(ProcessLock::acquire(&directory, &metadata)?);
+    let hooks = RecordingHooks::new(coordinator.clone()).with_hung_cancellation();
 
     let (report, ()) = tokio::join!(
         coordinator.shutdown(&hooks),
@@ -152,7 +161,7 @@ async fn a_hung_hook_cannot_extend_the_exact_deadline_and_releases_the_process_l
             .contains(&ShutdownStage::SignalCooperativeCancellation)
     );
     assert_eq!(
-        hooks.stages().last(),
+        report.completed_stages.last(),
         Some(&ShutdownStage::ReleaseResources)
     );
     assert!(!format!("{report:?}").contains("test-shared-bearer-token"));

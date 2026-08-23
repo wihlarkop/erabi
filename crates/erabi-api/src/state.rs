@@ -1,6 +1,9 @@
 //! Minimal runtime state shared by API routes.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// Runtime service mode used to protect mutable surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -33,6 +36,7 @@ struct RuntimeSnapshot {
 #[derive(Clone, Debug)]
 pub struct AppState {
     runtime: Arc<RwLock<RuntimeSnapshot>>,
+    accepting_mutations: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -51,6 +55,7 @@ impl AppState {
                 mode: RuntimeMode::Normal,
                 crawl4ai: Crawl4AiAvailability::Available,
             })),
+            accepting_mutations: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -65,6 +70,17 @@ impl AppState {
         if let Ok(mut runtime) = self.runtime.write() {
             runtime.ready = ready;
         }
+    }
+
+    /// Stops normal mutation admission during graceful process shutdown.
+    pub fn stop_accepting_mutations(&self) {
+        self.accepting_mutations.store(false, Ordering::Release);
+    }
+
+    /// Returns whether the runtime still admits normal mutation requests.
+    #[must_use]
+    pub fn accepts_mutations(&self) -> bool {
+        self.accepting_mutations.load(Ordering::Acquire)
     }
 
     /// Enters Recovery Mode and prevents normal mutations/new job submission.
@@ -90,9 +106,11 @@ impl AppState {
     /// Returns whether normal state-changing routes may proceed.
     #[must_use]
     pub fn mutations_allowed(&self) -> bool {
-        self.runtime
-            .read()
-            .is_ok_and(|runtime| matches!(runtime.mode, RuntimeMode::Normal))
+        self.accepts_mutations()
+            && self
+                .runtime
+                .read()
+                .is_ok_and(|runtime| matches!(runtime.mode, RuntimeMode::Normal))
     }
 
     /// Provides only typed, safe runtime diagnostics.

@@ -35,6 +35,36 @@ pub struct RecoveryState {
     pub message: String,
 }
 
+/// A startup failure that cannot safely expose an Erabi recovery surface.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{code}: {message}")]
+pub struct StartupFatalError {
+    /// Stable machine-readable reason for startup refusal.
+    pub code: String,
+    /// Safe operator-facing message without configuration values or secrets.
+    pub message: String,
+}
+
+impl StartupFatalError {
+    /// Builds a typed fatal startup error from already-sanitized text.
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Classification returned by an individual startup boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartupFailure {
+    /// The process must refuse startup because no safe service can be exposed.
+    Fatal(StartupFatalError),
+    /// Migration, integrity, or invariant risk requires limited Recovery Mode.
+    Recovery(RecoveryState),
+}
+
 /// Result of ordered process bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupOutcome {
@@ -42,6 +72,8 @@ pub enum StartupOutcome {
     Ready { crawl4ai: Crawl4AiStartupHealth },
     /// Migration/integrity failure selected Recovery Mode before route startup.
     Recovery(RecoveryState),
+    /// A non-recoverable bootstrap, filesystem, lock, or listener failure refused startup.
+    Fatal(StartupFatalError),
 }
 
 /// Dependencies supplied by the runtime without pulling Plan 04 job types forward.
@@ -52,19 +84,18 @@ pub trait StartupHooks {
     /// hook-only until Plan 04 supplies durable jobs/concurrency state.
     ///
     /// # Errors
-    /// Returns a typed Recovery Mode condition when the stage cannot proceed safely.
+    /// Classifies a stage failure as fatal or recovery-relevant.
     fn run_stage(
         &mut self,
         stage: StartupStage,
-    ) -> Result<Option<Crawl4AiStartupHealth>, RecoveryState>;
+    ) -> Result<Option<Crawl4AiStartupHealth>, StartupFailure>;
 }
 
 /// Executes startup in the canonical order.
 ///
 /// # Errors
-/// Only migration and integrity errors produce `Recovery`; other hook failures
-/// are represented by the caller's typed `RecoveryState` and likewise avoid
-/// exposing normal mutable routes.
+/// Only explicitly classified migration/integrity errors produce `Recovery`.
+/// Bootstrap, lock, listener, and other unsafe-to-serve failures remain fatal.
 pub fn run_startup(hooks: &mut impl StartupHooks) -> StartupOutcome {
     let stages = [
         StartupStage::ResolveDataDirectory,
@@ -85,8 +116,24 @@ pub fn run_startup(hooks: &mut impl StartupHooks) -> StartupOutcome {
         match hooks.run_stage(stage) {
             Ok(Some(health)) if stage == StartupStage::CheckCrawl4Ai => crawl4ai = health,
             Ok(_) => {}
-            Err(recovery) => return StartupOutcome::Recovery(recovery),
+            Err(StartupFailure::Recovery(recovery)) if recovery_is_safe_at(stage) => {
+                return StartupOutcome::Recovery(recovery);
+            }
+            Err(StartupFailure::Recovery(_)) => {
+                return StartupOutcome::Fatal(StartupFatalError::new(
+                    "STARTUP_FAILURE_MISCLASSIFIED",
+                    "Only migration or integrity risk may enter Erabi Recovery Mode.",
+                ));
+            }
+            Err(StartupFailure::Fatal(fatal)) => return StartupOutcome::Fatal(fatal),
         }
     }
     StartupOutcome::Ready { crawl4ai }
+}
+
+fn recovery_is_safe_at(stage: StartupStage) -> bool {
+    matches!(
+        stage,
+        StartupStage::ApplyMigrations | StartupStage::CheckIntegrity
+    )
 }

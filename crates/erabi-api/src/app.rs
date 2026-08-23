@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     extract::{Extension, State},
-    http::{HeaderName, HeaderValue, Request, StatusCode},
+    http::{HeaderName, HeaderValue, Request, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
     routing::{any, get},
@@ -66,7 +66,7 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route("/api/v1/exports/{*path}", any(unavailable))
         .route("/api/v1/backups/{*path}", any(unavailable))
         .route("/api/v1/artifacts/{*path}", any(unavailable))
-        .route("/assets/{*path}", any(unavailable))
+        .route("/assets/{*path}", get(static_asset_boundary))
         .route("/", get(spa_boundary))
         .route("/{*path}", get(spa_boundary))
         .fallback(unavailable)
@@ -178,6 +178,21 @@ async fn unavailable(Extension(trace_id): Extension<TraceId>) -> Response {
 
 async fn spa_boundary() -> Html<&'static str> {
     Html("<!doctype html><title>Erabi</title><main id=\"erabi-root\"></main>")
+}
+
+/// A token-free compiled-asset boundary. Plan 03 does not manufacture a UI
+/// bundle; later UI integration mounts its generated assets here. Returning an
+/// empty JavaScript module keeps the browser bootstrap contract usable without
+/// treating API/download assets as public.
+async fn static_asset_boundary() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        "",
+    )
+        .into_response()
 }
 
 async fn trace_request(mut request: Request<axum::body::Body>, next: middleware::Next) -> Response {

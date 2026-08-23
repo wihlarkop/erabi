@@ -22,7 +22,10 @@ pub(crate) async fn require_bearer(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if !config.requires_bearer_authentication() || request.method() == axum::http::Method::OPTIONS {
+    if !config.requires_bearer_authentication()
+        || request.method() == axum::http::Method::OPTIONS
+        || is_public_browser_bootstrap(request.uri().path())
+    {
         return next.run(request).await;
     }
 
@@ -75,6 +78,13 @@ pub(crate) async fn require_bearer(
     }
 
     next.run(request).await
+}
+
+/// The browser must load its shell and compiled UI resources before it can
+/// retrieve a session-stored bearer token. These paths contain no API/data
+/// surface and never receive a token through a URL or cookie.
+fn is_public_browser_bootstrap(path: &str) -> bool {
+    path == "/" || path.starts_with("/assets/")
 }
 
 fn parse_bearer(value: &HeaderValue) -> Option<&str> {

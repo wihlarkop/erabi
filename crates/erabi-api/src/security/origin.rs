@@ -145,7 +145,20 @@ fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
 
 fn same_origin(origin: &str, host: &str) -> bool {
     canonical_origin(origin).is_some_and(|origin| {
-        url::Url::parse(&origin).is_ok_and(|parsed| super::host_for_url(&parsed) == host)
+        url::Url::parse(&origin).is_ok_and(|parsed| {
+            let Some(origin_host) = parsed.host_str() else {
+                return false;
+            };
+            let bracketed_host = if origin_host.contains(':') {
+                format!("[{origin_host}]")
+            } else {
+                origin_host.to_owned()
+            };
+            let authority = parsed.port().map_or(bracketed_host.clone(), |port| {
+                format!("{bracketed_host}:{port}")
+            });
+            host.eq_ignore_ascii_case(&authority)
+        })
     })
 }
 

@@ -27,7 +27,7 @@ pub enum Exposure {
 pub struct SecurityConfig {
     exposure: Exposure,
     access_token: Option<SecretString>,
-    expected_hosts: BTreeSet<String>,
+    host_policy: HostPolicy,
     allowed_origins: BTreeSet<String>,
     mutation_body_limit_bytes: usize,
     openapi_enabled: bool,
@@ -45,7 +45,7 @@ impl SecurityConfig {
         Ok(Self {
             exposure: Exposure::Loopback,
             access_token: None,
-            expected_hosts: BTreeSet::from([host_for_socket_addr(bind_address)]),
+            host_policy: host_policy_for_socket_addr(bind_address),
             allowed_origins: BTreeSet::new(),
             mutation_body_limit_bytes: 64 * 1024,
             openapi_enabled: true,
@@ -67,18 +67,16 @@ impl SecurityConfig {
             return Err(SecurityConfigError::EmptyAccessToken);
         }
 
-        let mut expected_hosts = BTreeSet::from([host_for_socket_addr(bind_address)]);
         let mut canonical_origins = BTreeSet::new();
         for origin in allowed_origins {
             let parsed = parse_origin(&origin)?;
-            expected_hosts.insert(host_for_url(&parsed));
             canonical_origins.insert(parsed.origin().ascii_serialization());
         }
 
         Ok(Self {
             exposure: Exposure::Remote,
             access_token: Some(access_token),
-            expected_hosts,
+            host_policy: host_policy_for_socket_addr(bind_address),
             allowed_origins: canonical_origins,
             mutation_body_limit_bytes: 64 * 1024,
             openapi_enabled: false,
@@ -122,7 +120,7 @@ impl SecurityConfig {
     }
 
     pub(crate) fn host_is_expected(&self, host: &str) -> bool {
-        self.expected_hosts.contains(&host.to_ascii_lowercase())
+        self.host_policy.matches(host)
     }
 
     pub(crate) fn is_allowed_cross_origin(&self, origin: &str) -> bool {
@@ -140,7 +138,7 @@ impl fmt::Debug for SecurityConfig {
             .debug_struct("SecurityConfig")
             .field("exposure", &self.exposure)
             .field("access_token_configured", &self.access_token.is_some())
-            .field("expected_hosts", &self.expected_hosts)
+            .field("host_policy", &self.host_policy)
             .field("allowed_origins", &self.allowed_origins)
             .field("mutation_body_limit_bytes", &self.mutation_body_limit_bytes)
             .field("openapi_enabled", &self.openapi_enabled)
@@ -168,18 +166,44 @@ pub(crate) fn canonical_origin(origin: &str) -> Option<String> {
         .map(|parsed| parsed.origin().ascii_serialization())
 }
 
-pub(crate) fn host_for_url(url: &Url) -> String {
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    match url.port_or_known_default() {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
+/// Host validation is intentionally independent of CORS origins. A wildcard
+/// listener can accept concrete IP literals on its bound port, but it never
+/// trusts arbitrary DNS names supplied by a request header.
+#[derive(Clone, Debug)]
+enum HostPolicy {
+    Exact(BTreeSet<String>),
+    WildcardIpv4 { port: u16 },
+    WildcardIpv6 { port: u16 },
+}
+
+impl HostPolicy {
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            Self::Exact(expected_hosts) => expected_hosts.contains(&host.to_ascii_lowercase()),
+            Self::WildcardIpv4 { port } => host.parse::<SocketAddr>().is_ok_and(|address| {
+                address.ip().is_ipv4() && !address.ip().is_unspecified() && address.port() == *port
+            }),
+            Self::WildcardIpv6 { port } => host.parse::<SocketAddr>().is_ok_and(|address| {
+                address.ip().is_ipv6() && !address.ip().is_unspecified() && address.port() == *port
+            }),
+        }
     }
 }
 
-fn host_for_socket_addr(address: SocketAddr) -> String {
+fn host_policy_for_socket_addr(address: SocketAddr) -> HostPolicy {
     match address.ip() {
-        std::net::IpAddr::V4(ip) => format!("{ip}:{}", address.port()),
-        std::net::IpAddr::V6(ip) => format!("[{ip}]:{}", address.port()),
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => HostPolicy::WildcardIpv4 {
+            port: address.port(),
+        },
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => HostPolicy::WildcardIpv6 {
+            port: address.port(),
+        },
+        std::net::IpAddr::V4(ip) => {
+            HostPolicy::Exact(BTreeSet::from([format!("{ip}:{}", address.port())]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            HostPolicy::Exact(BTreeSet::from([format!("[{ip}]:{}", address.port())]))
+        }
     }
 }
 

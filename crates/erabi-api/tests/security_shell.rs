@@ -21,8 +21,15 @@ fn loopback_router() -> Result<Router, Box<dyn std::error::Error>> {
 }
 
 fn remote_router() -> Result<Router, Box<dyn std::error::Error>> {
-    let address: SocketAddr = REMOTE_HOST.parse()?;
-    let security = SecurityConfig::remote(address, SecretString::from(TOKEN), Vec::new())?;
+    remote_router_for(REMOTE_HOST, Vec::new())
+}
+
+fn remote_router_for(
+    bind: &str,
+    allowed_origins: Vec<String>,
+) -> Result<Router, Box<dyn std::error::Error>> {
+    let address: SocketAddr = bind.parse()?;
+    let security = SecurityConfig::remote(address, SecretString::from(TOKEN), allowed_origins)?;
     Ok(build_router(AppState::ready(), security))
 }
 
@@ -75,8 +82,6 @@ async fn remote_route_groups_require_a_bearer_token() -> Result<(), Box<dyn std:
         "/api/v1/backups/1",
         "/api/v1/artifacts/raw",
         "/api/v1/diagnostics/runtime",
-        "/assets/app.js",
-        "/",
     ] {
         let response = remote_router()?
             .oneshot(request("GET", path).body(Body::empty())?)
@@ -84,6 +89,27 @@ async fn remote_route_groups_require_a_bearer_token() -> Result<(), Box<dyn std:
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
         assert_eq!(error_code(response).await?, "AUTHENTICATION_REQUIRED");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_browser_shell_and_compiled_asset_boundary_bootstrap_without_a_bearer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = remote_router()?
+        .oneshot(request("GET", "/").body(Body::empty())?)
+        .await?;
+    assert_eq!(shell.status(), StatusCode::OK);
+
+    let asset = remote_router()?
+        .oneshot(request("GET", "/assets/app.js").body(Body::empty())?)
+        .await?;
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset.headers().get(header::CONTENT_TYPE),
+        Some(&axum::http::HeaderValue::from_static(
+            "application/javascript; charset=utf-8"
+        ))
+    );
     Ok(())
 }
 
@@ -191,6 +217,90 @@ async fn mutation_host_origin_content_type_and_body_limits_are_enforced()
         .await?;
     assert_eq!(body_rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(error_code(body_rejected).await?, "BODY_TOO_LARGE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_host_policy_handles_explicit_and_wildcard_binds_without_trusting_cors_origins()
+-> Result<(), Box<dyn std::error::Error>> {
+    let explicit = remote_router_for("192.0.2.10:7878", Vec::new())?
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::HOST, "192.0.2.10:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(explicit.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let wildcard = remote_router_for("0.0.0.0:7878", Vec::new())?
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::HOST, "192.0.2.34:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(wildcard.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let attacker = remote_router_for("0.0.0.0:7878", Vec::new())?
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::HOST, "attacker.example.test:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(attacker.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(attacker).await?, "HOST_NOT_ALLOWED");
+
+    let cors_is_not_host_trust = remote_router_for(
+        "0.0.0.0:7878",
+        vec!["https://frontend.example.test".to_owned()],
+    )?
+    .oneshot(
+        request("POST", "/api/v1/runs")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::HOST, "frontend.example.test:7878")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))?,
+    )
+    .await?;
+    assert_eq!(cors_is_not_host_trust.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error_code(cors_is_not_host_trust).await?,
+        "HOST_NOT_ALLOWED"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn wildcard_ipv6_bind_accepts_only_concrete_ipv6_literal_hosts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let accepted = remote_router_for("[::]:7878", Vec::new())?
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::HOST, "[2001:db8::34]:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(accepted.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let unspecified = remote_router_for("[::]:7878", Vec::new())?
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::HOST, "[::]:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(unspecified.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
 

@@ -4,13 +4,15 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use tokio::time::{Instant, timeout_at};
+
+use crate::ProcessLock;
 
 /// The fixed MVP graceful-shutdown deadline.
 pub const GRACEFUL_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
@@ -39,8 +41,9 @@ pub type ShutdownFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 ///
 /// Hooks must be cooperative and non-blocking. Each asynchronous hook is
 /// bounded by the one process-wide deadline; no hook receives extra time.
-/// Resource release is synchronous so an expired deadline cannot strand the
-/// local process lock.
+/// The coordinator deliberately does not accept arbitrary resource-cleanup
+/// callbacks: it owns and releases the known process lock itself, so an
+/// untrusted blocking callback cannot extend process shutdown.
 pub trait ShutdownHooks {
     /// Stops new mutation and job admission at the owning subsystem boundary.
     fn stop_accepting_mutations_and_jobs(&self) -> ShutdownFuture<'_>;
@@ -56,9 +59,6 @@ pub trait ShutdownHooks {
 
     /// Flushes critical audit and error state.
     fn flush_critical_state(&self) -> ShutdownFuture<'_>;
-
-    /// Releases resources such as the process lock without waiting past the deadline.
-    fn release_resources(&self);
 }
 
 /// A safe summary containing only stage identities and elapsed time.
@@ -87,6 +87,7 @@ impl ShutdownReport {
 pub struct ShutdownCoordinator {
     accepting_mutations: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    process_lock: Arc<Mutex<Option<ProcessLock>>>,
 }
 
 impl Default for ShutdownCoordinator {
@@ -102,7 +103,18 @@ impl ShutdownCoordinator {
         Self {
             accepting_mutations: Arc::new(AtomicBool::new(true)),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            process_lock: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Creates a coordinator that owns the active local process lock.
+    #[must_use]
+    pub fn with_process_lock(process_lock: ProcessLock) -> Self {
+        let coordinator = Self::new();
+        if let Ok(mut owned_lock) = coordinator.process_lock.lock() {
+            *owned_lock = Some(process_lock);
+        }
+        coordinator
     }
 
     /// Returns whether the runtime may accept new mutations or job submissions.
@@ -117,18 +129,37 @@ impl ShutdownCoordinator {
         self.shutting_down.load(Ordering::Acquire)
     }
 
+    /// Closes runtime admission and returns the single fixed shutdown deadline.
+    #[must_use]
+    pub fn begin_shutdown(&self) -> Instant {
+        self.accepting_mutations.store(false, Ordering::Release);
+        self.shutting_down.store(true, Ordering::Release);
+        Instant::now() + GRACEFUL_SHUTDOWN_DEADLINE
+    }
+
     /// Runs the canonical shutdown sequence within exactly three seconds.
     ///
     /// The admission gate changes before any cooperative hook is called. Once
     /// the single deadline expires, pending hooks are cancelled and resources
     /// are released immediately rather than waiting for a crawl or download.
     pub async fn shutdown(&self, hooks: &impl ShutdownHooks) -> ShutdownReport {
-        let started = Instant::now();
-        let deadline = started + GRACEFUL_SHUTDOWN_DEADLINE;
+        let deadline = self.begin_shutdown();
+        self.shutdown_by(deadline, hooks).await
+    }
+
+    /// Completes shutdown using a deadline established by [`Self::begin_shutdown`].
+    ///
+    /// This keeps runtime server termination and every cooperative hook on one
+    /// deadline, rather than granting cleanup a fresh timeout.
+    pub(crate) async fn shutdown_by(
+        &self,
+        deadline: Instant,
+        hooks: &impl ShutdownHooks,
+    ) -> ShutdownReport {
+        let started = deadline - GRACEFUL_SHUTDOWN_DEADLINE;
         let mut completed_stages = Vec::new();
         let mut timed_out_stages = Vec::new();
 
-        self.accepting_mutations.store(false, Ordering::Release);
         run_stage(
             hooks,
             ShutdownStage::StopAcceptingMutationsAndJobs,
@@ -138,7 +169,6 @@ impl ShutdownCoordinator {
         )
         .await;
 
-        self.shutting_down.store(true, Ordering::Release);
         for stage in [
             ShutdownStage::MarkShuttingDown,
             ShutdownStage::SignalCooperativeCancellation,
@@ -155,7 +185,7 @@ impl ShutdownCoordinator {
             .await;
         }
 
-        hooks.release_resources();
+        self.release_owned_resources();
         completed_stages.push(ShutdownStage::ReleaseResources);
 
         ShutdownReport {
@@ -163,6 +193,12 @@ impl ShutdownCoordinator {
             elapsed: Instant::now().saturating_duration_since(started),
             completed_stages,
             timed_out_stages,
+        }
+    }
+
+    fn release_owned_resources(&self) {
+        if let Ok(mut owned_lock) = self.process_lock.lock() {
+            drop(owned_lock.take());
         }
     }
 }
