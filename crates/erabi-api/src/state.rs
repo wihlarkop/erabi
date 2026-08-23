@@ -13,6 +13,19 @@ pub enum RuntimeMode {
     Normal,
     /// Mutations are unsafe until the stated recovery condition is addressed.
     Recovery { code: String, message: String },
+    /// The process has closed admission and is completing bounded shutdown.
+    ShuttingDown,
+}
+
+/// The reason a state-changing request is currently admitted or rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationAdmission {
+    /// Normal mutation handling may continue.
+    Allowed,
+    /// Recovery Mode protects integrity evidence and normal mutation surfaces.
+    Recovery,
+    /// Graceful process shutdown has closed new admission.
+    ShuttingDown,
 }
 
 /// Crawl engine availability that does not itself imply data corruption.
@@ -77,6 +90,14 @@ impl AppState {
         self.accepting_mutations.store(false, Ordering::Release);
     }
 
+    /// Makes the graceful-shutdown state observable after admission closes.
+    pub fn mark_shutting_down(&self) {
+        if let Ok(mut runtime) = self.runtime.write() {
+            runtime.mode = RuntimeMode::ShuttingDown;
+            runtime.ready = false;
+        }
+    }
+
     /// Returns whether the runtime still admits normal mutation requests.
     #[must_use]
     pub fn accepts_mutations(&self) -> bool {
@@ -106,11 +127,24 @@ impl AppState {
     /// Returns whether normal state-changing routes may proceed.
     #[must_use]
     pub fn mutations_allowed(&self) -> bool {
-        self.accepts_mutations()
-            && self
-                .runtime
-                .read()
-                .is_ok_and(|runtime| matches!(runtime.mode, RuntimeMode::Normal))
+        self.mutation_admission() == MutationAdmission::Allowed
+    }
+
+    /// Determines a distinct safe response for each normal mutation boundary.
+    #[must_use]
+    pub fn mutation_admission(&self) -> MutationAdmission {
+        let mode = self.runtime.read().map_or(
+            RuntimeMode::Recovery {
+                code: "RUNTIME_STATE_UNAVAILABLE".to_owned(),
+                message: "Runtime state could not be inspected safely.".to_owned(),
+            },
+            |runtime| runtime.mode.clone(),
+        );
+        match mode {
+            RuntimeMode::Recovery { .. } => MutationAdmission::Recovery,
+            RuntimeMode::Normal if self.accepts_mutations() => MutationAdmission::Allowed,
+            RuntimeMode::ShuttingDown | RuntimeMode::Normal => MutationAdmission::ShuttingDown,
+        }
     }
 
     /// Provides only typed, safe runtime diagnostics.

@@ -264,6 +264,62 @@ async fn runtime_process_lock_contention_is_a_fatal_startup_error()
 }
 
 #[tokio::test]
+async fn recorded_migrations_with_a_missing_critical_index_enter_recovery_mode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = temporary_data_dir("corrupt-index");
+    let runtime = RunningRuntime::start_with_options(
+        config(&data_dir, None, false)?,
+        RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
+            message: "Crawl4AI intentionally unavailable for this runtime test.".to_owned(),
+        }),
+    )
+    .await?;
+    runtime.shutdown().await?;
+
+    let database_path = data_dir.join("database").join("erabi.db");
+    let database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
+        .build()
+        .await?;
+    let connection = database.connect()?;
+    connection
+        .execute("DROP INDEX crawler_versions_by_crawler", ())
+        .await?;
+    drop(connection);
+    drop(database);
+
+    let recovery = RunningRuntime::start_with_options(
+        config(&data_dir, None, false)?,
+        RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
+            message: "Crawl4AI intentionally unavailable for this runtime test.".to_owned(),
+        }),
+    )
+    .await?;
+    assert!(matches!(
+        recovery.startup_outcome(),
+        StartupOutcome::Recovery(state) if state.code == "CRITICAL_SCHEMA_OBJECT_MISSING"
+    ));
+    let listener_address = recovery.local_address();
+    let host = listener_address.to_string();
+    let diagnostics = request(
+        listener_address,
+        "GET",
+        "/api/v1/diagnostics/status",
+        &host,
+        None,
+        "",
+    )
+    .await?;
+    assert_status(&diagnostics, 200);
+    let blocked = request(listener_address, "POST", "/api/v1/runs", &host, None, "{}").await?;
+    assert_status(&blocked, 503);
+    assert!(blocked.contains("RECOVERY_MODE_MUTATION_BLOCKED"));
+
+    recovery.shutdown().await?;
+    fs::remove_dir_all(&data_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn migration_risk_starts_safe_recovery_http_and_crawl4ai_degradation_remains_usable()
 -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = temporary_data_dir("recovery");

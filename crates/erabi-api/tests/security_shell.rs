@@ -95,10 +95,18 @@ async fn remote_route_groups_require_a_bearer_token() -> Result<(), Box<dyn std:
 #[tokio::test]
 async fn remote_browser_shell_and_compiled_asset_boundary_bootstrap_without_a_bearer()
 -> Result<(), Box<dyn std::error::Error>> {
-    let shell = remote_router()?
-        .oneshot(request("GET", "/").body(Body::empty())?)
-        .await?;
-    assert_eq!(shell.status(), StatusCode::OK);
+    for path in [
+        "/",
+        "/crawlers",
+        "/runs",
+        "/settings",
+        "/future/client-route",
+    ] {
+        let shell = remote_router()?
+            .oneshot(request("GET", path).body(Body::empty())?)
+            .await?;
+        assert_eq!(shell.status(), StatusCode::OK, "{path}");
+    }
 
     let asset = remote_router()?
         .oneshot(request("GET", "/assets/app.js").body(Body::empty())?)
@@ -394,6 +402,37 @@ async fn recovery_mode_blocks_mutations_but_keeps_safe_diagnostics_available()
         .oneshot(request("GET", "/api/v1/diagnostics/status").body(Body::empty())?)
         .await?;
     assert_eq!(diagnostics.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graceful_shutdown_uses_a_distinct_mutation_error_and_runtime_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let address: SocketAddr = "127.0.0.1:7878".parse()?;
+    let state = AppState::ready();
+    state.stop_accepting_mutations();
+    state.mark_shutting_down();
+    let router = build_router(state.clone(), SecurityConfig::loopback(address)?);
+
+    let mutation = router
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::HOST, "127.0.0.1:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(mutation.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error_code(mutation).await?, "SERVICE_SHUTTING_DOWN");
+    assert_eq!(state.runtime_mode(), erabi_api::RuntimeMode::ShuttingDown);
+
+    let diagnostics = router
+        .oneshot(request("GET", "/api/v1/diagnostics/status").body(Body::empty())?)
+        .await?;
+    assert_eq!(diagnostics.status(), StatusCode::OK);
+    let body = to_bytes(diagnostics.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("SHUTTING_DOWN"));
     Ok(())
 }
 

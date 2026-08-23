@@ -14,7 +14,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
-    AppState, Crawl4AiAvailability, RuntimeMode, SecurityConfig,
+    AppState, Crawl4AiAvailability, MutationAdmission, RuntimeMode, SecurityConfig,
     error::{ApiErrorEnvelope, error_response},
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
 };
@@ -43,10 +43,10 @@ impl TraceId {
 
 /// Builds the versioned API, protected future-surface groups, and SPA boundary.
 ///
-/// The protected router deliberately owns API, SSE, static assets, export,
-/// backup, raw-artifact, diagnostics, and SPA surfaces in one place. Later
-/// route modules attach below this boundary instead of creating parallel,
-/// accidentally unauthenticated routers.
+/// Browser shell routes deliberately stay separate from protected API/data
+/// groups so a remote browser can load the token-free SPA before JavaScript
+/// reads its session-stored bearer token. Later API modules attach only below
+/// the protected boundary.
 #[allow(clippy::needless_pass_by_value)] // Public contract intentionally owns the shared router state.
 pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
     let liveness = Router::new().route("/api/v1/health", get(liveness));
@@ -66,10 +66,7 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route("/api/v1/exports/{*path}", any(unavailable))
         .route("/api/v1/backups/{*path}", any(unavailable))
         .route("/api/v1/artifacts/{*path}", any(unavailable))
-        .route("/assets/{*path}", get(static_asset_boundary))
-        .route("/", get(spa_boundary))
-        .route("/{*path}", get(spa_boundary))
-        .fallback(unavailable)
+        .route("/api/v1/{*path}", any(unavailable))
         .with_state(app_state.clone())
         .layer(middleware::from_fn_with_state(
             security.clone(),
@@ -77,12 +74,18 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
-            recovery_mode_guard,
+            mutation_admission_guard,
         ))
         .layer(middleware::from_fn_with_state(security, require_bearer));
 
+    let browser_bootstrap = Router::new()
+        .route("/assets/{*path}", get(static_asset_boundary))
+        .route("/", get(spa_boundary))
+        .route("/{*path}", get(spa_boundary));
+
     liveness
         .merge(protected)
+        .merge(browser_bootstrap)
         .layer(middleware::from_fn(apply_security_headers))
         .layer(middleware::from_fn(trace_request))
 }
@@ -140,7 +143,7 @@ async fn openapi_disabled(Extension(trace_id): Extension<TraceId>) -> Response {
     )
 }
 
-async fn recovery_mode_guard(
+async fn mutation_admission_guard(
     State(app_state): State<AppState>,
     request: Request<axum::body::Body>,
     next: middleware::Next,
@@ -151,28 +154,46 @@ async fn recovery_mode_guard(
             | axum::http::Method::PUT
             | axum::http::Method::PATCH
             | axum::http::Method::DELETE
-    ) && !app_state.mutations_allowed()
-    {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiErrorEnvelope::new(
+    ) {
+        let (code, message) = match app_state.mutation_admission() {
+            MutationAdmission::Allowed => return next.run(request).await,
+            MutationAdmission::Recovery => (
                 "RECOVERY_MODE_MUTATION_BLOCKED",
                 "Normal mutations are disabled while the service is in Recovery Mode.",
-                trace_id_for(&request),
             ),
+            MutationAdmission::ShuttingDown => (
+                "SERVICE_SHUTTING_DOWN",
+                "Normal mutations are unavailable while Erabi is shutting down.",
+            ),
+        };
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiErrorEnvelope::new(code, message, trace_id_for(&request)),
         );
     }
     next.run(request).await
 }
 
-async fn unavailable(Extension(trace_id): Extension<TraceId>) -> Response {
-    error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        ApiErrorEnvelope::new(
+async fn unavailable(
+    method: axum::http::Method,
+    Extension(trace_id): Extension<TraceId>,
+) -> Response {
+    let (status, code, message) = if method == axum::http::Method::GET {
+        (
+            StatusCode::NOT_IMPLEMENTED,
             "ROUTE_NOT_AVAILABLE",
             "This API surface is reserved for a later Erabi plan.",
-            trace_id.as_str(),
-        ),
+        )
+    } else {
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            "METHOD_NOT_ALLOWED",
+            "This API surface does not support that HTTP method.",
+        )
+    };
+    error_response(
+        status,
+        ApiErrorEnvelope::new(code, message, trace_id.as_str()),
     )
 }
 

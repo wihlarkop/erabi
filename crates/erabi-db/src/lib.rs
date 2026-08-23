@@ -2,6 +2,7 @@
 
 mod artifact_store;
 mod configuration;
+mod integrity;
 mod migrate;
 pub mod repositories;
 
@@ -12,6 +13,7 @@ pub use configuration::{
     BootstrapConfiguration, ConfigurationError, LocalDataOwnership, PersistedDestination,
     PersistedSetting, SecretEnvironmentVariableName, SettingScope,
 };
+pub use integrity::{LightweightIntegrityChecker, LightweightIntegrityError};
 pub use migrate::{Migration, MigrationReport, MigrationRunner, SchemaVersion};
 
 /// A structured migration failure suitable for a later Recovery Mode surface.

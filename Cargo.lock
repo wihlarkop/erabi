@@ -701,6 +701,7 @@ dependencies = [
  "secrecy",
  "thiserror",
  "tokio",
+ "turso",
  "url",
 ]
 

@@ -11,13 +11,16 @@ use erabi::{
     GRACEFUL_SHUTDOWN_DEADLINE, ProcessLock, ProcessLockMetadata, ShutdownCoordinator,
     ShutdownFuture, ShutdownHooks, ShutdownStage,
 };
+use erabi_api::{AppState, RuntimeMode};
 
 #[derive(Clone)]
 struct RecordingHooks {
     coordinator: ShutdownCoordinator,
     stages: Arc<Mutex<Vec<ShutdownStage>>>,
     saw_admission_disabled_before_cancellation: Arc<AtomicBool>,
+    saw_shutting_down_before_cancellation: Arc<AtomicBool>,
     hang_cancellation: bool,
+    app_state: Option<AppState>,
 }
 
 impl RecordingHooks {
@@ -26,12 +29,19 @@ impl RecordingHooks {
             coordinator,
             stages: Arc::new(Mutex::new(Vec::new())),
             saw_admission_disabled_before_cancellation: Arc::new(AtomicBool::new(false)),
+            saw_shutting_down_before_cancellation: Arc::new(AtomicBool::new(false)),
             hang_cancellation: false,
+            app_state: None,
         }
     }
 
     fn with_hung_cancellation(mut self) -> Self {
         self.hang_cancellation = true;
+        self
+    }
+
+    fn with_app_state(mut self, app_state: AppState) -> Self {
+        self.app_state = Some(app_state);
         self
     }
 
@@ -50,17 +60,33 @@ impl RecordingHooks {
 
 impl ShutdownHooks for RecordingHooks {
     fn stop_accepting_mutations_and_jobs(&self) -> ShutdownFuture<'_> {
-        self.immediate(ShutdownStage::StopAcceptingMutationsAndJobs)
+        Box::pin(async move {
+            if let Some(app_state) = &self.app_state {
+                app_state.stop_accepting_mutations();
+            }
+            self.record(ShutdownStage::StopAcceptingMutationsAndJobs);
+        })
     }
 
     fn mark_shutting_down(&self) -> ShutdownFuture<'_> {
-        self.immediate(ShutdownStage::MarkShuttingDown)
+        Box::pin(async move {
+            if let Some(app_state) = &self.app_state {
+                app_state.mark_shutting_down();
+            }
+            self.record(ShutdownStage::MarkShuttingDown);
+        })
     }
 
     fn signal_cooperative_cancellation(&self) -> ShutdownFuture<'_> {
         Box::pin(async move {
             self.saw_admission_disabled_before_cancellation
                 .store(!self.coordinator.accepting_mutations(), Ordering::Release);
+            self.saw_shutting_down_before_cancellation.store(
+                self.app_state.as_ref().is_none_or(|app_state| {
+                    matches!(app_state.runtime_mode(), RuntimeMode::ShuttingDown)
+                }),
+                Ordering::Release,
+            );
             self.record(ShutdownStage::SignalCooperativeCancellation);
             if self.hang_cancellation {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -75,6 +101,24 @@ impl ShutdownHooks for RecordingHooks {
     fn flush_critical_state(&self) -> ShutdownFuture<'_> {
         self.immediate(ShutdownStage::FlushCriticalState)
     }
+}
+
+#[tokio::test]
+async fn shutdown_marks_the_runtime_state_before_cooperative_cancellation() {
+    let coordinator = ShutdownCoordinator::new();
+    let app_state = AppState::ready();
+    let hooks = RecordingHooks::new(coordinator.clone()).with_app_state(app_state.clone());
+
+    let report = coordinator.shutdown(&hooks).await;
+
+    assert!(report.completed_cleanly());
+    assert!(!app_state.accepts_mutations());
+    assert_eq!(app_state.runtime_mode(), RuntimeMode::ShuttingDown);
+    assert!(
+        hooks
+            .saw_shutting_down_before_cancellation
+            .load(Ordering::Acquire)
+    );
 }
 
 #[tokio::test]

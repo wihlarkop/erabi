@@ -10,7 +10,7 @@ use std::{
 
 use axum::Router;
 use erabi_api::{AppState, RuntimeMode, SecurityConfig, SecurityConfigError, build_router};
-use erabi_db::{ArtifactStore, ErabiDatabase, MigrationRunner};
+use erabi_db::{ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -129,12 +129,14 @@ impl RunningRuntime {
                 message: "Database migration could not complete safely. Recovery Mode is active."
                     .to_owned(),
             });
-        } else if options.migration_runner.status(&database).await.is_err() {
+        } else if let Err(error) =
+            LightweightIntegrityChecker::new(&database, &options.migration_runner, &data_dir)
+                .check()
+                .await
+        {
             recovery = Some(RecoveryState {
-                code: "INTEGRITY_CHECK_FAILED".to_owned(),
-                message:
-                    "Lightweight database integrity verification failed. Recovery Mode is active."
-                        .to_owned(),
+                code: error.code().to_owned(),
+                message: error.safe_message().to_owned(),
             });
         }
 
@@ -224,9 +226,7 @@ impl RunningRuntime {
     /// # Errors
     /// Returns a sanitized signal or server error.
     pub async fn serve_until_signal(self) -> Result<ShutdownReport, RuntimeError> {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(RuntimeError::ShutdownSignal)?;
+        wait_for_os_shutdown_signal().await?;
         self.shutdown().await
     }
 
@@ -270,6 +270,24 @@ impl RunningRuntime {
                 Ok(report)
             }
         }
+    }
+}
+
+async fn wait_for_os_shutdown_signal() -> Result<(), RuntimeError> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(RuntimeError::ShutdownSignal)?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(RuntimeError::ShutdownSignal),
+            _ = sigterm.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(RuntimeError::ShutdownSignal)
     }
 }
 
@@ -436,7 +454,9 @@ impl ShutdownHooks for RuntimeShutdownHooks {
     }
 
     fn mark_shutting_down(&self) -> ShutdownFuture<'_> {
-        Box::pin(async {})
+        Box::pin(async move {
+            self.app_state.mark_shutting_down();
+        })
     }
 
     fn signal_cooperative_cancellation(&self) -> ShutdownFuture<'_> {

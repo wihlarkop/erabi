@@ -204,4 +204,72 @@ impl<'database> ConfigurationRepository<'database> {
             row.get::<String>(4)?,
         )?))
     }
+
+    /// Reads every currently implemented persisted configuration record through
+    /// its validated domain boundary without changing stored state.
+    ///
+    /// # Errors
+    /// Returns an error when a setting/destination row is unreadable, malformed,
+    /// contains a secret-shaped value, or no longer validates for its type.
+    pub async fn validate_all(&self) -> Result<(), ConfigurationError> {
+        let connection = self.database.connection().await?;
+        let mut settings = connection
+            .query(
+                "SELECT id, scope_type, scope_id, setting_key, state, value_json, updated_at FROM settings",
+                (),
+            )
+            .await?;
+        while let Some(row) = settings.next().await? {
+            let stored_id: String = row.get(0)?;
+            let scope_type: String = row.get(1)?;
+            let scope_id: Option<String> = row.get(2)?;
+            let key: String = row.get(3)?;
+            let state: String = row.get(4)?;
+            let value_json: Option<String> = row.get(5)?;
+            let updated_at: String = row.get(6)?;
+            let setting = PersistedSetting::new(
+                SettingScope::from_database_parts(&scope_type, scope_id.as_deref())?,
+                key,
+                layer_value_from_parts(&state, value_json)?,
+                updated_at,
+            )?;
+            if setting.id() != stored_id {
+                return Err(ConfigurationError::Invalid(
+                    "persisted setting identity does not match its validated fields".into(),
+                ));
+            }
+        }
+        drop(settings);
+
+        let mut destinations = connection
+            .query(
+                "SELECT id, name, destination_kind, configuration_json, secret_environment_variable_name, created_at, updated_at FROM persisted_destinations",
+                (),
+            )
+            .await?;
+        while let Some(row) = destinations.next().await? {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let destination_kind: String = row.get(2)?;
+            let configuration_json: String = row.get(3)?;
+            let secret_name: Option<String> = row.get(4)?;
+            let created_at: String = row.get(5)?;
+            let updated_at: String = row.get(6)?;
+            let configuration = serde_json::from_str(&configuration_json)
+                .map_err(|error| ConfigurationError::Serialization(error.to_string()))?;
+            let secret_environment_variable_name = secret_name
+                .map(SecretEnvironmentVariableName::new)
+                .transpose()?;
+            PersistedDestination::new(
+                id,
+                name,
+                destination_kind,
+                configuration,
+                secret_environment_variable_name,
+                created_at,
+                updated_at,
+            )?;
+        }
+        Ok(())
+    }
 }
