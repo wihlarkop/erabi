@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     AppState, Crawl4AiAvailability, MutationAdmission, RuntimeMode, SecurityConfig,
     error::{ApiErrorEnvelope, error_response},
+    progress::job_progress_sse,
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
 };
 
@@ -36,7 +37,7 @@ impl TraceId {
         Self(trace_id)
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -61,6 +62,10 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
+        .route(
+            "/api/v1/events/jobs/{job_id}/progress",
+            get(job_progress_sse),
+        )
         .route("/api/v1/events/{*path}", any(unavailable))
         .route("/api/v1/assets/{*path}", any(unavailable))
         .route("/api/v1/exports/{*path}", any(unavailable))
@@ -286,6 +291,10 @@ impl OpenApiDocument {
         paths.insert(
             "/api/v1/diagnostics/status",
             OpenApiPath::get("Safe runtime diagnostics"),
+        );
+        paths.insert(
+            "/api/v1/events/jobs/{job_id}/progress",
+            OpenApiPath::get("Replayable job progress stream"),
         );
         paths.insert("/api/v1/openapi.json", OpenApiPath::get("OpenAPI document"));
         Self {

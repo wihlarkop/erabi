@@ -15,7 +15,7 @@ use erabi_db::{
     ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
     repositories::ConcurrencyState,
 };
-use erabi_jobs::recover_and_rebuild_at;
+use erabi_jobs::{ProgressLiveHub, recover_and_rebuild_at};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -76,6 +76,7 @@ pub struct RunningRuntime {
     server_task: JoinHandle<io::Result<()>>,
     _database: ErabiDatabase,
     _concurrency_state: ConcurrencyState,
+    _progress_live_hub: ProgressLiveHub,
 }
 
 impl RunningRuntime {
@@ -171,7 +172,9 @@ impl RunningRuntime {
             },
         };
 
-        let app_state = AppState::with_readiness(false);
+        let progress_live_hub = ProgressLiveHub::new();
+        let app_state = AppState::with_readiness(false)
+            .with_progress_runtime(database.clone(), progress_live_hub.clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
                 app_state.enter_recovery(recovery.code.clone(), recovery.message.clone());
@@ -215,6 +218,7 @@ impl RunningRuntime {
             server_task,
             _database: database,
             _concurrency_state: concurrency_state,
+            _progress_live_hub: progress_live_hub,
         })
     }
 

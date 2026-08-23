@@ -3,6 +3,7 @@
 mod artifact;
 mod configuration;
 mod crawler;
+mod identity;
 mod job;
 mod progress;
 mod run;
@@ -10,6 +11,7 @@ mod run;
 pub use artifact::ArtifactRepository;
 pub use configuration::ConfigurationRepository;
 pub use crawler::{CrawlerPointers, CrawlerRepository};
+pub use identity::JobIdParseError;
 pub use job::{
     AcquiredJob, AttemptOutcome, ConcurrencyState, JobAttempt, JobFailureCode, JobId, JobKind,
     JobLease, JobRecord, JobRepository, JobRepositoryError, JobState, NewJob, StaleJobRecovery,

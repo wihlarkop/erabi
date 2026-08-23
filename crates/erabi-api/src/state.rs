@@ -5,6 +5,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use erabi_db::ErabiDatabase;
+use erabi_jobs::ProgressLiveHub;
+
 /// Runtime service mode used to protect mutable surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "mode")]
@@ -45,11 +48,31 @@ struct RuntimeSnapshot {
     crawl4ai: Crawl4AiAvailability,
 }
 
+/// Runtime-owned progress dependencies shared by the authenticated SSE route.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressRuntimeState {
+    database: ErabiDatabase,
+    live_hub: ProgressLiveHub,
+}
+
+impl ProgressRuntimeState {
+    #[must_use]
+    pub(crate) const fn database(&self) -> &ErabiDatabase {
+        &self.database
+    }
+
+    #[must_use]
+    pub(crate) const fn live_hub(&self) -> &ProgressLiveHub {
+        &self.live_hub
+    }
+}
+
 /// Shared state used by the hardened shell and extended by later runtime tasks.
 #[derive(Clone, Debug)]
 pub struct AppState {
     runtime: Arc<RwLock<RuntimeSnapshot>>,
     accepting_mutations: Arc<AtomicBool>,
+    progress: Option<Arc<ProgressRuntimeState>>,
 }
 
 impl AppState {
@@ -69,7 +92,24 @@ impl AppState {
                 crawl4ai: Crawl4AiAvailability::Available,
             })),
             accepting_mutations: Arc::new(AtomicBool::new(true)),
+            progress: None,
         }
+    }
+
+    /// Attaches the durable progress store and live fan-out used by Task 2B.
+    #[must_use]
+    pub fn with_progress_runtime(
+        mut self,
+        database: ErabiDatabase,
+        live_hub: ProgressLiveHub,
+    ) -> Self {
+        self.progress = Some(Arc::new(ProgressRuntimeState { database, live_hub }));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn progress_runtime(&self) -> Option<Arc<ProgressRuntimeState>> {
+        self.progress.clone()
     }
 
     /// Reads the current readiness state.

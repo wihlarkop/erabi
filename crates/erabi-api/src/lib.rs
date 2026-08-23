@@ -6,6 +6,7 @@
 
 mod app;
 mod error;
+mod progress;
 mod redaction;
 mod run_safety;
 mod state;

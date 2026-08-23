@@ -1,8 +1,7 @@
-//! Generic Tokio worker boundary over Erabi's durable leased queue.
+//! Generic Tokio worker and durable progress boundaries for Erabi jobs.
 //!
-//! This crate intentionally has no crawl, extraction, export, progress, or
-//! cancellation implementation. Future plans supply handlers behind the typed
-//! [`JobHandler`] boundary.
+//! Crawl, extraction, export, and cancellation behavior remain in later plans;
+//! this crate owns generic leased execution and replayable progress services.
 
 use std::{panic::AssertUnwindSafe, time::Duration};
 
@@ -19,8 +18,8 @@ use tokio::time::{Instant, interval_at};
 mod progress;
 
 pub use progress::{
-    ProgressPublication, ProgressPublisher, ProgressPublisherError, ProgressService,
-    ProgressServiceError,
+    ProgressLiveHub, ProgressLiveHubError, ProgressPublication, ProgressPublisher,
+    ProgressPublisherError, ProgressService, ProgressServiceError,
 };
 
 pub use erabi_db::repositories::{AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob};
@@ -315,7 +314,7 @@ fn current_queue_time(initial_now: i64, started: Instant) -> Result<i64, JobRunt
 }
 
 /// Performs Plan 03's startup hooks with durable queue state as authority.
-/// This does not start a handler or introduce progress/cancellation semantics.
+/// This does not start a handler or introduce cancellation semantics.
 ///
 /// # Errors
 /// Returns an error when stale-job recovery or durable concurrency rebuilding

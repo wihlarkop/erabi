@@ -9,6 +9,9 @@ use erabi_db::{
         ProgressRepository, ProgressRepositoryError,
     },
 };
+use tokio::sync::broadcast;
+
+const DEFAULT_PROGRESS_LIVE_CAPACITY: usize = 256;
 
 /// A sanitized failure to notify an in-memory live-progress consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -16,6 +19,68 @@ pub enum ProgressPublisherError {
     /// The transient live-notification path could not accept the event.
     #[error("the live progress notification could not be delivered")]
     NotificationFailed,
+}
+
+/// Invalid construction of the bounded in-memory live progress fan-out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ProgressLiveHubError {
+    /// A broadcast channel requires at least one retained slot.
+    #[error("the live progress buffer capacity must be at least one")]
+    InvalidCapacity,
+}
+
+/// Best-effort in-process fan-out for already-committed progress events.
+///
+/// This hub is deliberately not authoritative. Receivers that lag or reconnect
+/// recover from the durable repository by sequence instead of trusting this
+/// bounded in-memory buffer.
+#[derive(Clone, Debug)]
+pub struct ProgressLiveHub {
+    sender: broadcast::Sender<ProgressEvent>,
+}
+
+impl ProgressLiveHub {
+    /// Creates the default bounded live fan-out.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a live fan-out with an explicit capacity for deterministic tests
+    /// or a future bounded runtime policy.
+    ///
+    /// # Errors
+    /// Returns an error when `capacity` is zero.
+    pub fn with_capacity(capacity: usize) -> Result<Self, ProgressLiveHubError> {
+        if capacity == 0 {
+            return Err(ProgressLiveHubError::InvalidCapacity);
+        }
+        let (sender, receiver) = broadcast::channel(capacity);
+        drop(receiver);
+        Ok(Self { sender })
+    }
+
+    /// Subscribes before durable replay so concurrent publication cannot fall
+    /// into the reconnect handoff window.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<ProgressEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Returns the current number of live subscribers for safe diagnostics and
+    /// deterministic integration tests.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+}
+
+impl Default for ProgressLiveHub {
+    fn default() -> Self {
+        let (sender, receiver) = broadcast::channel(DEFAULT_PROGRESS_LIVE_CAPACITY);
+        drop(receiver);
+        Self { sender }
+    }
 }
 
 /// Future Task 2B live-delivery seam. Implementations must not treat this as
@@ -26,6 +91,18 @@ pub trait ProgressPublisher: Send + Sync {
         &self,
         event: ProgressEvent,
     ) -> impl Future<Output = Result<(), ProgressPublisherError>> + Send;
+}
+
+impl ProgressPublisher for ProgressLiveHub {
+    fn publish(
+        &self,
+        event: ProgressEvent,
+    ) -> impl Future<Output = Result<(), ProgressPublisherError>> + Send {
+        // A receiver-free broadcast is not a failure: durable replay remains
+        // authoritative and a later subscriber can reconnect by sequence.
+        let _ = self.sender.send(event);
+        std::future::ready(Ok(()))
+    }
 }
 
 /// Result of one durable append followed by its optional live notification.
