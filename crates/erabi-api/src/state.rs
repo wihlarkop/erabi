@@ -78,7 +78,7 @@ impl AppState {
         }
     }
 
-    /// Marks Crawl4AI as unavailable without entering Recovery Mode.
+    /// Marks `Crawl4AI` as unavailable without entering Recovery Mode.
     pub fn set_crawl4ai_degraded(&self, message: impl Into<String>) {
         if let Ok(mut runtime) = self.runtime.write() {
             runtime.crawl4ai = Crawl4AiAvailability::Degraded {
@@ -107,7 +107,7 @@ impl AppState {
         )
     }
 
-    /// Provides the Crawl4AI availability used by readiness and diagnostics.
+    /// Provides the `Crawl4AI` availability used by readiness and diagnostics.
     #[must_use]
     pub fn crawl4ai_availability(&self) -> Crawl4AiAvailability {
         self.runtime.read().map_or_else(

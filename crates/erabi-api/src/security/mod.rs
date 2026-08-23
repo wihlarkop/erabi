@@ -30,6 +30,7 @@ pub struct SecurityConfig {
     expected_hosts: BTreeSet<String>,
     allowed_origins: BTreeSet<String>,
     mutation_body_limit_bytes: usize,
+    openapi_enabled: bool,
 }
 
 impl SecurityConfig {
@@ -47,6 +48,7 @@ impl SecurityConfig {
             expected_hosts: BTreeSet::from([host_for_socket_addr(bind_address)]),
             allowed_origins: BTreeSet::new(),
             mutation_body_limit_bytes: 64 * 1024,
+            openapi_enabled: true,
         })
     }
 
@@ -79,6 +81,7 @@ impl SecurityConfig {
             expected_hosts,
             allowed_origins: canonical_origins,
             mutation_body_limit_bytes: 64 * 1024,
+            openapi_enabled: false,
         })
     }
 
@@ -93,6 +96,21 @@ impl SecurityConfig {
     pub const fn with_mutation_body_limit(mut self, bytes: usize) -> Self {
         self.mutation_body_limit_bytes = bytes;
         self
+    }
+
+    /// Explicitly configures whether the generated `OpenAPI` document is exposed.
+    ///
+    /// Remote callers must opt in; loopback starts enabled by default.
+    #[must_use]
+    pub const fn with_openapi_enabled(mut self, enabled: bool) -> Self {
+        self.openapi_enabled = enabled;
+        self
+    }
+
+    /// Returns whether `OpenAPI` is exposed behind the protected router boundary.
+    #[must_use]
+    pub const fn openapi_enabled(&self) -> bool {
+        self.openapi_enabled
     }
 
     pub(crate) fn requires_bearer_authentication(&self) -> bool {
@@ -125,6 +143,7 @@ impl fmt::Debug for SecurityConfig {
             .field("expected_hosts", &self.expected_hosts)
             .field("allowed_origins", &self.allowed_origins)
             .field("mutation_body_limit_bytes", &self.mutation_body_limit_bytes)
+            .field("openapi_enabled", &self.openapi_enabled)
             .finish()
     }
 }

@@ -26,6 +26,13 @@ fn remote_router() -> Result<Router, Box<dyn std::error::Error>> {
     Ok(build_router(AppState::ready(), security))
 }
 
+fn remote_router_with_openapi(enabled: bool) -> Result<Router, Box<dyn std::error::Error>> {
+    let address: SocketAddr = REMOTE_HOST.parse()?;
+    let security = SecurityConfig::remote(address, SecretString::from(TOKEN), Vec::new())?
+        .with_openapi_enabled(enabled);
+    Ok(build_router(AppState::ready(), security))
+}
+
 #[test]
 fn loopback_policy_rejects_a_non_loopback_listener() -> Result<(), Box<dyn std::error::Error>> {
     let address: SocketAddr = REMOTE_HOST.parse()?;
@@ -298,5 +305,64 @@ async fn crawl4ai_outage_is_degraded_without_entering_recovery_mode()
         value["crawl4ai"]["DEGRADED"]["message"],
         "adapter unavailable"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn loopback_exposes_a_secret_free_openapi_document_by_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let response = loopback_router()?
+        .oneshot(request("GET", "/api/v1/openapi.json").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let document: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(document["openapi"], "3.1.0");
+    assert!(document["paths"].get("/api/v1/readiness").is_some());
+    assert!(!String::from_utf8(body.to_vec())?.contains(TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_openapi_is_disabled_without_explicit_opt_in()
+-> Result<(), Box<dyn std::error::Error>> {
+    let unauthenticated = remote_router()?
+        .oneshot(request("GET", "/api/v1/openapi.json").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let disabled = remote_router()?
+        .oneshot(
+            request("GET", "/api/v1/openapi.json")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(disabled).await?, "OPENAPI_DISABLED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicitly_enabled_remote_openapi_remains_bearer_protected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let unauthenticated = remote_router_with_openapi(true)?
+        .oneshot(request("GET", "/api/v1/openapi.json").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        error_code(unauthenticated).await?,
+        "AUTHENTICATION_REQUIRED"
+    );
+
+    let authenticated = remote_router_with_openapi(true)?
+        .oneshot(
+            request("GET", "/api/v1/openapi.json")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(authenticated.status(), StatusCode::OK);
     Ok(())
 }

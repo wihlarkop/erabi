@@ -9,6 +9,7 @@ use axum::{
     routing::{any, get},
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -46,10 +47,17 @@ impl TraceId {
 /// backup, raw-artifact, diagnostics, and SPA surfaces in one place. Later
 /// route modules attach below this boundary instead of creating parallel,
 /// accidentally unauthenticated routers.
+#[allow(clippy::needless_pass_by_value)] // Public contract intentionally owns the shared router state.
 pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
     let liveness = Router::new().route("/api/v1/health", get(liveness));
+    let documentation = if security.openapi_enabled() {
+        Router::new().route("/api/v1/openapi.json", get(openapi_document))
+    } else {
+        Router::new().route("/api/v1/openapi.json", get(openapi_disabled))
+    };
 
     let protected = Router::new()
+        .merge(documentation)
         .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
@@ -115,6 +123,21 @@ async fn runtime_diagnostics(
         mode: app_state.runtime_mode(),
         crawl4ai: app_state.crawl4ai_availability(),
     })
+}
+
+async fn openapi_document() -> Json<OpenApiDocument> {
+    Json(OpenApiDocument::generated())
+}
+
+async fn openapi_disabled(Extension(trace_id): Extension<TraceId>) -> Response {
+    error_response(
+        StatusCode::NOT_FOUND,
+        ApiErrorEnvelope::new(
+            "OPENAPI_DISABLED",
+            "OpenAPI documentation is disabled for this bind mode.",
+            trace_id.as_str(),
+        ),
+    )
 }
 
 async fn recovery_mode_guard(
@@ -209,4 +232,57 @@ struct ReadinessResponse {
 struct RuntimeDiagnosticsResponse {
     mode: RuntimeMode,
     crawl4ai: Crawl4AiAvailability,
+}
+
+/// `OpenAPI` document generated from the currently available stable route contracts.
+#[derive(Serialize)]
+struct OpenApiDocument {
+    openapi: &'static str,
+    info: OpenApiInfo,
+    paths: BTreeMap<&'static str, OpenApiPath>,
+}
+
+impl OpenApiDocument {
+    fn generated() -> Self {
+        let mut paths = BTreeMap::new();
+        paths.insert("/api/v1/health", OpenApiPath::get("Liveness"));
+        paths.insert("/api/v1/readiness", OpenApiPath::get("Readiness"));
+        paths.insert(
+            "/api/v1/diagnostics/status",
+            OpenApiPath::get("Safe runtime diagnostics"),
+        );
+        paths.insert("/api/v1/openapi.json", OpenApiPath::get("OpenAPI document"));
+        Self {
+            openapi: "3.1.0",
+            info: OpenApiInfo {
+                title: "Erabi API",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            paths,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OpenApiInfo {
+    title: &'static str,
+    version: &'static str,
+}
+
+#[derive(Serialize)]
+struct OpenApiPath {
+    get: OpenApiOperation,
+}
+
+impl OpenApiPath {
+    const fn get(summary: &'static str) -> Self {
+        Self {
+            get: OpenApiOperation { summary },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OpenApiOperation {
+    summary: &'static str,
 }

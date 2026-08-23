@@ -697,6 +697,7 @@ dependencies = [
  "dotenvy",
  "secrecy",
  "thiserror",
+ "tokio",
  "url",
 ]
 
