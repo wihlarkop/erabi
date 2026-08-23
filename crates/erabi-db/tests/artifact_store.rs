@@ -57,9 +57,7 @@ fn artifact_store_publishes_bytes_atomically_with_hash_and_size()
         b"hello"
     );
     assert!(std::fs::read_dir(store.root().join("pages"))?.all(|entry| {
-        entry
-            .map(|entry| !entry.file_name().to_string_lossy().ends_with(".partial"))
-            .unwrap_or(false)
+        entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().ends_with(".partial"))
     }));
     Ok(())
 }

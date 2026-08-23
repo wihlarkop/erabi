@@ -162,6 +162,43 @@ impl MigrationRunner {
         read_schema_versions(&connection).await
     }
 
+    /// Verifies that recorded migrations exactly match this bundled chain
+    /// without creating schema metadata or modifying product state.
+    ///
+    /// # Errors
+    /// Returns a typed migration failure when schema history is incomplete,
+    /// unknown, reordered, renamed, or checksum-incompatible.
+    pub async fn verify(&self, database: &ErabiDatabase) -> Result<(), DbError> {
+        self.validate_plan()?;
+        let connection = database.connection().await?;
+        let applied = read_schema_versions(&connection).await?;
+        self.validate_applied_versions(&applied)?;
+        if applied.len() != self.migrations.len() {
+            return Err(migration_failure(
+                None,
+                MigrationFailureState::UnsupportedSchema,
+                "recorded migrations do not cover the complete bundled schema chain",
+            ));
+        }
+        for (migration, recorded) in self.migrations.iter().zip(&applied) {
+            if recorded.version != migration.version || recorded.name != migration.name {
+                return Err(migration_failure(
+                    Some(&recorded.version),
+                    MigrationFailureState::UnsupportedSchema,
+                    "recorded migration identity differs from the bundled schema chain",
+                ));
+            }
+            if recorded.checksum != migration_checksum(migration)? {
+                return Err(migration_failure(
+                    Some(&recorded.version),
+                    MigrationFailureState::ChecksumMismatch,
+                    "recorded migration checksum differs from the bundled schema chain",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_until(
         &self,
         database: &ErabiDatabase,

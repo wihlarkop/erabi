@@ -6,6 +6,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{CrawlRunType, CrawlerId, CrawlerVersionId, ResolvedValue, RunProfileId, SeedId};
 
+/// Maximum supported size for an exact, immutable robots override reason.
+///
+/// The value is intentionally large enough for an operator's explanation but
+/// bounded so audit snapshots cannot become untrusted arbitrary payloads.
+pub const MAX_ROBOTS_OVERRIDE_REASON_CHARS: usize = 1_000;
+
 /// Errors that prevent creation of an auditable, deterministic run snapshot.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -98,6 +104,11 @@ impl RobotsAudit {
     ) -> Result<Self, SnapshotError> {
         let reason = reason.into();
         require_non_empty("robots override reason", &reason)?;
+        if reason.chars().count() > MAX_ROBOTS_OVERRIDE_REASON_CHARS {
+            return Err(SnapshotError::Invalid(format!(
+                "robots override reason must not exceed {MAX_ROBOTS_OVERRIDE_REASON_CHARS} characters"
+            )));
+        }
         Ok(Self {
             decision: RobotsDecision::Override { reason },
             actor: actor.into(),
@@ -145,6 +156,11 @@ impl RobotsAudit {
         require_non_empty("robots user agent", &self.user_agent)?;
         if let RobotsDecision::Override { reason } = &self.decision {
             require_non_empty("robots override reason", reason)?;
+            if reason.chars().count() > MAX_ROBOTS_OVERRIDE_REASON_CHARS {
+                return Err(SnapshotError::Invalid(format!(
+                    "robots override reason must not exceed {MAX_ROBOTS_OVERRIDE_REASON_CHARS} characters"
+                )));
+            }
         }
         Ok(())
     }
@@ -375,7 +391,7 @@ fn write_canonical_json(
         serde_json::Value::Object(values) => {
             output.push('{');
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             for (index, (key, value)) in entries.into_iter().enumerate() {
                 if index > 0 {
                     output.push(',');
