@@ -698,6 +698,7 @@ dependencies = [
  "dotenvy",
  "erabi-api",
  "erabi-db",
+ "erabi-jobs",
  "secrecy",
  "thiserror",
  "tokio",
@@ -771,6 +772,12 @@ version = "0.1.0"
 [[package]]
 name = "erabi-jobs"
 version = "0.1.0"
+dependencies = [
+ "erabi-db",
+ "futures-util",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "erased-serde"

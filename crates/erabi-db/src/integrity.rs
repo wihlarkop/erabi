@@ -1,4 +1,4 @@
-//! Read-only startup integrity checks for the implemented Plan 01-03 surface.
+//! Read-only startup integrity checks for the implemented Plan 01-04 surface.
 
 use std::{fs, path::Path};
 
@@ -25,6 +25,10 @@ const CRITICAL_TABLES: &[&str] = &[
     "crawl_runs",
     "discovered_urls",
     "artifacts",
+    "jobs",
+    "job_attempts",
+    "job_checkpoints",
+    "job_progress_events",
 ];
 
 const CRITICAL_INDEXES: &[&str] = &[
@@ -33,6 +37,16 @@ const CRITICAL_INDEXES: &[&str] = &[
     "crawl_runs_by_created_at",
     "discovered_urls_by_run",
     "artifacts_by_hash",
+    "jobs_ready_by_schedule",
+    "jobs_running_by_lease_expiry",
+    "jobs_by_parent",
+    "jobs_by_crawl_run",
+    "job_attempts_by_job",
+    "job_attempts_running_by_job",
+    "job_checkpoints_by_job",
+    "job_checkpoints_by_attempt",
+    "job_progress_events_by_job_sequence",
+    "job_progress_events_by_attempt",
 ];
 
 const CRITICAL_TRIGGERS: &[&str] = &[
@@ -51,6 +65,15 @@ const CRITICAL_TRIGGERS: &[&str] = &[
     "discovery_transitions_published_version_no_update",
     "discovery_transitions_published_version_no_delete",
     "crawl_runs_snapshot_immutable",
+    "jobs_must_start_queued",
+    "jobs_legal_state_transition",
+    "jobs_lease_state_consistency",
+    "job_attempts_terminal_history_immutable",
+    "job_attempts_no_delete",
+    "job_checkpoints_no_update",
+    "job_checkpoints_no_delete",
+    "job_progress_events_no_update",
+    "job_progress_events_no_delete",
 ];
 
 /// Stable, secret-free failures surfaced through Recovery Mode diagnostics.
@@ -74,6 +97,9 @@ pub enum LightweightIntegrityError {
     /// The existing artifact root is not a controlled accessible directory.
     #[error("the controlled artifact root is inaccessible or unsafe")]
     ArtifactRootUnsafe,
+    /// Durable lease or attempt history could permit unsafe job scheduling.
+    #[error("durable job ownership or attempt history is inconsistent")]
+    QueueInvariantInconsistent,
 }
 
 impl LightweightIntegrityError {
@@ -87,6 +113,7 @@ impl LightweightIntegrityError {
             Self::ActiveVersionPointerInconsistent => "ACTIVE_VERSION_POINTER_INCONSISTENT",
             Self::PersistedConfigurationInvalid => "PERSISTED_CONFIGURATION_INVALID",
             Self::ArtifactRootUnsafe => "ARTIFACT_ROOT_UNSAFE",
+            Self::QueueInvariantInconsistent => "QUEUE_INVARIANT_VIOLATION",
         }
     }
 
@@ -110,6 +137,9 @@ impl LightweightIntegrityError {
                 "A persisted configuration record is invalid and requires recovery."
             }
             Self::ArtifactRootUnsafe => "The controlled artifact root is inaccessible or unsafe.",
+            Self::QueueInvariantInconsistent => {
+                "Durable job ownership or attempt history is inconsistent and requires recovery."
+            }
         }
     }
 }
@@ -169,6 +199,7 @@ impl<'database, 'path> LightweightIntegrityChecker<'database, 'path> {
         ensure_schema_objects(&connection, "index", CRITICAL_INDEXES).await?;
         ensure_schema_objects(&connection, "trigger", CRITICAL_TRIGGERS).await?;
         ensure_active_version_pointers(&connection).await?;
+        ensure_job_queue_invariants(&connection).await?;
         ConfigurationRepository::new(self.database)
             .validate_all()
             .await
@@ -176,6 +207,33 @@ impl<'database, 'path> LightweightIntegrityChecker<'database, 'path> {
         ensure_artifact_root(self.canonical_data_dir)?;
         Ok(())
     }
+}
+
+async fn ensure_job_queue_invariants(
+    connection: &turso::Connection,
+) -> Result<(), LightweightIntegrityError> {
+    const INCONSISTENCIES: [&str; 5] = [
+        "SELECT 1 FROM jobs AS job WHERE (job.state = 'RUNNING' AND (job.current_attempt = 0 OR job.lease_id IS NULL OR job.lease_owner IS NULL OR job.lease_generation = 0 OR job.lease_acquired_at IS NULL OR job.lease_expires_at IS NULL OR job.heartbeat_at IS NULL)) OR (job.state <> 'RUNNING' AND (job.lease_id IS NOT NULL OR job.lease_owner IS NOT NULL OR job.lease_acquired_at IS NOT NULL OR job.lease_expires_at IS NOT NULL OR job.heartbeat_at IS NOT NULL)) LIMIT 1",
+        "SELECT 1 FROM jobs AS job LEFT JOIN job_attempts AS attempt ON attempt.job_id = job.id AND attempt.attempt_number = job.current_attempt AND attempt.outcome = 'RUNNING' WHERE job.state = 'RUNNING' AND (attempt.id IS NULL OR attempt.lease_id <> job.lease_id OR attempt.lease_generation <> job.lease_generation OR attempt.worker_id <> job.lease_owner) LIMIT 1",
+        "SELECT 1 FROM jobs AS job JOIN job_attempts AS attempt ON attempt.job_id = job.id WHERE job.state <> 'RUNNING' AND attempt.outcome = 'RUNNING' LIMIT 1",
+        "SELECT 1 FROM jobs AS job WHERE job.current_attempt <> COALESCE((SELECT MAX(attempt.attempt_number) FROM job_attempts AS attempt WHERE attempt.job_id = job.id), 0) LIMIT 1",
+        "SELECT 1 FROM job_attempts AS attempt LEFT JOIN jobs AS job ON job.id = attempt.job_id WHERE job.id IS NULL OR attempt.attempt_number > job.max_attempts LIMIT 1",
+    ];
+    for query in INCONSISTENCIES {
+        let mut rows = connection
+            .query(query, ())
+            .await
+            .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
+        if rows
+            .next()
+            .await
+            .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?
+            .is_some()
+        {
+            return Err(LightweightIntegrityError::QueueInvariantInconsistent);
+        }
+    }
+    Ok(())
 }
 
 async fn ensure_schema_objects(

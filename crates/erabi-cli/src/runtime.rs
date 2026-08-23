@@ -10,7 +10,12 @@ use std::{
 
 use axum::Router;
 use erabi_api::{AppState, RuntimeMode, SecurityConfig, SecurityConfigError, build_router};
-use erabi_db::{ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner};
+use erabi_db::repositories::JobRepositoryError;
+use erabi_db::{
+    ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
+    repositories::ConcurrencyState,
+};
+use erabi_jobs::recover_and_rebuild_at;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -70,6 +75,7 @@ pub struct RunningRuntime {
     stop_server: watch::Sender<bool>,
     server_task: JoinHandle<io::Result<()>>,
     _database: ErabiDatabase,
+    _concurrency_state: ConcurrencyState,
 }
 
 impl RunningRuntime {
@@ -140,10 +146,18 @@ impl RunningRuntime {
             });
         }
 
-        if recovery.is_none() {
+        let concurrency_state = if recovery.is_none() {
             prepare_artifact_directories(&data_dir)?;
-            run_plan_four_startup_hooks();
-        }
+            match run_plan_four_startup_hooks(&database).await {
+                Ok(concurrency_state) => concurrency_state,
+                Err(recovery_state) => {
+                    recovery = Some(recovery_state);
+                    ConcurrencyState::default()
+                }
+            }
+        } else {
+            ConcurrencyState::default()
+        };
 
         let crawl4ai = if let Some(health) = options.crawl4ai_health {
             health
@@ -200,6 +214,7 @@ impl RunningRuntime {
             stop_server,
             server_task,
             _database: database,
+            _concurrency_state: concurrency_state,
         })
     }
 
@@ -365,9 +380,28 @@ fn prepare_artifact_directories(data_dir: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Plan 04 owns durable stale-job recovery and concurrency rebuilding. Plan 03
-/// invokes this bounded no-op seam without introducing durable job behavior.
-fn run_plan_four_startup_hooks() {}
+/// Executes the Plan 04 durable stale-job recovery and scheduler-state rebuild
+/// inside the existing Plan 03 startup boundary. No handler is started here;
+/// later plans register concrete work only after this durable state is safe.
+async fn run_plan_four_startup_hooks(
+    database: &ErabiDatabase,
+) -> Result<ConcurrencyState, RecoveryState> {
+    recover_and_rebuild_at(database, startup_epoch_seconds())
+        .await
+        .map(|(_, concurrency_state)| concurrency_state)
+        .map_err(|error| match error {
+            JobRepositoryError::QueueInvariant => RecoveryState {
+                code: "QUEUE_INVARIANT_VIOLATION".to_owned(),
+                message: "Durable job ownership or attempt history is inconsistent. Recovery Mode is active."
+                    .to_owned(),
+            },
+            _ => RecoveryState {
+                code: "JOB_RECOVERY_UNAVAILABLE".to_owned(),
+                message: "Durable job recovery could not complete safely. Recovery Mode is active."
+                    .to_owned(),
+            },
+        })
+}
 
 async fn probe_crawl4ai(config: &BootstrapConfig) -> Crawl4AiStartupHealth {
     let Some(url) = config.crawl4ai().base_url() else {
@@ -440,6 +474,14 @@ fn startup_timestamp() -> String {
         Ok(duration) => format!("unix:{}", duration.as_secs()),
         Err(_) => "unix:0".to_owned(),
     }
+}
+
+fn startup_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 struct RuntimeShutdownHooks {

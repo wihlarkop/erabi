@@ -30,7 +30,7 @@ impl StartupHooks for RecordingHooks {
 }
 
 #[test]
-fn startup_order_includes_only_plan_four_hooks_not_a_job_implementation() {
+fn startup_order_preserves_plan_four_recovery_and_concurrency_boundaries() {
     let mut hooks = RecordingHooks {
         stages: Vec::new(),
         failure: None,

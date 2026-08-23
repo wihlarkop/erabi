@@ -76,12 +76,9 @@ pub enum StartupOutcome {
     Fatal(StartupFatalError),
 }
 
-/// Dependencies supplied by the runtime without pulling Plan 04 job types forward.
+/// Dependencies supplied by the runtime startup sequence.
 pub trait StartupHooks {
     /// Performs the named startup action.
-    ///
-    /// `RecoverStaleJobsHook` and `RebuildConcurrencyHook` are intentionally
-    /// hook-only until Plan 04 supplies durable jobs/concurrency state.
     ///
     /// # Errors
     /// Classifies a stage failure as fatal or recovery-relevant.
@@ -134,6 +131,9 @@ pub fn run_startup(hooks: &mut impl StartupHooks) -> StartupOutcome {
 fn recovery_is_safe_at(stage: StartupStage) -> bool {
     matches!(
         stage,
-        StartupStage::ApplyMigrations | StartupStage::CheckIntegrity
+        StartupStage::ApplyMigrations
+            | StartupStage::CheckIntegrity
+            | StartupStage::RecoverStaleJobsHook
+            | StartupStage::RebuildConcurrencyHook
     )
 }
