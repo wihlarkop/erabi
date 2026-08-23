@@ -20,8 +20,8 @@ mod url_matcher;
 
 pub use collection::Collection;
 pub use crawl_snapshot::{
-    CrawlRunSnapshot, CrawlRunSnapshotDraft, RobotsAudit, RobotsDecision, RunConfiguration,
-    SnapshotError, SnapshotOperationalSettings, canonical_sha256,
+    CrawlRunSnapshot, CrawlRunSnapshotDraft, MAX_ROBOTS_OVERRIDE_REASON_CHARS, RobotsAudit,
+    RobotsDecision, RunConfiguration, SnapshotError, SnapshotOperationalSettings, canonical_sha256,
 };
 pub use crawler::Crawler;
 pub use crawler_version::{CrawlerVersion, CrawlerVersionState};
