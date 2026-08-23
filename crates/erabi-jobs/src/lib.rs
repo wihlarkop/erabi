@@ -16,7 +16,20 @@ use erabi_db::{
 use futures_util::FutureExt;
 use tokio::time::{Instant, interval_at};
 
+mod progress;
+
+pub use progress::{
+    ProgressPublication, ProgressPublisher, ProgressPublisherError, ProgressService,
+    ProgressServiceError,
+};
+
 pub use erabi_db::repositories::{AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob};
+pub use erabi_db::repositories::{
+    NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
+    ProgressMetadata, ProgressMetadataCode, ProgressMetadataKey, ProgressMetadataValue,
+    ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
+    ProgressSequence, ProgressTerminalState,
+};
 
 /// Fixed bounded retry and lease policy for one generic worker runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

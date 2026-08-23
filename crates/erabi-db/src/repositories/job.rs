@@ -22,6 +22,10 @@ impl JobId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_stored(value: String) -> Self {
+        Self(value)
+    }
 }
 
 impl Default for JobId {
