@@ -13,7 +13,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
-    AppState, SecurityConfig,
+    AppState, Crawl4AiAvailability, RuntimeMode, SecurityConfig,
     error::{ApiErrorEnvelope, error_response},
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
 };
@@ -51,6 +51,7 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
 
     let protected = Router::new()
         .route("/api/v1/readiness", get(readiness))
+        .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
         .route("/api/v1/events/{*path}", any(unavailable))
         .route("/api/v1/assets/{*path}", any(unavailable))
@@ -61,10 +62,14 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route("/", get(spa_boundary))
         .route("/{*path}", get(spa_boundary))
         .fallback(unavailable)
-        .with_state(app_state)
+        .with_state(app_state.clone())
         .layer(middleware::from_fn_with_state(
             security.clone(),
             enforce_browser_request_policy,
+        ))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            recovery_mode_guard,
         ))
         .layer(middleware::from_fn_with_state(security, require_bearer));
 
@@ -83,7 +88,15 @@ async fn readiness(
     Extension(trace_id): Extension<TraceId>,
 ) -> Response {
     if app_state.is_ready() {
-        return Json(ReadinessResponse { status: "ready" }).into_response();
+        let status = match app_state.crawl4ai_availability() {
+            Crawl4AiAvailability::Available => "ready",
+            Crawl4AiAvailability::Degraded { .. } => "degraded",
+        };
+        return Json(ReadinessResponse {
+            status,
+            crawl4ai: app_state.crawl4ai_availability(),
+        })
+        .into_response();
     }
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -93,6 +106,40 @@ async fn readiness(
             trace_id.as_str(),
         ),
     )
+}
+
+async fn runtime_diagnostics(
+    State(app_state): State<AppState>,
+) -> Json<RuntimeDiagnosticsResponse> {
+    Json(RuntimeDiagnosticsResponse {
+        mode: app_state.runtime_mode(),
+        crawl4ai: app_state.crawl4ai_availability(),
+    })
+}
+
+async fn recovery_mode_guard(
+    State(app_state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: middleware::Next,
+) -> Response {
+    if matches!(
+        *request.method(),
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    ) && !app_state.mutations_allowed()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiErrorEnvelope::new(
+                "RECOVERY_MODE_MUTATION_BLOCKED",
+                "Normal mutations are disabled while the service is in Recovery Mode.",
+                trace_id_for(&request),
+            ),
+        );
+    }
+    next.run(request).await
 }
 
 async fn unavailable(Extension(trace_id): Extension<TraceId>) -> Response {
@@ -155,4 +202,11 @@ struct LivenessResponse {
 #[derive(Serialize)]
 struct ReadinessResponse {
     status: &'static str,
+    crawl4ai: Crawl4AiAvailability,
+}
+
+#[derive(Serialize)]
+struct RuntimeDiagnosticsResponse {
+    mode: RuntimeMode,
+    crawl4ai: Crawl4AiAvailability,
 }

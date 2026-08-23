@@ -249,3 +249,54 @@ async fn safe_trace_ids_propagate_into_headers_and_error_envelopes()
     assert!(value.get("details").is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn recovery_mode_blocks_mutations_but_keeps_safe_diagnostics_available()
+-> Result<(), Box<dyn std::error::Error>> {
+    let address: SocketAddr = "127.0.0.1:7878".parse()?;
+    let state = AppState::ready();
+    state.enter_recovery("INTEGRITY_FAILURE", "Integrity check failed safely.");
+    let router = build_router(state, SecurityConfig::loopback(address)?);
+
+    let mutation = router
+        .clone()
+        .oneshot(
+            request("POST", "/api/v1/runs")
+                .header(header::HOST, "127.0.0.1:7878")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(mutation.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        error_code(mutation).await?,
+        "RECOVERY_MODE_MUTATION_BLOCKED"
+    );
+
+    let diagnostics = router
+        .oneshot(request("GET", "/api/v1/diagnostics/status").body(Body::empty())?)
+        .await?;
+    assert_eq!(diagnostics.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn crawl4ai_outage_is_degraded_without_entering_recovery_mode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let address: SocketAddr = "127.0.0.1:7878".parse()?;
+    let state = AppState::ready();
+    state.set_crawl4ai_degraded("adapter unavailable");
+    let router = build_router(state, SecurityConfig::loopback(address)?);
+    let readiness = router
+        .oneshot(request("GET", "/api/v1/readiness").body(Body::empty())?)
+        .await?;
+    assert_eq!(readiness.status(), StatusCode::OK);
+    let body = to_bytes(readiness.into_body(), usize::MAX).await?;
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["status"], "degraded");
+    assert_eq!(
+        value["crawl4ai"]["DEGRADED"]["message"],
+        "adapter unavailable"
+    );
+    Ok(())
+}

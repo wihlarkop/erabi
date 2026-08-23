@@ -20,4 +20,4 @@ pub use run_safety::{
     reuse_frozen_robots_decision,
 };
 pub use security::{SecurityConfig, SecurityConfigError};
-pub use state::AppState;
+pub use state::{AppState, Crawl4AiAvailability, RuntimeMode};

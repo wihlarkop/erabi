@@ -705,6 +705,8 @@ name = "erabi-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "erabi-db",
+ "erabi-domain",
  "secrecy",
  "serde",
  "serde_json",
