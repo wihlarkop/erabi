@@ -6,3 +6,9 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+dotenvy = "0.15.7"
+secrecy = "0.10.3"
+thiserror = "2.0.20"
+url = "2.5.8"
