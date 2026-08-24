@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use erabi_db::{
@@ -313,7 +316,7 @@ impl JobHandler for CheckpointThenWait {
         let observed_cancellation = Arc::clone(&self.observed_cancellation);
         async move {
             context
-                .checkpoint(&checkpoint, 0)
+                .checkpoint(&checkpoint)
                 .await
                 .map_err(|_| JobExecutionError)?;
             started.notify_one();
@@ -330,6 +333,86 @@ struct InvalidCheckpointThenWait {
     checkpoint_failed: Arc<AtomicBool>,
 }
 
+struct CheckpointAfterSignal {
+    started: Arc<Notify>,
+    persist: Arc<Notify>,
+    checkpoint: CheckpointEnvelope,
+    persisted: Arc<AtomicBool>,
+}
+
+impl JobHandler for CheckpointAfterSignal {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let started = Arc::clone(&self.started);
+        let persist = Arc::clone(&self.persist);
+        let checkpoint = self.checkpoint.clone();
+        let persisted = Arc::clone(&self.persisted);
+        async move {
+            started.notify_one();
+            persist.notified().await;
+            if context.checkpoint(&checkpoint).await.is_ok() {
+                persisted.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+    }
+}
+
+struct TwoCheckpointsAtSignals {
+    first_persisted: Arc<Notify>,
+    persist_second: Arc<Notify>,
+    first: CheckpointEnvelope,
+    second: CheckpointEnvelope,
+}
+
+impl JobHandler for TwoCheckpointsAtSignals {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let first_persisted = Arc::clone(&self.first_persisted);
+        let persist_second = Arc::clone(&self.persist_second);
+        let first = self.first.clone();
+        let second = self.second.clone();
+        async move {
+            context
+                .checkpoint(&first)
+                .await
+                .map_err(|_| JobExecutionError)?;
+            first_persisted.notify_one();
+            persist_second.notified().await;
+            context
+                .checkpoint(&second)
+                .await
+                .map(|_| ())
+                .map_err(|_| JobExecutionError)
+        }
+    }
+}
+
+struct WaitForLeaseLossCancellation {
+    started: Arc<Notify>,
+    observed_cancellation: Arc<AtomicBool>,
+}
+
+impl JobHandler for WaitForLeaseLossCancellation {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let started = Arc::clone(&self.started);
+        let observed_cancellation = Arc::clone(&self.observed_cancellation);
+        async move {
+            started.notify_one();
+            context.cancellation().cancelled().await;
+            observed_cancellation.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+}
+
 impl JobHandler for InvalidCheckpointThenWait {
     fn execute(
         &self,
@@ -342,7 +425,7 @@ impl JobHandler for InvalidCheckpointThenWait {
             .clone_from(&checkpoint.completed_units);
         let checkpoint_failed = Arc::clone(&self.checkpoint_failed);
         async move {
-            if context.checkpoint(&checkpoint, 0).await.is_err() {
+            if context.checkpoint(&checkpoint).await.is_err() {
                 checkpoint_failed.store(true, Ordering::Release);
             }
             started.notify_one();
@@ -440,6 +523,153 @@ async fn lost_heartbeat_ownership_never_commits_a_stale_handler_result()
         repository.attempts(&job.id).await?[0].outcome,
         AttemptOutcome::LeaseExpired
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_lease_rejects_checkpoint_without_handler_control_of_time()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(
+        &database,
+        "worker-checkpoint-time",
+        WorkerPolicy {
+            lease_duration_seconds: 30,
+            retry_delay_seconds: 0,
+        },
+    )?;
+    let started = Arc::new(Notify::new());
+    let persist = Arc::new(Notify::new());
+    let persisted = Arc::new(AtomicBool::new(false));
+    let handler = CheckpointAfterSignal {
+        started: Arc::clone(&started),
+        persist: Arc::clone(&persist),
+        checkpoint: checkpoint("expired")?,
+        persisted: Arc::clone(&persisted),
+    };
+    let execution = runtime.execute_next_at(&handler, 0);
+    tokio::pin!(execution);
+
+    tokio::select! {
+        () = started.notified() => {}
+        result = &mut execution => return Err(format!("handler ended before lease expiry: {result:?}").into()),
+    }
+    let lease = repository
+        .job(&job.id)
+        .await?
+        .lease
+        .ok_or("lease missing")?;
+    repository.heartbeat(&job.id, &lease, 0, 1).await?;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    persist.notify_one();
+
+    assert!(matches!(
+        execution.await,
+        Err(JobRuntimeError::Repository(JobRepositoryError::LeaseLost))
+    ));
+    assert!(!persisted.load(Ordering::Acquire));
+    assert!(repository.checkpoints(&job.id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_owned_checkpoint_time_preserves_history_and_latest_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(
+        &database,
+        "worker-checkpoint-order",
+        WorkerPolicy {
+            lease_duration_seconds: 30,
+            retry_delay_seconds: 0,
+        },
+    )?;
+    let first_persisted = Arc::new(Notify::new());
+    let persist_second = Arc::new(Notify::new());
+    let handler = TwoCheckpointsAtSignals {
+        first_persisted: Arc::clone(&first_persisted),
+        persist_second: Arc::clone(&persist_second),
+        first: checkpoint("first")?,
+        second: checkpoint("second")?,
+    };
+    let execution = runtime.execute_next_at(&handler, 0);
+    tokio::pin!(execution);
+
+    tokio::select! {
+        () = first_persisted.notified() => {}
+        result = &mut execution => return Err(format!("handler ended before second checkpoint: {result:?}").into()),
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    persist_second.notify_one();
+    assert!(matches!(execution.await?, WorkerTurn::Succeeded { .. }));
+
+    let records = repository.checkpoints(&job.id).await?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].created_at, 0);
+    assert_eq!(records[1].created_at, 1);
+    assert_eq!(records[0].checkpoint.completed_units[0].as_str(), "first");
+    assert_eq!(records[1].checkpoint.completed_units[0].as_str(), "second");
+    assert_eq!(
+        repository
+            .latest_checkpoint(&job.id)
+            .await?
+            .ok_or("latest checkpoint missing")?
+            .checkpoint
+            .completed_units[0]
+            .as_str(),
+        "second"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_loss_signals_cooperative_handler_before_waiting_for_its_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(2, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(
+        &database,
+        "worker-lease-loss-cancel",
+        WorkerPolicy {
+            lease_duration_seconds: 3,
+            retry_delay_seconds: 0,
+        },
+    )?;
+    let started = Arc::new(Notify::new());
+    let observed = Arc::new(AtomicBool::new(false));
+    let handler = WaitForLeaseLossCancellation {
+        started: Arc::clone(&started),
+        observed_cancellation: Arc::clone(&observed),
+    };
+    let execution = runtime.execute_next_at(&handler, 0);
+    tokio::pin!(execution);
+
+    tokio::select! {
+        () = started.notified() => {}
+        result = &mut execution => return Err(format!("handler ended before lease loss: {result:?}").into()),
+    }
+    assert_eq!(repository.recover_stale_jobs(3).await?.requeued, 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    tokio::select! {
+        biased;
+        result = &mut execution => assert!(matches!(
+            result,
+            Err(JobRuntimeError::Repository(JobRepositoryError::LeaseLost | JobRepositoryError::IllegalTransition))
+        )),
+        () = tokio::time::advance(Duration::from_secs(1)) => panic!("lease loss did not signal the waiting handler"),
+    }
+    assert!(observed.load(Ordering::Acquire));
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Queued);
     Ok(())
 }
 

@@ -131,9 +131,8 @@ impl JobExecutionContext {
     pub async fn checkpoint(
         &self,
         checkpoint: &CheckpointEnvelope,
-        created_at: i64,
     ) -> Result<CheckpointRecord, JobRepositoryError> {
-        self.checkpoint_writer.append(checkpoint, created_at).await
+        self.checkpoint_writer.append(checkpoint).await
     }
 }
 
@@ -144,15 +143,22 @@ struct CheckpointWriter {
     attempt_id: String,
     lease: Arc<RwLock<JobLease>>,
     persisted: Arc<AtomicBool>,
+    initial_now: i64,
+    started: Instant,
 }
 
 impl CheckpointWriter {
     async fn append(
         &self,
         checkpoint: &CheckpointEnvelope,
-        created_at: i64,
     ) -> Result<CheckpointRecord, JobRepositoryError> {
         let lease = self.lease.read().await.clone();
+        let elapsed = i64::try_from(self.started.elapsed().as_secs())
+            .map_err(|_| JobRepositoryError::QueueInvariant)?;
+        let created_at = self
+            .initial_now
+            .checked_add(elapsed)
+            .ok_or(JobRepositoryError::QueueInvariant)?;
         let record = JobRepository::new(&self.database)
             .append_checkpoint(
                 &self.job_id,
@@ -297,10 +303,18 @@ impl<'database> JobRuntime<'database> {
         now: i64,
     ) -> Result<JobState, JobRuntimeError> {
         self.cancellation.request(job_id);
-        self.repository
+        let state = self
+            .repository
             .cancel_queued(job_id, now)
             .await
-            .map_err(JobRuntimeError::Repository)
+            .map_err(JobRuntimeError::Repository)?;
+        if matches!(
+            state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            self.cancellation.retire_after_terminal_boundary(job_id);
+        }
+        Ok(state)
     }
 
     /// Executes at most one eligible job using supplied deterministic time.
@@ -337,16 +351,19 @@ impl<'database> JobRuntime<'database> {
         let current_lease = match current_lease {
             Ok(lease) => lease,
             Err(error) => {
-                self.cancellation.release(&acquired.job.id);
+                self.cancellation.release(&acquired.job.id, false);
                 return Err(error);
             }
         };
+        let started = Instant::now();
         let checkpoint_writer = CheckpointWriter {
             database: self.database.clone(),
             job_id: acquired.job.id.clone(),
             attempt_id: acquired.attempt.id.clone(),
             lease: Arc::new(RwLock::new(current_lease.clone())),
             persisted: Arc::new(AtomicBool::new(false)),
+            initial_now: now,
+            started,
         };
         let context = JobExecutionContext {
             job_id: acquired.job.id.clone(),
@@ -357,8 +374,16 @@ impl<'database> JobRuntime<'database> {
             cancellation,
             checkpoint_writer,
         };
-        let outcome = self.execute_acquired(handler, context, now).await;
-        self.cancellation.release(&acquired.job.id);
+        let outcome = self.execute_acquired(handler, context, now, started).await;
+        self.cancellation.release(
+            &acquired.job.id,
+            matches!(
+                outcome,
+                Ok(WorkerTurn::Succeeded { .. }
+                    | WorkerTurn::Failed { .. }
+                    | WorkerTurn::Cancelled { .. })
+            ),
+        );
         outcome
     }
 
@@ -367,8 +392,8 @@ impl<'database> JobRuntime<'database> {
         handler: &H,
         context: JobExecutionContext,
         now: i64,
+        started: Instant,
     ) -> Result<WorkerTurn, JobRuntimeError> {
-        let started = Instant::now();
         let mut current_lease = context.lease.clone();
         let mut heartbeat = interval_at(
             started + self.policy.heartbeat_interval(),
@@ -397,9 +422,10 @@ impl<'database> JobRuntime<'database> {
                             context.checkpoint_writer.update_lease(renewed_lease).await;
                         }
                         Err(error) => {
-                            // Task 1 has no cancellation/checkpoint protocol. Let the
-                            // handler reach its own boundary, but never let its stale
-                            // result mutate durable queue state.
+                            // Lease loss revokes durable authority first, then signals
+                            // the handler to reach its existing cooperative boundary.
+                            // Its eventual result is intentionally discarded.
+                            context.cancellation.cancel();
                             let _ = handler.await;
                             return Err(JobRuntimeError::Repository(error));
                         }

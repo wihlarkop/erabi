@@ -429,7 +429,7 @@ impl<'database> CheckpointRepository<'database> {
         }
     }
 
-    /// Returns all append-only checkpoint evidence in commit order.
+    /// Returns all append-only checkpoint evidence in trusted-time order.
     ///
     /// # Errors
     /// Returns a typed malformed/inconsistent result instead of treating bad
@@ -443,25 +443,11 @@ impl<'database> CheckpointRepository<'database> {
             .connection()
             .await
             .map_err(CheckpointRepositoryError::from_db)?;
-        let mut rows = connection
-            .query(
-                "SELECT id, job_id, attempt_id, checkpoint_json, created_at, length(checkpoint_json) FROM job_checkpoints WHERE job_id = ?1 ORDER BY created_at, id",
-                [job_id.as_str()],
-            )
-            .await
-            .map_err(CheckpointRepositoryError::database)?;
-        let mut records = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(CheckpointRepositoryError::database)?
-        {
-            records.push(record_from_row(&row)?);
-        }
-        Ok(records)
+        records_from_connection(&connection, job_id).await
     }
 
-    /// Returns the latest checkpoint, if any, without hiding malformed data.
+    /// Returns the latest checkpoint, if any, without hiding malformed or
+    /// structurally inconsistent earlier evidence.
     ///
     /// # Errors
     /// Returns a typed error for malformed or inconsistent durable evidence.
@@ -474,7 +460,7 @@ impl<'database> CheckpointRepository<'database> {
             .connection()
             .await
             .map_err(CheckpointRepositoryError::from_db)?;
-        latest_from_connection(&connection, job_id).await
+        Ok(records_from_connection(&connection, job_id).await?.pop())
     }
 
     /// Classifies every expired active job using only durable checkpoint and
@@ -580,46 +566,31 @@ async fn ensure_owned_attempt(
     Ok(())
 }
 
-async fn latest_from_connection(
-    connection: &Connection,
-    job_id: &JobId,
-) -> Result<Option<CheckpointRecord>, CheckpointRepositoryError> {
-    let mut rows = connection
-        .query(
-            "SELECT id, job_id, attempt_id, checkpoint_json, created_at, length(checkpoint_json) FROM job_checkpoints WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
-            [job_id.as_str()],
-        )
-        .await
-        .map_err(CheckpointRepositoryError::database)?;
-    rows.next()
-        .await
-        .map_err(CheckpointRepositoryError::database)?
-        .map(|row| record_from_row(&row))
-        .transpose()
-}
-
 async fn assess_one_stale_job(
     connection: &Connection,
     job_id: &JobId,
     run_id: Option<&str>,
 ) -> Result<CheckpointRecoveryDisposition, CheckpointRepositoryError> {
-    let Some(latest) = (match latest_from_connection(connection, job_id).await {
-        Ok(latest) => latest,
+    let records = match records_from_connection(connection, job_id).await {
+        Ok(records) => records,
         Err(
             CheckpointRepositoryError::Malformed
             | CheckpointRepositoryError::Inconsistent
             | CheckpointRepositoryError::PayloadTooLarge,
         ) => return Ok(CheckpointRecoveryDisposition::Unsafe),
         Err(error) => return Err(error),
-    }) else {
+    };
+    let Some(latest) = records.last() else {
         return Ok(CheckpointRecoveryDisposition::RestartRequired);
     };
+    let Some(attempt_id) = latest.attempt_id.as_deref() else {
+        return Ok(CheckpointRecoveryDisposition::Unsafe);
+    };
+    if !active_checkpoint_lineage_is_valid(connection, job_id, attempt_id).await? {
+        return Ok(CheckpointRecoveryDisposition::Unsafe);
+    }
     let Some(run_id) = run_id else {
-        // Generic Task 3 jobs do not yet have a crawl-run projection to compare
-        // against. The envelope is still valid durable resume evidence; a
-        // later plan-specific resume action must apply `compatibility_with`
-        // against its immutable current identity before reusing it.
-        return Ok(CheckpointRecoveryDisposition::Recoverable);
+        return Ok(CheckpointRecoveryDisposition::RestartRequired);
     };
     let mut rows = connection
         .query(
@@ -646,7 +617,54 @@ async fn assess_one_stale_job(
     })
 }
 
+async fn active_checkpoint_lineage_is_valid(
+    connection: &Connection,
+    job_id: &JobId,
+    attempt_id: &str,
+) -> Result<bool, CheckpointRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM jobs AS job JOIN job_attempts AS attempt ON attempt.id = ?1 WHERE job.id = ?2 AND job.state = 'RUNNING' AND attempt.job_id = job.id AND attempt.attempt_number = job.current_attempt AND attempt.outcome = 'RUNNING' AND attempt.lease_id = job.lease_id AND attempt.lease_generation = job.lease_generation AND attempt.worker_id = job.lease_owner LIMIT 1",
+            (attempt_id, job_id.as_str()),
+        )
+        .await
+        .map_err(CheckpointRepositoryError::database)?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(CheckpointRepositoryError::database)?
+        .is_some())
+}
+
+async fn records_from_connection(
+    connection: &Connection,
+    job_id: &JobId,
+) -> Result<Vec<CheckpointRecord>, CheckpointRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT checkpoint.id, checkpoint.job_id, checkpoint.attempt_id, checkpoint.checkpoint_json, checkpoint.created_at, length(checkpoint.checkpoint_json), attempt.job_id FROM job_checkpoints AS checkpoint LEFT JOIN job_attempts AS attempt ON attempt.id = checkpoint.attempt_id WHERE checkpoint.job_id = ?1 ORDER BY checkpoint.created_at, checkpoint.id",
+            [job_id.as_str()],
+        )
+        .await
+        .map_err(CheckpointRepositoryError::database)?;
+    let mut records = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(CheckpointRepositoryError::database)?
+    {
+        records.push(record_from_row(&row)?);
+    }
+    Ok(records)
+}
+
 fn record_from_row(row: &turso::Row) -> Result<CheckpointRecord, CheckpointRepositoryError> {
+    let job_id: String = row.get(1).map_err(CheckpointRepositoryError::database)?;
+    let attempt_id: Option<String> = row.get(2).map_err(CheckpointRepositoryError::database)?;
+    let attempt_job_id: Option<String> = row.get(6).map_err(CheckpointRepositoryError::database)?;
+    if attempt_id.is_none() || attempt_job_id.as_deref() != Some(job_id.as_str()) {
+        return Err(CheckpointRepositoryError::Inconsistent);
+    }
     let encoded_length: i64 = row.get(5).map_err(CheckpointRepositoryError::database)?;
     let encoded_length =
         usize::try_from(encoded_length).map_err(|_| CheckpointRepositoryError::Inconsistent)?;
@@ -654,8 +672,8 @@ fn record_from_row(row: &turso::Row) -> Result<CheckpointRecord, CheckpointRepos
     let checkpoint = CheckpointEnvelope::decode(&encoded, encoded_length)?;
     Ok(CheckpointRecord {
         id: row.get(0).map_err(CheckpointRepositoryError::database)?,
-        job_id: JobId::from_stored(row.get(1).map_err(CheckpointRepositoryError::database)?),
-        attempt_id: row.get(2).map_err(CheckpointRepositoryError::database)?,
+        job_id: JobId::from_stored(job_id),
+        attempt_id,
         checkpoint,
         created_at: row.get(4).map_err(CheckpointRepositoryError::database)?,
     })
@@ -679,7 +697,8 @@ fn valid_hash(value: &str) -> Result<(), CheckpointRepositoryError> {
 mod tests {
     use super::*;
     use crate::{
-        MigrationRunner, repositories::JobKind, repositories::JobRepository, repositories::NewJob,
+        MigrationRunner, repositories::JobFailureCode, repositories::JobKind,
+        repositories::JobRepository, repositories::NewJob,
     };
 
     async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -809,6 +828,181 @@ mod tests {
         assert_eq!(
             jobs.job(&job.id).await?.state,
             super::super::job::JobState::Queued
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incompatible_current_identity_requires_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let jobs = JobRepository::new(&database);
+        let connection = database.connection().await?;
+        connection
+            .execute(
+                "INSERT INTO crawl_runs (id, run_type, status, crawler_id, crawler_version_id, snapshot_json, snapshot_hash, checkpoint_compatibility_hash, actor, created_at) VALUES (?1, 'QUICK_SCRAPE', 'RUNNING', NULL, NULL, '{}', ?2, ?3, 'operator', '2026-08-25T00:00:00Z')",
+                ("run-mismatch", "a".repeat(64), "c".repeat(64)),
+            )
+            .await?;
+        let mut job = job(2)?;
+        job.crawl_run_id = Some("run-mismatch".to_owned());
+        jobs.enqueue(&job, 0).await?;
+        let acquired = jobs
+            .acquire_next("checkpoint-worker", 0, 5)
+            .await?
+            .ok_or("job was not acquired")?;
+        let lease = acquired.job.lease.ok_or("lease missing")?;
+        jobs.append_checkpoint(
+            &job.id,
+            &acquired.attempt.id,
+            &lease,
+            &checkpoint_for("run-mismatch", "resume")?,
+            1,
+        )
+        .await?;
+        let assessments = CheckpointRepository::new(&database)
+            .assess_stale_jobs(5)
+            .await?;
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(
+            assessments[0].disposition,
+            CheckpointRecoveryDisposition::RestartRequired
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_or_unverifiable_identity_requires_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let jobs = JobRepository::new(&database);
+        let with_checkpoint = job(2)?;
+        let without_checkpoint = job(2)?;
+        jobs.enqueue(&with_checkpoint, 0).await?;
+        jobs.enqueue(&without_checkpoint, 0).await?;
+        let acquired = jobs
+            .acquire_next("checkpoint-worker", 0, 5)
+            .await?
+            .ok_or("checkpoint job was not acquired")?;
+        let lease = acquired.job.lease.ok_or("lease missing")?;
+        jobs.append_checkpoint(
+            &with_checkpoint.id,
+            &acquired.attempt.id,
+            &lease,
+            &checkpoint("generic-resume")?,
+            1,
+        )
+        .await?;
+        let second = jobs
+            .acquire_next("checkpoint-worker", 0, 5)
+            .await?
+            .ok_or("missing-checkpoint job was not acquired")?;
+        assert_eq!(second.job.id, without_checkpoint.id);
+
+        let assessments = CheckpointRepository::new(&database)
+            .assess_stale_jobs(5)
+            .await?;
+        assert_eq!(assessments.len(), 2);
+        assert!(assessments.iter().all(|assessment| {
+            assessment.disposition == CheckpointRecoveryDisposition::RestartRequired
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_checkpoint_attempt_lineage_is_unsafe_and_never_resumable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let jobs = JobRepository::new(&database);
+        let prior_attempt = job(2)?;
+        let cross_job = job(2)?;
+        let null_attempt = job(2)?;
+        jobs.enqueue(&prior_attempt, 0).await?;
+        let prior_first = jobs
+            .acquire_next("checkpoint-worker", 0, 5)
+            .await?
+            .ok_or("prior attempt job was not acquired")?;
+        jobs.fail(
+            &prior_attempt.id,
+            &prior_first.job.lease.ok_or("lease missing")?,
+            1,
+            JobFailureCode::HandlerFailed,
+            1,
+        )
+        .await?;
+        let prior_second = jobs
+            .acquire_next("checkpoint-worker", 1, 4)
+            .await?
+            .ok_or("current attempt job was not acquired")?;
+        assert_eq!(prior_second.job.id, prior_attempt.id);
+        jobs.enqueue(&cross_job, 0).await?;
+        jobs.enqueue(&null_attempt, 0).await?;
+        let first = jobs
+            .acquire_next("checkpoint-worker", 1, 4)
+            .await?
+            .ok_or("cross-job checkpoint job was not acquired")?;
+        let second = jobs
+            .acquire_next("checkpoint-worker", 1, 4)
+            .await?
+            .ok_or("null-attempt checkpoint job was not acquired")?;
+        let connection = database.connection().await?;
+        let encoded = checkpoint("corrupt-lineage")?.encode()?;
+        connection
+            .execute(
+                "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    Uuid::now_v7().to_string(),
+                    first.job.id.as_str(),
+                    second.attempt.id.as_str(),
+                    encoded.as_str(),
+                    1,
+                ),
+            )
+            .await?;
+        connection
+            .execute(
+                "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    Uuid::now_v7().to_string(),
+                    prior_attempt.id.as_str(),
+                    prior_first.attempt.id.as_str(),
+                    encoded.as_str(),
+                    1,
+                ),
+            )
+            .await?;
+        connection
+            .execute(
+                "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, NULL, ?3, ?4)",
+                (
+                    Uuid::now_v7().to_string(),
+                    second.job.id.as_str(),
+                    encoded.as_str(),
+                    1,
+                ),
+            )
+            .await?;
+
+        assert!(matches!(
+            CheckpointRepository::new(&database)
+                .latest(&first.job.id)
+                .await,
+            Err(CheckpointRepositoryError::Inconsistent)
+        ));
+        assert!(matches!(
+            CheckpointRepository::new(&database)
+                .records(&second.job.id)
+                .await,
+            Err(CheckpointRepositoryError::Inconsistent)
+        ));
+        let assessments = CheckpointRepository::new(&database)
+            .assess_stale_jobs(5)
+            .await?;
+        assert_eq!(assessments.len(), 3);
+        assert!(
+            assessments.iter().all(|assessment| {
+                assessment.disposition == CheckpointRecoveryDisposition::Unsafe
+            })
         );
         Ok(())
     }

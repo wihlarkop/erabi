@@ -137,10 +137,45 @@ impl CancellationController {
     }
 
     /// Removes an active token after its worker turn has reached a durable
-    /// boundary. The request record remains until the job identity is retired.
-    pub(crate) fn release(&self, job_id: &JobId) {
+    /// boundary, retiring a cancellation request only after terminal state is
+    /// durable. Keeping queued/retry requests preserves request-before-register
+    /// race safety.
+    pub(crate) fn release(&self, job_id: &JobId, terminal_boundary: bool) {
         if let Ok(mut state) = self.state.lock() {
             state.active.remove(job_id);
+            if terminal_boundary {
+                state.requested.remove(job_id);
+            }
         }
+    }
+
+    /// Retires a request after another owner has durably committed a terminal
+    /// state before this controller ever registered an active handler.
+    pub(crate) fn retire_after_terminal_boundary(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.requested.remove(job_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_before_register_is_observed_then_retired_at_terminal_boundary() {
+        let controller = CancellationController::default();
+        let job_id = JobId::new();
+
+        controller.request(&job_id);
+        let token = controller.register(&job_id);
+        assert!(token.is_cancelled());
+        controller.release(&job_id, true);
+
+        let Ok(state) = controller.state.lock() else {
+            panic!("controller state is available");
+        };
+        assert!(!state.requested.contains(&job_id));
+        assert!(!state.active.contains_key(&job_id));
     }
 }
