@@ -1,5 +1,7 @@
 //! Ordered startup orchestration with bounded Plan 04 extension hooks.
 
+use erabi_db::{LightweightIntegrityError, repositories::JobRepositoryError};
+
 /// Canonical ordered startup stages; tests can assert every boundary directly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupStage {
@@ -33,6 +35,77 @@ pub struct RecoveryState {
     pub code: String,
     /// Safe diagnostic message.
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryClassification {
+    MigrationFailure,
+    QueueInvariantViolation,
+    JobRecoveryUnavailable,
+    CheckpointInvariantViolation,
+}
+
+impl RecoveryClassification {
+    const fn details(self) -> (&'static str, &'static str) {
+        match self {
+            Self::MigrationFailure => (
+                "MIGRATION_FAILURE",
+                "Database migration could not complete safely. Recovery Mode is active.",
+            ),
+            Self::QueueInvariantViolation => (
+                "QUEUE_INVARIANT_VIOLATION",
+                "Durable job ownership or attempt history is inconsistent. Recovery Mode is active.",
+            ),
+            Self::JobRecoveryUnavailable => (
+                "JOB_RECOVERY_UNAVAILABLE",
+                "Durable job recovery could not complete safely. Recovery Mode is active.",
+            ),
+            Self::CheckpointInvariantViolation => (
+                "CHECKPOINT_INVARIANT_VIOLATION",
+                "Durable checkpoint evidence is inconsistent. Recovery Mode is active.",
+            ),
+        }
+    }
+}
+
+impl From<RecoveryClassification> for RecoveryState {
+    fn from(classification: RecoveryClassification) -> Self {
+        let (code, message) = classification.details();
+        Self {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl RecoveryState {
+    pub(crate) fn migration_failure() -> Self {
+        RecoveryClassification::MigrationFailure.into()
+    }
+
+    pub(crate) fn checkpoint_invariant_violation() -> Self {
+        RecoveryClassification::CheckpointInvariantViolation.into()
+    }
+}
+
+impl From<LightweightIntegrityError> for RecoveryState {
+    fn from(error: LightweightIntegrityError) -> Self {
+        Self {
+            code: error.code().to_owned(),
+            message: error.safe_message().to_owned(),
+        }
+    }
+}
+
+impl From<JobRepositoryError> for RecoveryState {
+    fn from(error: JobRepositoryError) -> Self {
+        match error {
+            JobRepositoryError::QueueInvariant => {
+                RecoveryClassification::QueueInvariantViolation.into()
+            }
+            _ => RecoveryClassification::JobRecoveryUnavailable.into(),
+        }
+    }
 }
 
 /// A startup failure that cannot safely expose an Erabi recovery surface.
@@ -76,12 +149,9 @@ pub enum StartupOutcome {
     Fatal(StartupFatalError),
 }
 
-/// Dependencies supplied by the runtime without pulling Plan 04 job types forward.
+/// Dependencies supplied by the runtime startup sequence.
 pub trait StartupHooks {
     /// Performs the named startup action.
-    ///
-    /// `RecoverStaleJobsHook` and `RebuildConcurrencyHook` are intentionally
-    /// hook-only until Plan 04 supplies durable jobs/concurrency state.
     ///
     /// # Errors
     /// Classifies a stage failure as fatal or recovery-relevant.
@@ -134,6 +204,55 @@ pub fn run_startup(hooks: &mut impl StartupHooks) -> StartupOutcome {
 fn recovery_is_safe_at(stage: StartupStage) -> bool {
     matches!(
         stage,
-        StartupStage::ApplyMigrations | StartupStage::CheckIntegrity
+        StartupStage::ApplyMigrations
+            | StartupStage::CheckIntegrity
+            | StartupStage::RecoverStaleJobsHook
+            | StartupStage::RebuildConcurrencyHook
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_recovery_details(state: &RecoveryState, code: &str, message: &str) {
+        assert_eq!(state.code, code);
+        assert_eq!(state.message, message);
+        assert!(!state.message.contains("SQL"));
+    }
+
+    #[test]
+    fn boundary_recovery_classifications_keep_stable_sanitized_details() {
+        assert_recovery_details(
+            &RecoveryState::migration_failure(),
+            "MIGRATION_FAILURE",
+            "Database migration could not complete safely. Recovery Mode is active.",
+        );
+        assert_recovery_details(
+            &RecoveryState::from(JobRepositoryError::QueueInvariant),
+            "QUEUE_INVARIANT_VIOLATION",
+            "Durable job ownership or attempt history is inconsistent. Recovery Mode is active.",
+        );
+        assert_recovery_details(
+            &RecoveryState::from(JobRepositoryError::InvalidJobKind),
+            "JOB_RECOVERY_UNAVAILABLE",
+            "Durable job recovery could not complete safely. Recovery Mode is active.",
+        );
+        assert_recovery_details(
+            &RecoveryState::checkpoint_invariant_violation(),
+            "CHECKPOINT_INVARIANT_VIOLATION",
+            "Durable checkpoint evidence is inconsistent. Recovery Mode is active.",
+        );
+    }
+
+    #[test]
+    fn integrity_error_conversion_preserves_its_typed_sanitized_details() {
+        let state = RecoveryState::from(LightweightIntegrityError::DatabaseUnreadable);
+
+        assert_recovery_details(
+            &state,
+            "DATABASE_UNREADABLE",
+            "The internal database could not complete a required read-only check.",
+        );
+    }
 }

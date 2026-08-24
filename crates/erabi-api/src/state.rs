@@ -5,6 +5,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use erabi_db::ErabiDatabase;
+use erabi_jobs::{
+    CancellationController, JobActionService, ProgressLiveHub, StoragePressureController,
+    StoragePressurePolicy, StoragePressureState,
+};
+
 /// Runtime service mode used to protect mutable surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "mode")]
@@ -45,11 +51,46 @@ struct RuntimeSnapshot {
     crawl4ai: Crawl4AiAvailability,
 }
 
+/// Runtime-owned progress dependencies shared by the authenticated SSE route.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressRuntimeState {
+    database: ErabiDatabase,
+    live_hub: ProgressLiveHub,
+}
+
+/// Runtime-owned durable action service shared by protected mutation routes.
+#[derive(Clone, Debug)]
+pub(crate) struct JobActionRuntimeState {
+    service: JobActionService,
+}
+
+impl JobActionRuntimeState {
+    #[must_use]
+    pub(crate) const fn service(&self) -> &JobActionService {
+        &self.service
+    }
+}
+
+impl ProgressRuntimeState {
+    #[must_use]
+    pub(crate) const fn database(&self) -> &ErabiDatabase {
+        &self.database
+    }
+
+    #[must_use]
+    pub(crate) const fn live_hub(&self) -> &ProgressLiveHub {
+        &self.live_hub
+    }
+}
+
 /// Shared state used by the hardened shell and extended by later runtime tasks.
 #[derive(Clone, Debug)]
 pub struct AppState {
     runtime: Arc<RwLock<RuntimeSnapshot>>,
     accepting_mutations: Arc<AtomicBool>,
+    progress: Option<Arc<ProgressRuntimeState>>,
+    job_actions: Option<Arc<JobActionRuntimeState>>,
+    storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
 impl AppState {
@@ -69,7 +110,65 @@ impl AppState {
                 crawl4ai: Crawl4AiAvailability::Available,
             })),
             accepting_mutations: Arc::new(AtomicBool::new(true)),
+            progress: None,
+            job_actions: None,
+            storage_pressure: None,
         }
+    }
+
+    /// Attaches the durable progress store and live fan-out used by Task 2B.
+    #[must_use]
+    pub fn with_progress_runtime(
+        mut self,
+        database: ErabiDatabase,
+        live_hub: ProgressLiveHub,
+    ) -> Self {
+        self.progress = Some(Arc::new(ProgressRuntimeState { database, live_hub }));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn progress_runtime(&self) -> Option<Arc<ProgressRuntimeState>> {
+        self.progress.clone()
+    }
+
+    /// Attaches the durable Task 4 action service and process cancellation
+    /// controller used by protected job mutation routes.
+    #[must_use]
+    pub fn with_job_actions_runtime(
+        mut self,
+        database: ErabiDatabase,
+        cancellation: CancellationController,
+    ) -> Self {
+        self.job_actions = Some(Arc::new(JobActionRuntimeState {
+            service: JobActionService::new(database, cancellation),
+        }));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn job_actions_runtime(&self) -> Option<Arc<JobActionRuntimeState>> {
+        self.job_actions.clone()
+    }
+
+    /// Attaches the typed storage-pressure state shared with worker admission.
+    #[must_use]
+    pub fn with_storage_pressure_controller(
+        mut self,
+        controller: StoragePressureController,
+    ) -> Self {
+        self.storage_pressure = Some(Arc::new(controller));
+        self
+    }
+
+    /// Returns safe operational storage state. A state-less test shell is
+    /// unavailable rather than incorrectly reporting healthy storage.
+    #[must_use]
+    pub fn storage_pressure(&self) -> StoragePressureState {
+        self.storage_pressure.as_ref().map_or_else(
+            || StoragePressureState::unavailable(StoragePressurePolicy::default()),
+            |controller| controller.state(),
+        )
     }
 
     /// Reads the current readiness state.

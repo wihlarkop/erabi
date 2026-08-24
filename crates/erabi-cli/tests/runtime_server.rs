@@ -10,7 +10,10 @@ use erabi::{
     ProcessLock, ProcessLockMetadata, RunningRuntime, RuntimeError, RuntimeOptions, StartupOutcome,
 };
 use erabi_api::RuntimeMode;
-use erabi_db::{Migration, MigrationRunner};
+use erabi_db::{
+    ErabiDatabase, Migration, MigrationRunner,
+    repositories::{AttemptOutcome, JobKind, JobRepository, JobState, NewJob},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -366,6 +369,101 @@ async fn migration_risk_starts_safe_recovery_http_and_crawl4ai_degradation_remai
     assert!(blocked.contains("RECOVERY_MODE_MUTATION_BLOCKED"));
 
     runtime.shutdown().await?;
+    fs::remove_dir_all(&data_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_four_startup_hook_recovers_stale_leases_before_runtime_readiness()
+-> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = temporary_data_dir("stale-job-recovery");
+    let options = RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
+        message: "Crawl4AI intentionally unavailable for this runtime test.".to_owned(),
+    });
+    RunningRuntime::start_with_options(config(&data_dir, None, false)?, options.clone())
+        .await?
+        .shutdown()
+        .await?;
+
+    let database_path = data_dir.join("database").join("erabi.db");
+    let job_id = {
+        let database = ErabiDatabase::open_local(&database_path).await?;
+        let jobs = JobRepository::new(&database);
+        let job = NewJob::new(JobKind::new("TEST_WORK")?, 1, 0, 2)?;
+        jobs.enqueue(&job, 0).await?;
+        jobs.acquire_next("worker-before-restart", 0, 1)
+            .await?
+            .ok_or("stale job was not acquired")?;
+        job.id
+    };
+
+    let runtime =
+        RunningRuntime::start_with_options(config(&data_dir, None, false)?, options).await?;
+    assert!(matches!(
+        runtime.startup_outcome(),
+        StartupOutcome::Ready { .. }
+    ));
+    runtime.shutdown().await?;
+
+    let database = ErabiDatabase::open_local(&database_path).await?;
+    let jobs = JobRepository::new(&database);
+    assert_eq!(jobs.job(&job_id).await?.state, JobState::Queued);
+    assert_eq!(
+        jobs.attempts(&job_id).await?[0].outcome,
+        AttemptOutcome::LeaseExpired
+    );
+    drop(database);
+    fs::remove_dir_all(&data_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_queue_ownership_enters_recovery_mode_without_auto_repair()
+-> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = temporary_data_dir("queue-invariant");
+    let options = RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
+        message: "Crawl4AI intentionally unavailable for this runtime test.".to_owned(),
+    });
+    RunningRuntime::start_with_options(config(&data_dir, None, false)?, options.clone())
+        .await?
+        .shutdown()
+        .await?;
+
+    let database_path = data_dir.join("database").join("erabi.db");
+    let job_id = {
+        let database = ErabiDatabase::open_local(&database_path).await?;
+        let jobs = JobRepository::new(&database);
+        let job = NewJob::new(JobKind::new("TEST_WORK")?, 1, 0, 2)?;
+        jobs.enqueue(&job, 0).await?;
+        jobs.acquire_next("worker-before-corruption", 0, 100)
+            .await?
+            .ok_or("job was not acquired")?;
+        job.id
+    };
+    let raw_database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
+        .build()
+        .await?;
+    let raw_connection = raw_database.connect()?;
+    raw_connection
+        .execute(
+            "UPDATE jobs SET lease_id = 'tampered-lease' WHERE id = ?1",
+            [job_id.as_str()],
+        )
+        .await?;
+    drop(raw_connection);
+    drop(raw_database);
+
+    let recovery =
+        RunningRuntime::start_with_options(config(&data_dir, None, false)?, options).await?;
+    assert!(
+        matches!(
+            recovery.startup_outcome(),
+            StartupOutcome::Recovery(state) if state.code == "QUEUE_INVARIANT_VIOLATION"
+        ),
+        "unexpected startup outcome: {:#?}",
+        recovery.startup_outcome()
+    );
+    recovery.shutdown().await?;
     fs::remove_dir_all(&data_dir)?;
     Ok(())
 }

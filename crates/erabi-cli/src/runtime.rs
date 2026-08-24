@@ -5,18 +5,26 @@ use std::{
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use axum::Router;
 use erabi_api::{AppState, RuntimeMode, SecurityConfig, SecurityConfigError, build_router};
-use erabi_db::{ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner};
+use erabi_db::{
+    ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
+    repositories::ConcurrencyState,
+};
+use erabi_jobs::{
+    CancellationController, ProgressLiveHub, StoragePressureMonitor, StoragePressurePolicy,
+    StoragePressureState, recover_and_rebuild_at,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
     task::JoinHandle,
-    time::{timeout, timeout_at},
+    time::{Duration, Instant, MissedTickBehavior, interval_at, timeout, timeout_at},
 };
+
+const STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 use crate::{
     BindMode, BootstrapConfig, BootstrapConfigError, Crawl4AiStartupHealth, ProcessLock,
@@ -70,6 +78,11 @@ pub struct RunningRuntime {
     stop_server: watch::Sender<bool>,
     server_task: JoinHandle<io::Result<()>>,
     _database: ErabiDatabase,
+    _concurrency_state: ConcurrencyState,
+    _progress_live_hub: ProgressLiveHub,
+    storage_pressure: StoragePressureMonitor,
+    storage_pressure_task: JoinHandle<()>,
+    cancellation: CancellationController,
 }
 
 impl RunningRuntime {
@@ -124,26 +137,30 @@ impl RunningRuntime {
         let database = open_database(&data_dir).await?;
         let mut recovery = None;
         if options.migration_runner.apply(&database).await.is_err() {
-            recovery = Some(RecoveryState {
-                code: "MIGRATION_FAILURE".to_owned(),
-                message: "Database migration could not complete safely. Recovery Mode is active."
-                    .to_owned(),
-            });
+            recovery = Some(RecoveryState::migration_failure());
         } else if let Err(error) =
             LightweightIntegrityChecker::new(&database, &options.migration_runner, &data_dir)
                 .check()
                 .await
         {
-            recovery = Some(RecoveryState {
-                code: error.code().to_owned(),
-                message: error.safe_message().to_owned(),
-            });
+            recovery = Some(error.into());
         }
 
-        if recovery.is_none() {
+        let concurrency_state = if recovery.is_none() {
             prepare_artifact_directories(&data_dir)?;
-            run_plan_four_startup_hooks();
-        }
+            match run_plan_four_startup_hooks(&database).await {
+                Ok(concurrency_state) => concurrency_state,
+                Err(recovery_state) => {
+                    recovery = Some(recovery_state);
+                    ConcurrencyState::default()
+                }
+            }
+        } else {
+            ConcurrencyState::default()
+        };
+        let storage_pressure =
+            StoragePressureMonitor::filesystem(data_dir.clone(), StoragePressurePolicy::default());
+        let _ = storage_pressure.refresh();
 
         let crawl4ai = if let Some(health) = options.crawl4ai_health {
             health
@@ -157,7 +174,12 @@ impl RunningRuntime {
             },
         };
 
-        let app_state = AppState::with_readiness(false);
+        let progress_live_hub = ProgressLiveHub::new();
+        let cancellation = CancellationController::default();
+        let app_state = AppState::with_readiness(false)
+            .with_progress_runtime(database.clone(), progress_live_hub.clone())
+            .with_job_actions_runtime(database.clone(), cancellation.clone())
+            .with_storage_pressure_controller(storage_pressure.controller().clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
                 app_state.enter_recovery(recovery.code.clone(), recovery.message.clone());
@@ -190,6 +212,8 @@ impl RunningRuntime {
             app_state.set_ready(true);
         }
         let (stop_server, stop_receiver) = watch::channel(false);
+        let storage_pressure_task =
+            spawn_storage_pressure_refresh(storage_pressure.clone(), stop_receiver.clone());
         let server_task = spawn_server(listener, router, stop_receiver);
 
         Ok(Self {
@@ -200,6 +224,11 @@ impl RunningRuntime {
             stop_server,
             server_task,
             _database: database,
+            _concurrency_state: concurrency_state,
+            _progress_live_hub: progress_live_hub,
+            storage_pressure,
+            storage_pressure_task,
+            cancellation,
         })
     }
 
@@ -219,6 +248,25 @@ impl RunningRuntime {
     #[must_use]
     pub fn runtime_mode(&self) -> RuntimeMode {
         self.app_state.runtime_mode()
+    }
+
+    /// Returns the process-owned cooperative cancellation controller used by
+    /// workers that join this runtime.
+    #[must_use]
+    pub fn cancellation_controller(&self) -> CancellationController {
+        self.cancellation.clone()
+    }
+
+    /// Returns the last typed storage-pressure observation for diagnostics.
+    #[must_use]
+    pub fn storage_pressure_state(&self) -> StoragePressureState {
+        self.storage_pressure.controller().state()
+    }
+
+    /// Refreshes the authoritative data-directory free-space observation.
+    #[must_use]
+    pub fn refresh_storage_pressure(&self) -> StoragePressureState {
+        self.storage_pressure.refresh()
     }
 
     /// Waits for an operating-system termination signal, then shuts down safely.
@@ -260,8 +308,15 @@ impl RunningRuntime {
 
         let hooks = RuntimeShutdownHooks {
             app_state: self.app_state.clone(),
+            cancellation: self.cancellation.clone(),
         };
         let report = self.shutdown.shutdown_by(deadline, &hooks).await;
+        if timeout_at(deadline, &mut self.storage_pressure_task)
+            .await
+            .is_err()
+        {
+            self.storage_pressure_task.abort();
+        }
         match timeout_at(deadline, &mut self.server_task).await {
             Ok(Ok(Ok(()))) => Ok(report),
             Ok(Ok(Err(_)) | Err(_)) => Err(RuntimeError::Server),
@@ -365,9 +420,45 @@ fn prepare_artifact_directories(data_dir: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Plan 04 owns durable stale-job recovery and concurrency rebuilding. Plan 03
-/// invokes this bounded no-op seam without introducing durable job behavior.
-fn run_plan_four_startup_hooks() {}
+/// Executes the Plan 04 durable stale-job recovery and scheduler-state rebuild
+/// inside the existing Plan 03 startup boundary. No handler is started here;
+/// later plans register concrete work only after this durable state is safe.
+async fn run_plan_four_startup_hooks(
+    database: &ErabiDatabase,
+) -> Result<ConcurrencyState, RecoveryState> {
+    let (recovery, concurrency_state) = recover_and_rebuild_at(database, startup_epoch_seconds())
+        .await
+        .map_err(RecoveryState::from)?;
+    if recovery.unsafe_checkpoints > 0 {
+        return Err(RecoveryState::checkpoint_invariant_violation());
+    }
+    Ok(concurrency_state)
+}
+
+fn spawn_storage_pressure_refresh(
+    storage_pressure: StoragePressureMonitor,
+    mut stop_receiver: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut refresh = interval_at(
+            Instant::now() + STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL,
+            STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL,
+        );
+        refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = refresh.tick() => {
+                    let _ = storage_pressure.refresh();
+                }
+                changed = stop_receiver.changed() => {
+                    if changed.is_err() || *stop_receiver.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
 
 async fn probe_crawl4ai(config: &BootstrapConfig) -> Crawl4AiStartupHealth {
     let Some(url) = config.crawl4ai().base_url() else {
@@ -442,8 +533,17 @@ fn startup_timestamp() -> String {
     }
 }
 
+fn startup_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
 struct RuntimeShutdownHooks {
     app_state: AppState,
+    cancellation: CancellationController,
 }
 
 impl ShutdownHooks for RuntimeShutdownHooks {
@@ -460,7 +560,9 @@ impl ShutdownHooks for RuntimeShutdownHooks {
     }
 
     fn signal_cooperative_cancellation(&self) -> ShutdownFuture<'_> {
-        Box::pin(async {})
+        Box::pin(async move {
+            self.cancellation.cancel_all();
+        })
     }
 
     fn settle_or_rollback_transactions(&self) -> ShutdownFuture<'_> {
@@ -469,5 +571,72 @@ impl ShutdownHooks for RuntimeShutdownHooks {
 
     fn flush_critical_state(&self) -> ShutdownFuture<'_> {
         Box::pin(async {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use erabi_db::repositories::JobId;
+    use erabi_jobs::{CancellationToken, StoragePressureLevel, StorageProbe, StorageProbeError};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_shutdown_signals_workers_without_extending_fixed_deadline() {
+        let cancellation = CancellationController::default();
+        let token: CancellationToken = cancellation.register(&JobId::new());
+        let coordinator = ShutdownCoordinator::new();
+        let hooks = RuntimeShutdownHooks {
+            app_state: AppState::ready(),
+            cancellation,
+        };
+
+        let report = coordinator.shutdown(&hooks).await;
+
+        assert!(token.is_cancelled());
+        assert_eq!(report.deadline, crate::GRACEFUL_SHUTDOWN_DEADLINE);
+        assert!(report.completed_cleanly());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_runtime_refreshes_storage_diagnostics_without_an_external_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(Clone)]
+        struct MutableProbe(Arc<Mutex<u64>>);
+
+        impl StorageProbe for MutableProbe {
+            fn free_bytes(&self, _path: &Path) -> Result<u64, StorageProbeError> {
+                self.0
+                    .lock()
+                    .map_or(Err(StorageProbeError::Unavailable), |bytes| Ok(*bytes))
+            }
+        }
+
+        let free_bytes = Arc::new(Mutex::new(101));
+        let monitor = StoragePressureMonitor::new(
+            MutableProbe(Arc::clone(&free_bytes)),
+            "C:\\erabi-data",
+            StoragePressurePolicy::new(100, 50)?,
+        );
+        let (stop, receiver) = watch::channel(false);
+        let task = spawn_storage_pressure_refresh(monitor.clone(), receiver);
+        tokio::task::yield_now().await;
+        if let Ok(mut bytes) = free_bytes.lock() {
+            *bytes = 50;
+        } else {
+            return Err("test storage probe lock was poisoned".into());
+        }
+        tokio::time::advance(STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            monitor.controller().state().level,
+            StoragePressureLevel::Critical
+        );
+        let _ = stop.send(true);
+        task.await?;
+        Ok(())
     }
 }

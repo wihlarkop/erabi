@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderName, HeaderValue, Request, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, delete, get, post},
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -16,6 +16,12 @@ use uuid::Uuid;
 use crate::{
     AppState, Crawl4AiAvailability, MutationAdmission, RuntimeMode, SecurityConfig,
     error::{ApiErrorEnvelope, error_response},
+    job_actions::{
+        cancel as cancel_job, remove as remove_job, reprioritize as reprioritize_job,
+        rerun_full_crawl, restart as restart_job, resume as resume_job, retry as retry_job,
+        retry_failed_parts,
+    },
+    progress::job_progress_sse,
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
 };
 
@@ -36,7 +42,7 @@ impl TraceId {
         Self(trace_id)
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -61,6 +67,24 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
+        .route(
+            "/api/v1/events/jobs/{job_id}/progress",
+            get(job_progress_sse),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/retry-failed-parts",
+            post(retry_failed_parts),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/rerun-full-crawl",
+            post(rerun_full_crawl),
+        )
+        .route("/api/v1/jobs/{job_id}/resume", post(resume_job))
+        .route("/api/v1/jobs/{job_id}/restart", post(restart_job))
+        .route("/api/v1/jobs/{job_id}/retry", post(retry_job))
+        .route("/api/v1/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/api/v1/jobs/{job_id}/priority", post(reprioritize_job))
+        .route("/api/v1/jobs/{job_id}", delete(remove_job))
         .route("/api/v1/events/{*path}", any(unavailable))
         .route("/api/v1/assets/{*path}", any(unavailable))
         .route("/api/v1/exports/{*path}", any(unavailable))
@@ -125,6 +149,7 @@ async fn runtime_diagnostics(
     Json(RuntimeDiagnosticsResponse {
         mode: app_state.runtime_mode(),
         crawl4ai: app_state.crawl4ai_availability(),
+        storage_pressure: app_state.storage_pressure(),
     })
 }
 
@@ -268,6 +293,7 @@ struct ReadinessResponse {
 struct RuntimeDiagnosticsResponse {
     mode: RuntimeMode,
     crawl4ai: Crawl4AiAvailability,
+    storage_pressure: erabi_jobs::StoragePressureState,
 }
 
 /// `OpenAPI` document generated from the currently available stable route contracts.
@@ -286,6 +312,31 @@ impl OpenApiDocument {
         paths.insert(
             "/api/v1/diagnostics/status",
             OpenApiPath::get("Safe runtime diagnostics"),
+        );
+        paths.insert(
+            "/api/v1/events/jobs/{job_id}/progress",
+            OpenApiPath::get("Replayable job progress stream"),
+        );
+        for (path, summary) in [
+            (
+                "/api/v1/jobs/{job_id}/retry-failed-parts",
+                "Retry failed parts",
+            ),
+            ("/api/v1/jobs/{job_id}/rerun-full-crawl", "Rerun full crawl"),
+            (
+                "/api/v1/jobs/{job_id}/resume",
+                "Resume compatible checkpoint",
+            ),
+            ("/api/v1/jobs/{job_id}/restart", "Restart from beginning"),
+            ("/api/v1/jobs/{job_id}/retry", "Retry bounded job attempt"),
+            ("/api/v1/jobs/{job_id}/cancel", "Cancel job cooperatively"),
+            ("/api/v1/jobs/{job_id}/priority", "Move queued job"),
+        ] {
+            paths.insert(path, OpenApiPath::post(summary));
+        }
+        paths.insert(
+            "/api/v1/jobs/{job_id}",
+            OpenApiPath::delete("Remove safe never-started job"),
         );
         paths.insert("/api/v1/openapi.json", OpenApiPath::get("OpenAPI document"));
         Self {
@@ -307,13 +358,36 @@ struct OpenApiInfo {
 
 #[derive(Serialize)]
 struct OpenApiPath {
-    get: OpenApiOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    get: Option<OpenApiOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post: Option<OpenApiOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete: Option<OpenApiOperation>,
 }
 
 impl OpenApiPath {
     const fn get(summary: &'static str) -> Self {
         Self {
-            get: OpenApiOperation { summary },
+            get: Some(OpenApiOperation { summary }),
+            post: None,
+            delete: None,
+        }
+    }
+
+    const fn post(summary: &'static str) -> Self {
+        Self {
+            get: None,
+            post: Some(OpenApiOperation { summary }),
+            delete: None,
+        }
+    }
+
+    const fn delete(summary: &'static str) -> Self {
+        Self {
+            get: None,
+            post: None,
+            delete: Some(OpenApiOperation { summary }),
         }
     }
 }

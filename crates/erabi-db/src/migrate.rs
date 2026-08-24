@@ -35,6 +35,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "runs",
         include_str!("../../../migrations/0003_runs.sql"),
     ),
+    (
+        "0004",
+        "jobs",
+        include_str!("../../../migrations/0004_jobs.sql"),
+    ),
 ];
 
 /// One ordered SQL migration owned by Erabi.
@@ -397,4 +402,69 @@ fn timestamp() -> String {
         Err(_) => 0,
     };
     format!("unix:{seconds}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn jobs_migration_owns_append_only_checkpoint_and_progress_substrates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = ErabiDatabase::in_memory().await?;
+        MigrationRunner::default().apply(&database).await?;
+        let connection = database.connection().await?;
+
+        for (object_type, object_name) in [
+            ("table", "job_checkpoints"),
+            ("table", "job_progress_events"),
+            ("index", "job_checkpoints_by_job"),
+            ("index", "job_checkpoints_by_attempt"),
+            ("index", "job_progress_events_by_job_sequence"),
+            ("index", "job_progress_events_by_attempt"),
+            ("trigger", "job_checkpoints_no_update"),
+            ("trigger", "job_checkpoints_no_delete"),
+            ("trigger", "job_progress_events_no_update"),
+            ("trigger", "job_progress_events_no_delete"),
+        ] {
+            let mut rows = connection
+                .query(
+                    "SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+                    (object_type, object_name),
+                )
+                .await?;
+            assert!(
+                rows.next().await?.is_some(),
+                "missing {object_type} {object_name}"
+            );
+        }
+
+        connection
+            .execute_batch(
+                "
+                INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at)
+                VALUES ('job-1', 'TEST', 0, 'QUEUED', NULL, NULL, 0, 0, 1, NULL, NULL, 0, NULL, NULL, NULL, NULL, 0, 0);
+                INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at)
+                VALUES ('checkpoint-1', 'job-1', NULL, '{}', 0);
+                INSERT INTO job_progress_events (id, job_id, attempt_id, sequence, event_type, payload_json, created_at)
+                VALUES ('event-1', 'job-1', NULL, 1, 'STATUS', '{}', 0);
+                ",
+            )
+            .await?;
+        assert!(
+            connection
+                .execute_batch(
+                    "UPDATE job_checkpoints SET checkpoint_json = '{}' WHERE id = 'checkpoint-1'"
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute_batch("DELETE FROM job_progress_events WHERE id = 'event-1'")
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 }

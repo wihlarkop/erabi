@@ -6,3 +6,15 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+erabi-db = { version = "0.1.0", path = "../erabi-db" }
+erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
+fs4 = { version = "1", default-features = false, features = ["sync"] }
+futures-util = "0.3.31"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
