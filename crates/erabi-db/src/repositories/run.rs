@@ -49,13 +49,26 @@ impl<'database> CrawlRunRepository<'database> {
     /// Returns an error when the run does not exist, cannot be read, or contains
     /// an invalid snapshot payload.
     pub async fn snapshot(&self, id: CrawlRunId) -> Result<CrawlRunSnapshot, DbError> {
+        self.snapshot_by_stored_id(&id.to_string()).await
+    }
+
+    /// Loads a snapshot using a durable foreign-key value from another
+    /// repository. The stored identifier is kept opaque at this boundary.
+    ///
+    /// # Errors
+    /// Returns an error when the run does not exist, cannot be read, or
+    /// contains an invalid immutable snapshot.
+    pub async fn snapshot_by_stored_id(
+        &self,
+        stored_id: &str,
+    ) -> Result<CrawlRunSnapshot, DbError> {
         let connection = self.database.connection().await?;
         let row = connection
             .prepare(
                 "SELECT snapshot_json, snapshot_hash, checkpoint_compatibility_hash FROM crawl_runs WHERE id = ?1",
             )
             .await?
-            .query_row([id.to_string()])
+            .query_row([stored_id])
             .await?;
         let snapshot_json: String = row.get(0)?;
         let stored_snapshot_hash: String = row.get(1)?;
@@ -106,7 +119,7 @@ impl<'database> CrawlRunRepository<'database> {
     }
 }
 
-async fn insert_run_in_transaction(
+pub(crate) async fn insert_run_in_transaction(
     connection: &Connection,
     id: CrawlRunId,
     status: CrawlRunStatus,

@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
+erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 futures-util = "0.3.31"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }

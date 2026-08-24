@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use erabi_db::ErabiDatabase;
-use erabi_jobs::ProgressLiveHub;
+use erabi_jobs::{CancellationController, JobActionService, ProgressLiveHub};
 
 /// Runtime service mode used to protect mutable surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -55,6 +55,19 @@ pub(crate) struct ProgressRuntimeState {
     live_hub: ProgressLiveHub,
 }
 
+/// Runtime-owned durable action service shared by protected mutation routes.
+#[derive(Clone, Debug)]
+pub(crate) struct JobActionRuntimeState {
+    service: JobActionService,
+}
+
+impl JobActionRuntimeState {
+    #[must_use]
+    pub(crate) const fn service(&self) -> &JobActionService {
+        &self.service
+    }
+}
+
 impl ProgressRuntimeState {
     #[must_use]
     pub(crate) const fn database(&self) -> &ErabiDatabase {
@@ -73,6 +86,7 @@ pub struct AppState {
     runtime: Arc<RwLock<RuntimeSnapshot>>,
     accepting_mutations: Arc<AtomicBool>,
     progress: Option<Arc<ProgressRuntimeState>>,
+    job_actions: Option<Arc<JobActionRuntimeState>>,
 }
 
 impl AppState {
@@ -93,6 +107,7 @@ impl AppState {
             })),
             accepting_mutations: Arc::new(AtomicBool::new(true)),
             progress: None,
+            job_actions: None,
         }
     }
 
@@ -110,6 +125,25 @@ impl AppState {
     #[must_use]
     pub(crate) fn progress_runtime(&self) -> Option<Arc<ProgressRuntimeState>> {
         self.progress.clone()
+    }
+
+    /// Attaches the durable Task 4 action service and process cancellation
+    /// controller used by protected job mutation routes.
+    #[must_use]
+    pub fn with_job_actions_runtime(
+        mut self,
+        database: ErabiDatabase,
+        cancellation: CancellationController,
+    ) -> Self {
+        self.job_actions = Some(Arc::new(JobActionRuntimeState {
+            service: JobActionService::new(database, cancellation),
+        }));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn job_actions_runtime(&self) -> Option<Arc<JobActionRuntimeState>> {
+        self.job_actions.clone()
     }
 
     /// Reads the current readiness state.

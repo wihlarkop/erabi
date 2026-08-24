@@ -168,7 +168,8 @@ impl RunningRuntime {
         let progress_live_hub = ProgressLiveHub::new();
         let cancellation = CancellationController::default();
         let app_state = AppState::with_readiness(false)
-            .with_progress_runtime(database.clone(), progress_live_hub.clone());
+            .with_progress_runtime(database.clone(), progress_live_hub.clone())
+            .with_job_actions_runtime(database.clone(), cancellation.clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
                 app_state.enter_recovery(recovery.code.clone(), recovery.message.clone());

@@ -25,9 +25,11 @@ use tokio::{
     time::{Instant, interval_at},
 };
 
+mod actions;
 mod cancellation;
 mod progress;
 
+pub use actions::{JobAction, JobActionError, JobActionResult, JobActionService};
 pub use cancellation::{CancellationController, CancellationToken};
 pub use progress::{
     ProgressLiveHub, ProgressLiveHubError, ProgressPublication, ProgressPublisher,
@@ -302,19 +304,7 @@ impl<'database> JobRuntime<'database> {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobState, JobRuntimeError> {
-        self.cancellation.request(job_id);
-        let state = self
-            .repository
-            .cancel_queued(job_id, now)
-            .await
-            .map_err(JobRuntimeError::Repository)?;
-        if matches!(
-            state,
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled
-        ) {
-            self.cancellation.retire_after_terminal_boundary(job_id);
-        }
-        Ok(state)
+        request_job_cancellation(&self.database, &self.cancellation, job_id, now).await
     }
 
     /// Executes at most one eligible job using supplied deterministic time.
@@ -505,6 +495,32 @@ impl<'database> JobRuntime<'database> {
             )),
         }
     }
+}
+
+/// Shared Task 3 cancellation boundary used by both workers and explicit API
+/// actions. It durably cancels queued work and only signals active work.
+///
+/// # Errors
+/// Returns a typed runtime error when the durable state cannot be inspected or
+/// updated safely.
+pub async fn request_job_cancellation(
+    database: &ErabiDatabase,
+    cancellation: &CancellationController,
+    job_id: &JobId,
+    now: i64,
+) -> Result<JobState, JobRuntimeError> {
+    cancellation.request(job_id);
+    let state = JobRepository::new(database)
+        .cancel_queued(job_id, now)
+        .await
+        .map_err(JobRuntimeError::Repository)?;
+    if matches!(
+        state,
+        JobState::Succeeded | JobState::Failed | JobState::Cancelled
+    ) {
+        cancellation.retire_after_terminal_boundary(job_id);
+    }
+    Ok(state)
 }
 
 fn current_queue_time(initial_now: i64, started: Instant) -> Result<i64, JobRuntimeError> {
