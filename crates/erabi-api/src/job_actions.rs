@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use erabi_db::repositories::JobId;
-use erabi_jobs::{JobAction, JobActionError, JobActionResult};
+use erabi_jobs::{JobAction, JobActionError, JobActionResult, RerunFullCrawlInput};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -25,6 +25,11 @@ use crate::{
 pub(crate) struct QueueActionInput {
     pub priority: i32,
     pub scheduled_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RerunFullCrawlRequest {
+    pub robots_override_reason: Option<String>,
 }
 
 pub(crate) async fn retry_failed_parts(
@@ -42,9 +47,18 @@ pub(crate) async fn rerun_full_crawl(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
+    Json(input): Json<RerunFullCrawlRequest>,
 ) -> Response {
     action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service.rerun_full_crawl(&job_id, now()).await
+        service
+            .rerun_full_crawl(
+                &job_id,
+                now(),
+                RerunFullCrawlInput {
+                    robots_override_reason: input.robots_override_reason,
+                },
+            )
+            .await
     })
     .await
 }
@@ -187,6 +201,26 @@ fn action_error(error: &JobActionError, trace: &TraceId) -> Response {
             StatusCode::CONFLICT,
             "ATTEMPTS_EXHAUSTED",
             "The job has reached its bounded attempt limit.",
+        ),
+        JobActionError::RetryAlreadyContinued => (
+            StatusCode::CONFLICT,
+            "RETRY_ALREADY_CONTINUED",
+            "Retry the latest continuation instead of creating a sibling retry.",
+        ),
+        JobActionError::CrawlRunRequired => (
+            StatusCode::CONFLICT,
+            "CRAWL_RUN_REQUIRED",
+            "Rerun Full Crawl requires durable Crawl Run evidence.",
+        ),
+        JobActionError::RobotsOverrideReasonRequired => (
+            StatusCode::BAD_REQUEST,
+            "ROBOTS_OVERRIDE_REASON_REQUIRED",
+            "A new robots override reason is required for this independent rerun.",
+        ),
+        JobActionError::RobotsOverrideReasonInvalid => (
+            StatusCode::BAD_REQUEST,
+            "ROBOTS_OVERRIDE_REASON_INVALID",
+            "The submitted robots override reason is invalid.",
         ),
         JobActionError::CheckpointMissing => (
             StatusCode::CONFLICT,

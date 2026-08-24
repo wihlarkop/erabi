@@ -197,6 +197,18 @@ pub struct JobRecord {
     pub updated_at: i64,
 }
 
+/// The Crawl Run relationship selected by a durable recovery action.
+///
+/// Same-run recovery reuses the source run identity and changes only its
+/// lifecycle status. An independent rerun is the sole variant allowed to
+/// insert a new immutable run snapshot.
+#[derive(Clone, Copy, Debug)]
+pub enum ActionRunAssociation<'snapshot> {
+    None,
+    SameSourceRun,
+    NewIndependentRun(&'snapshot CrawlRunSnapshot),
+}
+
 /// Unforgeable-at-the-repository-boundary current ownership evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobLease {
@@ -297,6 +309,8 @@ pub enum JobRepositoryError {
     NotReprioritizable,
     #[error("an equivalent action is already queued or running")]
     ActionAlreadyActive,
+    #[error("the job already has an explicit retry continuation")]
+    RetryAlreadyContinued,
     #[error("the current worker no longer owns this lease")]
     LeaseLost,
     #[error("a critical durable queue invariant is inconsistent")]
@@ -703,7 +717,11 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::database)?;
         let result = async {
             let job = select_job(&transaction, job_id).await?;
-            if job.state != JobState::Queued || job.current_attempt != 0 || job.crawl_run_id.is_some() {
+            if job.state != JobState::Queued
+                || job.current_attempt != 0
+                || job.crawl_run_id.is_some()
+                || job.parent_job_id.is_some()
+            {
                 return Err(JobRepositoryError::RemovalUnsafe);
             }
             let mut rows = transaction
@@ -729,7 +747,7 @@ impl<'database> JobRepository<'database> {
             }
             let changed = transaction
                 .execute(
-                    "DELETE FROM jobs WHERE id = ?1 AND state = 'QUEUED' AND current_attempt = 0 AND crawl_run_id IS NULL",
+                    "DELETE FROM jobs WHERE id = ?1 AND state = 'QUEUED' AND current_attempt = 0 AND crawl_run_id IS NULL AND parent_job_id IS NULL",
                     [job_id.as_str()],
                 )
                 .await
@@ -752,10 +770,9 @@ impl<'database> JobRepository<'database> {
         }
     }
 
-    /// Creates one queued action child and, when the source is run-backed,
-    /// atomically creates a new run containing the original immutable snapshot.
-    /// Active equivalent children are rejected to prevent concurrent duplicate
-    /// action lineages.
+    /// Creates one queued action child with an explicit durable Crawl Run
+    /// association. Same-run recovery requeues the source run without touching
+    /// its immutable snapshot; independent reruns atomically insert a new run.
     ///
     /// # Errors
     /// Returns a typed queue or database invariant error.
@@ -764,16 +781,17 @@ impl<'database> JobRepository<'database> {
         source_job_id: &JobId,
         action_kind: JobKind,
         now: i64,
-        snapshot: Option<&CrawlRunSnapshot>,
+        run_association: ActionRunAssociation<'_>,
         max_attempts: Option<u32>,
     ) -> Result<JobRecord, JobRepositoryError> {
-        let serialized_snapshot =
-            snapshot
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|error| {
+        let serialized_snapshot = match run_association {
+            ActionRunAssociation::NewIndependentRun(snapshot) => {
+                Some(serde_json::to_string(snapshot).map_err(|error| {
                     JobRepositoryError::Database(DbError::Serialization(error.to_string()))
-                })?;
+                })?)
+            }
+            ActionRunAssociation::None | ActionRunAssociation::SameSourceRun => None,
+        };
         let mut connection = self
             .database
             .connection()
@@ -785,40 +803,21 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::database)?;
         let result = async {
             let source = select_job(&transaction, source_job_id).await?;
-            if matches!(source.state, JobState::Queued | JobState::Running) {
-                return Err(JobRepositoryError::IllegalTransition);
-            }
-            let mut active_children = transaction
-                .query(
-                    "SELECT 1 FROM jobs WHERE parent_job_id = ?1 AND kind = ?2 AND state IN ('QUEUED', 'RUNNING') LIMIT 1",
-                    (source_job_id.as_str(), action_kind.as_str()),
-                )
-                .await
-                .map_err(JobRepositoryError::database)?;
-            if active_children
-                .next()
-                .await
-                .map_err(JobRepositoryError::database)?
-                .is_some()
-            {
-                return Err(JobRepositoryError::ActionAlreadyActive);
-            }
+            validate_action_child_lineage(
+                &transaction,
+                &source,
+                source_job_id,
+                &action_kind,
+            )
+            .await?;
             let child_id = JobId::new();
-            let crawl_run_id = if let Some(snapshot) = snapshot {
-                let run_id = CrawlRunId::new();
-                insert_run_in_transaction(
-                    &transaction,
-                    run_id,
-                    CrawlRunStatus::Queued,
-                    snapshot,
-                    serialized_snapshot.as_deref().ok_or(JobRepositoryError::QueueInvariant)?,
-                )
-                    .await
-                    .map_err(JobRepositoryError::from_db)?;
-                Some(run_id.to_string())
-            } else {
-                None
-            };
+            let crawl_run_id = action_child_crawl_run_id(
+                &transaction,
+                &source,
+                run_association,
+                serialized_snapshot.as_deref(),
+            )
+            .await?;
             transaction
                 .execute(
                     "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', ?4, ?5, ?6, 0, ?7, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?6, ?6)",
@@ -1099,6 +1098,120 @@ impl<'database> JobRepository<'database> {
 impl JobRepositoryError {
     fn from_db(error: DbError) -> Self {
         Self::Database(error)
+    }
+}
+
+fn is_recovery_continuation_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "RETRY" | "RETRY_FAILED_PARTS" | "RESUME_CHECKPOINT" | "RESTART_FROM_BEGINNING"
+    )
+}
+
+async fn validate_action_child_lineage(
+    connection: &Connection,
+    source: &JobRecord,
+    source_job_id: &JobId,
+    action_kind: &JobKind,
+) -> Result<(), JobRepositoryError> {
+    if matches!(source.state, JobState::Queued | JobState::Running) {
+        return Err(JobRepositoryError::IllegalTransition);
+    }
+    if action_kind.as_str() == "RETRY"
+        && action_child_exists(connection, source_job_id, "kind = 'RETRY'").await?
+    {
+        return Err(JobRepositoryError::RetryAlreadyContinued);
+    }
+    if active_equivalent_action_child(connection, source_job_id, action_kind).await? {
+        return Err(JobRepositoryError::ActionAlreadyActive);
+    }
+    if is_recovery_continuation_kind(action_kind.as_str())
+        && action_child_exists(
+            connection,
+            source_job_id,
+            "kind IN ('RETRY', 'RETRY_FAILED_PARTS', 'RESUME_CHECKPOINT', 'RESTART_FROM_BEGINNING') AND state IN ('QUEUED', 'RUNNING')",
+        )
+        .await?
+    {
+        return Err(JobRepositoryError::ActionAlreadyActive);
+    }
+    Ok(())
+}
+
+async fn action_child_exists(
+    connection: &Connection,
+    source_job_id: &JobId,
+    predicate: &'static str,
+) -> Result<bool, JobRepositoryError> {
+    let query = format!("SELECT 1 FROM jobs WHERE parent_job_id = ?1 AND {predicate} LIMIT 1");
+    let mut children = connection
+        .query(query, [source_job_id.as_str()])
+        .await
+        .map_err(JobRepositoryError::database)?;
+    children
+        .next()
+        .await
+        .map_err(JobRepositoryError::database)
+        .map(|row| row.is_some())
+}
+
+async fn active_equivalent_action_child(
+    connection: &Connection,
+    source_job_id: &JobId,
+    action_kind: &JobKind,
+) -> Result<bool, JobRepositoryError> {
+    let mut children = connection
+        .query(
+            "SELECT 1 FROM jobs WHERE parent_job_id = ?1 AND kind = ?2 AND state IN ('QUEUED', 'RUNNING') LIMIT 1",
+            (source_job_id.as_str(), action_kind.as_str()),
+        )
+        .await
+        .map_err(JobRepositoryError::database)?;
+    children
+        .next()
+        .await
+        .map_err(JobRepositoryError::database)
+        .map(|row| row.is_some())
+}
+
+async fn action_child_crawl_run_id(
+    connection: &Connection,
+    source: &JobRecord,
+    association: ActionRunAssociation<'_>,
+    serialized_snapshot: Option<&str>,
+) -> Result<Option<String>, JobRepositoryError> {
+    match association {
+        ActionRunAssociation::None => Ok(None),
+        ActionRunAssociation::SameSourceRun => {
+            let run_id = source
+                .crawl_run_id
+                .as_deref()
+                .ok_or(JobRepositoryError::QueueInvariant)?;
+            let changed = connection
+                .execute(
+                    "UPDATE crawl_runs SET status = 'QUEUED' WHERE id = ?1 AND status IN ('QUEUED', 'SUCCEEDED', 'PARTIAL_RESULT', 'FAILED', 'CANCELLED')",
+                    [run_id],
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            if changed != 1 {
+                return Err(JobRepositoryError::QueueInvariant);
+            }
+            Ok(Some(run_id.to_owned()))
+        }
+        ActionRunAssociation::NewIndependentRun(snapshot) => {
+            let run_id = CrawlRunId::new();
+            insert_run_in_transaction(
+                connection,
+                run_id,
+                CrawlRunStatus::Queued,
+                snapshot,
+                serialized_snapshot.ok_or(JobRepositoryError::QueueInvariant)?,
+            )
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+            Ok(Some(run_id.to_string()))
+        }
     }
 }
 

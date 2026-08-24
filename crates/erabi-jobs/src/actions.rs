@@ -3,9 +3,13 @@
 use erabi_db::{
     ErabiDatabase,
     repositories::{
-        CheckpointCompatibility, CheckpointIdentity, CheckpointRepositoryError, CrawlRunRepository,
-        JobId, JobKind, JobRecord, JobRepository, JobRepositoryError, JobState,
+        ActionRunAssociation, CheckpointCompatibility, CheckpointIdentity,
+        CheckpointRepositoryError, CrawlRunRepository, CrawlRunRepositoryError, JobId, JobKind,
+        JobRecord, JobRepository, JobRepositoryError, JobState,
     },
+};
+use erabi_domain::{
+    CrawlRunSnapshot, CrawlRunSnapshotDraft, RobotsAudit, RobotsDecision, SnapshotError,
 };
 
 use crate::{CancellationController, JobRuntimeError, request_job_cancellation};
@@ -35,6 +39,12 @@ pub struct JobActionResult {
     pub failed_part_count: Option<usize>,
 }
 
+/// Explicit evidence for one independent full-crawl rerun.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RerunFullCrawlInput {
+    pub robots_override_reason: Option<String>,
+}
+
 /// Typed semantic failures at the action boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum JobActionError {
@@ -44,6 +54,14 @@ pub enum JobActionError {
     IllegalLifecycleState,
     #[error("the job has exhausted its bounded attempts")]
     AttemptsExhausted,
+    #[error("the job already has an explicit retry continuation")]
+    RetryAlreadyContinued,
+    #[error("Rerun Full Crawl requires a durable Crawl Run")]
+    CrawlRunRequired,
+    #[error("an independent rerun with a robots override requires a new reason")]
+    RobotsOverrideReasonRequired,
+    #[error("the submitted robots override reason is invalid")]
+    RobotsOverrideReasonInvalid,
     #[error("no durable checkpoint is available")]
     CheckpointMissing,
     #[error("the durable checkpoint is unsafe to use")]
@@ -93,14 +111,14 @@ impl JobActionService {
         if source.current_attempt >= source.max_attempts {
             return Err(JobActionError::AttemptsExhausted);
         }
-        let snapshot = self.snapshot_for(&source).await?;
+        self.snapshot_for(&source).await?;
         let remaining_attempts = source.max_attempts - source.current_attempt;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
                 job_id,
                 action_kind(JobAction::Retry)?,
                 now,
-                snapshot.as_ref(),
+                same_run_association(&source),
                 Some(remaining_attempts),
             )
             .await
@@ -124,7 +142,7 @@ impl JobActionService {
         if source.current_attempt >= source.max_attempts {
             return Err(JobActionError::AttemptsExhausted);
         }
-        let (snapshot, failed_part_count) = self.compatible_checkpoint(&source).await?;
+        let (_snapshot, failed_part_count) = self.compatible_checkpoint(&source).await?;
         if failed_part_count == 0 {
             return Err(JobActionError::IllegalLifecycleState);
         }
@@ -133,7 +151,7 @@ impl JobActionService {
                 job_id,
                 action_kind(JobAction::RetryFailedParts)?,
                 now,
-                Some(&snapshot),
+                ActionRunAssociation::SameSourceRun,
                 Some(source.max_attempts - source.current_attempt),
             )
             .await
@@ -145,8 +163,8 @@ impl JobActionService {
         ))
     }
 
-    /// Creates a new run/job child using the original immutable snapshot and
-    /// explicit parent lineage.
+    /// Creates an independent run/job child using explicit robots override
+    /// evidence where the source run used an override.
     ///
     /// # Errors
     /// Returns a typed lifecycle, lineage, or persistence error.
@@ -154,9 +172,25 @@ impl JobActionService {
         &self,
         job_id: &JobId,
         now: i64,
+        input: RerunFullCrawlInput,
     ) -> Result<JobActionResult, JobActionError> {
-        self.new_snapshot_child(job_id, now, JobAction::RerunFullCrawl)
+        let source = self.source(job_id).await?;
+        let snapshot = self
+            .snapshot_for(&source)
+            .await?
+            .ok_or(JobActionError::CrawlRunRequired)?;
+        let rerun_snapshot = independent_rerun_snapshot(&snapshot, input, now)?;
+        let job = JobRepository::new(&self.database)
+            .enqueue_action_child(
+                job_id,
+                action_kind(JobAction::RerunFullCrawl)?,
+                now,
+                ActionRunAssociation::NewIndependentRun(&rerun_snapshot),
+                None,
+            )
             .await
+            .map_err(action_repository_error)?;
+        Ok(result(JobAction::RerunFullCrawl, job, None))
     }
 
     /// Resumes only from a current, structurally valid, snapshot-compatible
@@ -170,13 +204,13 @@ impl JobActionService {
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.source(job_id).await?;
-        let (snapshot, _) = self.compatible_checkpoint(&source).await?;
+        let (_snapshot, _) = self.compatible_checkpoint(&source).await?;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
                 job_id,
                 action_kind(JobAction::ResumeCheckpoint)?,
                 now,
-                Some(&snapshot),
+                ActionRunAssociation::SameSourceRun,
                 None,
             )
             .await
@@ -184,8 +218,8 @@ impl JobActionService {
         Ok(result(JobAction::ResumeCheckpoint, job, None))
     }
 
-    /// Starts a new child from the beginning. It deliberately does not load,
-    /// validate, or copy checkpoint evidence.
+    /// Restarts the same durable run from the beginning without loading,
+    /// validating, or copying checkpoint evidence.
     ///
     /// # Errors
     /// Returns a typed lifecycle, lineage, or persistence error.
@@ -194,8 +228,19 @@ impl JobActionService {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
-        self.new_snapshot_child(job_id, now, JobAction::RestartFromBeginning)
+        let source = self.source(job_id).await?;
+        self.snapshot_for(&source).await?;
+        let job = JobRepository::new(&self.database)
+            .enqueue_action_child(
+                job_id,
+                action_kind(JobAction::RestartFromBeginning)?,
+                now,
+                same_run_association(&source),
+                None,
+            )
             .await
+            .map_err(action_repository_error)?;
+        Ok(result(JobAction::RestartFromBeginning, job, None))
     }
 
     /// Reuses the Task 3 cooperative cancellation boundary for queued and
@@ -276,31 +321,16 @@ impl JobActionService {
         Ok(job)
     }
 
-    async fn new_snapshot_child(
-        &self,
-        job_id: &JobId,
-        now: i64,
-        action: JobAction,
-    ) -> Result<JobActionResult, JobActionError> {
-        let source = self.source(job_id).await?;
-        let snapshot = self.snapshot_for(&source).await?;
-        let job = JobRepository::new(&self.database)
-            .enqueue_action_child(job_id, action_kind(action)?, now, snapshot.as_ref(), None)
-            .await
-            .map_err(action_repository_error)?;
-        Ok(result(action, job, None))
-    }
-
     async fn snapshot_for(
         &self,
         source: &JobRecord,
-    ) -> Result<Option<erabi_domain::CrawlRunSnapshot>, JobActionError> {
+    ) -> Result<Option<CrawlRunSnapshot>, JobActionError> {
         match source.crawl_run_id.as_deref() {
             Some(run_id) => Ok(Some(
                 CrawlRunRepository::new(&self.database)
                     .snapshot_by_stored_id(run_id)
                     .await
-                    .map_err(|_| JobActionError::NotFound)?,
+                    .map_err(run_repository_error)?,
             )),
             None => Ok(None),
         }
@@ -309,7 +339,7 @@ impl JobActionService {
     async fn compatible_checkpoint(
         &self,
         source: &JobRecord,
-    ) -> Result<(erabi_domain::CrawlRunSnapshot, usize), JobActionError> {
+    ) -> Result<(CrawlRunSnapshot, usize), JobActionError> {
         let run_id = source
             .crawl_run_id
             .as_deref()
@@ -317,7 +347,7 @@ impl JobActionService {
         let snapshot = CrawlRunRepository::new(&self.database)
             .snapshot_by_stored_id(run_id)
             .await
-            .map_err(|_| JobActionError::NotFound)?;
+            .map_err(run_repository_error)?;
         let identity = CheckpointIdentity::new(
             run_id,
             snapshot.snapshot_hash(),
@@ -335,6 +365,63 @@ impl JobActionService {
             return Err(JobActionError::CheckpointIncompatible);
         }
         Ok((snapshot, checkpoint.checkpoint.failed_units.len()))
+    }
+}
+
+fn same_run_association(source: &JobRecord) -> ActionRunAssociation<'static> {
+    if source.crawl_run_id.is_some() {
+        ActionRunAssociation::SameSourceRun
+    } else {
+        ActionRunAssociation::None
+    }
+}
+
+fn independent_rerun_snapshot(
+    source: &CrawlRunSnapshot,
+    input: RerunFullCrawlInput,
+    now: i64,
+) -> Result<CrawlRunSnapshot, JobActionError> {
+    match source.robots().decision() {
+        RobotsDecision::Respect => Ok(source.clone()),
+        RobotsDecision::Override { .. } => {
+            let reason = input
+                .robots_override_reason
+                .ok_or(JobActionError::RobotsOverrideReasonRequired)?;
+            let decided_at = now.to_string();
+            let robots = RobotsAudit::override_with_reason(
+                reason,
+                source.robots().actor(),
+                &decided_at,
+                source.robots().affected_scope(),
+                source.robots().user_agent(),
+                source.robots().crawler_version_id(),
+            )
+            .map_err(robots_override_reason_error)?;
+            CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
+                run_type: source.run_type(),
+                configuration: source.configuration().clone(),
+                selected_seed_ids: source.selected_seed_ids().to_vec(),
+                run_profile_id: source.run_profile_id(),
+                settings: source.settings().clone(),
+                robots,
+                actor: source.actor().to_owned(),
+                created_at: decided_at,
+            })
+            .map_err(robots_override_reason_error)
+        }
+    }
+}
+
+fn robots_override_reason_error(_: SnapshotError) -> JobActionError {
+    JobActionError::RobotsOverrideReasonInvalid
+}
+
+fn run_repository_error(error: CrawlRunRepositoryError) -> JobActionError {
+    match error {
+        CrawlRunRepositoryError::NotFound => JobActionError::NotFound,
+        CrawlRunRepositoryError::Database(error) => {
+            JobActionError::Repository(JobRepositoryError::Database(error))
+        }
     }
 }
 
@@ -390,6 +477,7 @@ fn action_repository_error(error: JobRepositoryError) -> JobActionError {
     match error {
         JobRepositoryError::NotFound => JobActionError::NotFound,
         JobRepositoryError::AttemptsExhausted => JobActionError::AttemptsExhausted,
+        JobRepositoryError::RetryAlreadyContinued => JobActionError::RetryAlreadyContinued,
         JobRepositoryError::RemovalUnsafe => JobActionError::NotRemovable,
         JobRepositoryError::NotReprioritizable => JobActionError::NotReprioritizable,
         JobRepositoryError::ActionAlreadyActive | JobRepositoryError::LeaseLost => {
@@ -403,6 +491,7 @@ fn action_repository_error(error: JobRepositoryError) -> JobActionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use erabi_db::DbError;
 
     #[test]
     fn malformed_checkpoint_evidence_maps_to_the_unsafe_action_error() {
@@ -411,6 +500,16 @@ mod tests {
                 CheckpointRepositoryError::Malformed
             )),
             JobActionError::CheckpointUnsafe
+        ));
+    }
+
+    #[test]
+    fn durable_run_invariant_evidence_is_not_mapped_to_not_found() {
+        assert!(matches!(
+            run_repository_error(CrawlRunRepositoryError::Database(DbError::Invariant(
+                "snapshot mismatch".into()
+            ))),
+            JobActionError::Repository(JobRepositoryError::Database(DbError::Invariant(_)))
         ));
     }
 }

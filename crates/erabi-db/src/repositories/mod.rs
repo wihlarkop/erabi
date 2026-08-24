@@ -21,8 +21,9 @@ pub use configuration::ConfigurationRepository;
 pub use crawler::{CrawlerPointers, CrawlerRepository};
 pub use identity::JobIdParseError;
 pub use job::{
-    AcquiredJob, AttemptOutcome, ConcurrencyState, JobAttempt, JobFailureCode, JobId, JobKind,
-    JobLease, JobRecord, JobRepository, JobRepositoryError, JobState, NewJob, StaleJobRecovery,
+    AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,
+    JobFailureCode, JobId, JobKind, JobLease, JobRecord, JobRepository, JobRepositoryError,
+    JobState, NewJob, StaleJobRecovery,
 };
 pub use progress::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
@@ -30,4 +31,4 @@ pub use progress::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
-pub use run::CrawlRunRepository;
+pub use run::{CrawlRunRepository, CrawlRunRepositoryError};

@@ -7,11 +7,12 @@ use erabi_db::repositories::{
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
     CrawlRunId, CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunStatus, CrawlRunType,
-    ResolvedValue, RobotsAudit, RunConfiguration, SettingSource, SnapshotOperationalSettings,
+    ResolvedValue, RobotsAudit, RobotsDecision, RunConfiguration, SettingSource,
+    SnapshotOperationalSettings,
 };
 use erabi_jobs::{
     CancellationController, JobAction, JobActionError, JobActionService, JobExecutionContext,
-    JobExecutionError, JobHandler, JobRuntime, WorkerPolicy, WorkerTurn,
+    JobExecutionError, JobHandler, JobRuntime, RerunFullCrawlInput, WorkerPolicy, WorkerTurn,
 };
 use tokio::sync::Notify;
 
@@ -22,6 +23,18 @@ async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
 }
 
 fn snapshot() -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {
+    snapshot_with_robots(RobotsAudit::respect(
+        "operator",
+        "2026-08-23T00:00:00Z",
+        "https://example.test",
+        "Erabi/0.1",
+        None,
+    ))
+}
+
+fn snapshot_with_robots(
+    robots: RobotsAudit,
+) -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {
     Ok(CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
         run_type: CrawlRunType::QuickScrape,
         configuration: RunConfiguration::QuickScrape {
@@ -42,13 +55,7 @@ fn snapshot() -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {
             retain_artifacts: resolved(true),
             user_agent: resolved("Erabi/0.1".into()),
         },
-        robots: RobotsAudit::respect(
-            "operator",
-            "2026-08-23T00:00:00Z",
-            "https://example.test",
-            "Erabi/0.1",
-            None,
-        ),
+        robots,
         actor: "operator".into(),
         created_at: "2026-08-23T00:00:00Z".into(),
     })?)
@@ -75,6 +82,14 @@ async fn run_backed_job(
     max_attempts: u32,
 ) -> Result<(NewJob, CrawlRunId, CrawlRunSnapshot), Box<dyn std::error::Error>> {
     let snapshot = snapshot()?;
+    run_backed_job_with_snapshot(database, max_attempts, snapshot).await
+}
+
+async fn run_backed_job_with_snapshot(
+    database: &ErabiDatabase,
+    max_attempts: u32,
+    snapshot: CrawlRunSnapshot,
+) -> Result<(NewJob, CrawlRunId, CrawlRunSnapshot), Box<dyn std::error::Error>> {
     let run_id = CrawlRunId::new();
     CrawlRunRepository::new(database)
         .create(run_id, CrawlRunStatus::Queued, &snapshot)
@@ -120,7 +135,15 @@ fn compatible_checkpoint(
 async fn retry_preserves_attempt_history_and_creates_a_new_attempt()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
-    let job = queued_job(&database, 3).await?;
+    let snapshot = snapshot_with_robots(RobotsAudit::override_with_reason(
+        "frozen retry approval",
+        "operator",
+        "2026-08-23T00:00:00Z",
+        "https://example.test",
+        "Erabi/0.1",
+        None,
+    )?)?;
+    let (job, run_id, snapshot) = run_backed_job_with_snapshot(&database, 3, snapshot).await?;
     let repository = JobRepository::new(&database);
     let acquired = repository
         .acquire_next("retry-worker", 0, 30)
@@ -134,6 +157,22 @@ async fn retry_preserves_attempt_history_and_creates_a_new_attempt()
     assert_eq!(result.action, JobAction::Retry);
     assert_eq!(repository.attempts(&job.id).await?.len(), 1);
     assert_eq!(result.parent_job_id, Some(job.id.clone()));
+    assert_eq!(result.crawl_run_id, Some(run_id.to_string()));
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .snapshot(run_id)
+            .await?
+            .snapshot_hash(),
+        snapshot.snapshot_hash()
+    );
+    assert!(matches!(
+        CrawlRunRepository::new(&database)
+            .snapshot(run_id)
+            .await?
+            .robots()
+            .decision(),
+        RobotsDecision::Override { reason } if reason == "frozen retry approval"
+    ));
     assert_eq!(repository.job(&job.id).await?.state, JobState::Cancelled);
     let second = repository
         .acquire_next("retry-worker-2", 2, 30)
@@ -202,7 +241,14 @@ async fn resume_requires_a_current_compatible_checkpoint() -> Result<(), Box<dyn
     let result = service.resume(&job.id, 3).await?;
     assert_eq!(result.action, JobAction::ResumeCheckpoint);
     assert_eq!(result.parent_job_id, Some(job.id.clone()));
-    assert_ne!(result.crawl_run_id, job.crawl_run_id);
+    assert_eq!(result.crawl_run_id, job.crawl_run_id);
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .snapshot(run_id)
+            .await?
+            .snapshot_hash(),
+        snapshot.snapshot_hash()
+    );
     let child = JobRepository::new(&database).job(&result.job_id).await?;
     assert!(
         JobRepository::new(&database)
@@ -245,7 +291,7 @@ async fn resume_rejects_incompatible_checkpoint() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-async fn restart_ignores_checkpoint_and_rerun_reuses_snapshot_lineage()
+async fn restart_reuses_the_same_run_and_rerun_creates_an_independent_run()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
     let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
@@ -259,18 +305,22 @@ async fn restart_ignores_checkpoint_and_rerun_reuses_snapshot_lineage()
     let restart = service.restart_from_beginning(&job.id, 3).await?;
     let restart_record = JobRepository::new(&database).job(&restart.job_id).await?;
     assert_eq!(restart_record.kind.as_str(), "RESTART_FROM_BEGINNING");
+    assert_eq!(restart.crawl_run_id, Some(run_id.to_string()));
     assert!(
         JobRepository::new(&database)
             .latest_checkpoint(&restart.job_id)
             .await?
             .is_none()
     );
-    let rerun = service.rerun_full_crawl(&job.id, 3).await?;
+    let rerun = service
+        .rerun_full_crawl(&job.id, 3, RerunFullCrawlInput::default())
+        .await?;
     let rerun_run_id = rerun.crawl_run_id.as_deref().ok_or("run missing")?;
     let rerun_snapshot = CrawlRunRepository::new(&database)
         .snapshot_by_stored_id(rerun_run_id)
         .await?;
     assert_eq!(rerun_snapshot.snapshot_hash(), snapshot.snapshot_hash());
+    assert_ne!(rerun.crawl_run_id, Some(run_id.to_string()));
     assert_eq!(rerun.parent_job_id, Some(job.id));
     Ok(())
 }
@@ -291,12 +341,152 @@ async fn retry_failed_parts_preserves_successful_checkpoint_evidence()
     let service = JobActionService::new(database.clone(), CancellationController::default());
     let result = service.retry_failed_parts(&job.id, 3).await?;
     assert_eq!(result.failed_part_count, Some(1));
+    assert_eq!(result.crawl_run_id, job.crawl_run_id);
     let records = JobRepository::new(&database).checkpoints(&job.id).await?;
     assert_eq!(
         records[0].checkpoint.completed_units[0].as_str(),
         "success-1"
     );
     assert_eq!(records[0].checkpoint.failed_units[0].as_str(), "failed-1");
+    Ok(())
+}
+
+#[tokio::test]
+async fn independent_rerun_requires_fresh_robots_override_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let source_snapshot = snapshot_with_robots(RobotsAudit::override_with_reason(
+        "initial approval",
+        "operator",
+        "2026-08-23T00:00:00Z",
+        "https://example.test",
+        "Erabi/0.1",
+        None,
+    )?)?;
+    let (job, run_id, source_snapshot) =
+        run_backed_job_with_snapshot(&database, 3, source_snapshot).await?;
+    cancel_active(
+        &database,
+        &job,
+        Some(compatible_checkpoint(run_id, &source_snapshot)?),
+    )
+    .await?;
+    let service = JobActionService::new(database.clone(), CancellationController::default());
+    let resumed = service.resume(&job.id, 3).await?;
+    assert_eq!(resumed.crawl_run_id, Some(run_id.to_string()));
+    assert!(matches!(
+        CrawlRunRepository::new(&database)
+            .snapshot(run_id)
+            .await?
+            .robots()
+            .decision(),
+        RobotsDecision::Override { reason } if reason == "initial approval"
+    ));
+    assert!(matches!(
+        service
+            .rerun_full_crawl(&job.id, 4, RerunFullCrawlInput::default())
+            .await,
+        Err(JobActionError::RobotsOverrideReasonRequired)
+    ));
+
+    let result = service
+        .rerun_full_crawl(
+            &job.id,
+            5,
+            RerunFullCrawlInput {
+                robots_override_reason: Some("renewed approval".into()),
+            },
+        )
+        .await?;
+    assert_ne!(result.crawl_run_id, Some(run_id.to_string()));
+    let rerun = CrawlRunRepository::new(&database)
+        .snapshot_by_stored_id(result.crawl_run_id.as_deref().ok_or("run missing")?)
+        .await?;
+    assert!(matches!(
+        rerun.robots().decision(),
+        RobotsDecision::Override { reason } if reason == "renewed approval"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rerun_full_crawl_rejects_a_generic_job_without_a_crawl_run()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let job = queued_job(&database, 2).await?;
+    cancel_active(&database, &job, None).await?;
+    let service = JobActionService::new(database, CancellationController::default());
+    assert!(matches!(
+        service
+            .rerun_full_crawl(&job.id, 3, RerunFullCrawlInput::default())
+            .await,
+        Err(JobActionError::CrawlRunRequired)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_continuation_cannot_reset_budget_from_a_terminal_ancestor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let source = queued_job(&database, 3).await?;
+    cancel_active(&database, &source, None).await?;
+    let repository = JobRepository::new(&database);
+    let service = JobActionService::new(database.clone(), CancellationController::default());
+    let child = service.retry(&source.id, 3).await?;
+    let acquired = repository
+        .acquire_next("retry-child-worker", 3, 30)
+        .await?
+        .ok_or("child was not acquired")?;
+    assert_eq!(acquired.job.id, child.job_id);
+    let lease = acquired.job.lease.clone().ok_or("lease missing")?;
+    repository.cancel(&child.job_id, &lease, 4).await?;
+
+    assert!(matches!(
+        service.retry(&source.id, 5).await,
+        Err(JobActionError::RetryAlreadyContinued)
+    ));
+    let grandchild = service.retry(&child.job_id, 5).await?;
+    let grandchild_record = repository.job(&grandchild.job_id).await?;
+    assert_eq!(grandchild_record.parent_job_id, Some(child.job_id));
+    assert_eq!(grandchild_record.max_attempts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn parent_linked_queued_action_child_is_not_removable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let source = queued_job(&database, 2).await?;
+    cancel_active(&database, &source, None).await?;
+    let service = JobActionService::new(database.clone(), CancellationController::default());
+    let child = service.retry(&source.id, 3).await?;
+    assert!(matches!(
+        service.remove(&child.job_id).await,
+        Err(JobActionError::NotRemovable)
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_same_run_recovery_actions_create_one_active_continuation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    cancel_active(
+        &database,
+        &job,
+        Some(compatible_checkpoint(run_id, &snapshot)?),
+    )
+    .await?;
+    let service = JobActionService::new(database, CancellationController::default());
+    let (resume, restart) = tokio::join!(
+        service.resume(&job.id, 3),
+        service.restart_from_beginning(&job.id, 3)
+    );
+    assert_eq!(u8::from(resume.is_ok()) + u8::from(restart.is_ok()), 1);
+    let error = resume.err().or(restart.err()).ok_or("missing conflict")?;
+    assert!(matches!(error, JobActionError::ConcurrentTransition));
     Ok(())
 }
 

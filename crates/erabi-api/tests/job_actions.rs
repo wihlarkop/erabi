@@ -94,6 +94,27 @@ async fn action_api_returns_stable_lifecycle_errors() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
+async fn rerun_action_requires_a_durable_crawl_run() -> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let job = job(&database).await?;
+    let router = loopback(&database)?;
+    let cancelled = router
+        .clone()
+        .oneshot(request(&format!("/api/v1/jobs/{}/cancel", job.id)).body(Body::from("{}"))?)
+        .await?;
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    let response = router
+        .oneshot(
+            request(&format!("/api/v1/jobs/{}/rerun-full-crawl", job.id)).body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let value = body_json(response).await?;
+    assert_eq!(value["code"], "CRAWL_RUN_REQUIRED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_task_4_actions_inherit_bearer_authentication()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;

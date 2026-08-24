@@ -29,7 +29,9 @@ mod actions;
 mod cancellation;
 mod progress;
 
-pub use actions::{JobAction, JobActionError, JobActionResult, JobActionService};
+pub use actions::{
+    JobAction, JobActionError, JobActionResult, JobActionService, RerunFullCrawlInput,
+};
 pub use cancellation::{CancellationController, CancellationToken};
 pub use progress::{
     ProgressLiveHub, ProgressLiveHubError, ProgressPublication, ProgressPublisher,

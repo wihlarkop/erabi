@@ -3,6 +3,16 @@ use turso::{Connection, transaction::TransactionBehavior};
 
 use crate::{DbError, ErabiDatabase};
 
+/// Typed immutable Crawl Run read failures. Missing rows are distinct from
+/// malformed or inconsistent durable snapshot evidence.
+#[derive(Debug, thiserror::Error)]
+pub enum CrawlRunRepositoryError {
+    #[error("the Crawl Run does not exist")]
+    NotFound,
+    #[error("durable Crawl Run operation failed")]
+    Database(#[source] DbError),
+}
+
 /// Persistence operations for immutable Crawl Run snapshots.
 #[derive(Clone, Copy, Debug)]
 pub struct CrawlRunRepository<'database> {
@@ -48,7 +58,10 @@ impl<'database> CrawlRunRepository<'database> {
     /// # Errors
     /// Returns an error when the run does not exist, cannot be read, or contains
     /// an invalid snapshot payload.
-    pub async fn snapshot(&self, id: CrawlRunId) -> Result<CrawlRunSnapshot, DbError> {
+    pub async fn snapshot(
+        &self,
+        id: CrawlRunId,
+    ) -> Result<CrawlRunSnapshot, CrawlRunRepositoryError> {
         self.snapshot_by_stored_id(&id.to_string()).await
     }
 
@@ -61,31 +74,48 @@ impl<'database> CrawlRunRepository<'database> {
     pub async fn snapshot_by_stored_id(
         &self,
         stored_id: &str,
-    ) -> Result<CrawlRunSnapshot, DbError> {
-        let connection = self.database.connection().await?;
+    ) -> Result<CrawlRunSnapshot, CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
         let row = connection
             .prepare(
                 "SELECT snapshot_json, snapshot_hash, checkpoint_compatibility_hash FROM crawl_runs WHERE id = ?1",
             )
-            .await?
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
             .query_row([stored_id])
-            .await?;
-        let snapshot_json: String = row.get(0)?;
-        let stored_snapshot_hash: String = row.get(1)?;
-        let stored_checkpoint_compatibility_hash: String = row.get(2)?;
+            .await
+            .map_err(|error| match error {
+                turso::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
+                other => CrawlRunRepositoryError::Database(DbError::from(other)),
+            })?;
+        let snapshot_json: String = row
+            .get(0)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let stored_snapshot_hash: String = row
+            .get(1)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let stored_checkpoint_compatibility_hash: String = row
+            .get(2)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
         let snapshot: CrawlRunSnapshot = serde_json::from_str(&snapshot_json).map_err(|error| {
-            DbError::Invariant(format!("stored CrawlRunSnapshot is invalid: {error}"))
+            CrawlRunRepositoryError::Database(DbError::Invariant(format!(
+                "stored CrawlRunSnapshot is invalid: {error}"
+            )))
         })?;
         if snapshot.snapshot_hash() != stored_snapshot_hash {
-            return Err(DbError::Invariant(
+            return Err(CrawlRunRepositoryError::Database(DbError::Invariant(
                 "stored CrawlRunSnapshot hash column does not match snapshot JSON".into(),
-            ));
+            )));
         }
         if snapshot.checkpoint_compatibility_hash() != stored_checkpoint_compatibility_hash {
-            return Err(DbError::Invariant(
+            return Err(CrawlRunRepositoryError::Database(DbError::Invariant(
                 "stored CrawlRunSnapshot checkpoint hash column does not match snapshot JSON"
                     .into(),
-            ));
+            )));
         }
         Ok(snapshot)
     }
@@ -328,7 +358,7 @@ mod tests {
             .await?;
         assert!(matches!(
             repository.snapshot(run_id).await,
-            Err(DbError::Invariant(_))
+            Err(CrawlRunRepositoryError::Database(DbError::Invariant(_)))
         ));
 
         let invalid_run_id = CrawlRunId::new();
@@ -351,7 +381,7 @@ mod tests {
             .await?;
         assert!(matches!(
             repository.snapshot(invalid_run_id).await,
-            Err(DbError::Invariant(_))
+            Err(CrawlRunRepositoryError::Database(DbError::Invariant(_)))
         ));
 
         let checkpoint_run_id = CrawlRunId::new();
@@ -366,7 +396,7 @@ mod tests {
             .await?;
         assert!(matches!(
             repository.snapshot(checkpoint_run_id).await,
-            Err(DbError::Invariant(_))
+            Err(CrawlRunRepositoryError::Database(DbError::Invariant(_)))
         ));
         Ok(())
     }
