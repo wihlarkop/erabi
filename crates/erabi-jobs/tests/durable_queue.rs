@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use erabi_db::{
@@ -11,9 +11,11 @@ use erabi_db::{
     },
 };
 use erabi_jobs::{
-    JobExecutionContext, JobExecutionError, JobHandler, JobRuntime, JobRuntimeError, WorkerPolicy,
-    WorkerTurn, recover_and_rebuild_at,
+    CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, JobExecutionContext,
+    JobExecutionError, JobHandler, JobRuntime, JobRuntimeError, WorkerPolicy, WorkerTurn,
+    recover_and_rebuild_at,
 };
+use tokio::sync::Notify;
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
@@ -108,6 +110,35 @@ async fn expired_leases_revoke_stale_owner_authority_without_aba_reuse()
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].outcome, AttemptOutcome::LeaseExpired);
     assert_eq!(attempts[0].failure_code, Some(JobFailureCode::LeaseExpired));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_lease_owner_cannot_commit_final_cancellation_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(2, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let first = repository
+        .acquire_next("worker-stale-a", 0, 5)
+        .await?
+        .ok_or("first lease missing")?;
+    let first_lease = first.job.lease.ok_or("first lease missing")?;
+    let second = repository
+        .acquire_next("worker-stale-b", 5, 5)
+        .await?
+        .ok_or("second lease missing")?;
+
+    assert!(matches!(
+        repository.cancel(&job.id, &first_lease, 5).await,
+        Err(JobRepositoryError::LeaseLost)
+    ));
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Running);
+    repository
+        .cancel(&job.id, &second.job.lease.ok_or("second lease missing")?, 5)
+        .await?;
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Cancelled);
     Ok(())
 }
 
@@ -257,6 +288,70 @@ struct BarrierThenSuccess {
     barrier: Arc<tokio::sync::Barrier>,
 }
 
+fn checkpoint(unit: &str) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
+    let identity = CheckpointIdentity::new("generic-job", "a".repeat(64), "b".repeat(64))?;
+    let mut checkpoint = CheckpointEnvelope::new(identity);
+    checkpoint
+        .completed_units
+        .push(CheckpointUnitId::new(unit)?);
+    Ok(checkpoint)
+}
+
+struct CheckpointThenWait {
+    started: Arc<Notify>,
+    checkpoint: CheckpointEnvelope,
+    observed_cancellation: Arc<AtomicBool>,
+}
+
+impl JobHandler for CheckpointThenWait {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let started = Arc::clone(&self.started);
+        let checkpoint = self.checkpoint.clone();
+        let observed_cancellation = Arc::clone(&self.observed_cancellation);
+        async move {
+            context
+                .checkpoint(&checkpoint, 0)
+                .await
+                .map_err(|_| JobExecutionError)?;
+            started.notify_one();
+            context.cancellation().cancelled().await;
+            observed_cancellation.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+}
+
+struct InvalidCheckpointThenWait {
+    started: Arc<Notify>,
+    checkpoint: CheckpointEnvelope,
+    checkpoint_failed: Arc<AtomicBool>,
+}
+
+impl JobHandler for InvalidCheckpointThenWait {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let started = Arc::clone(&self.started);
+        let mut checkpoint = self.checkpoint.clone();
+        checkpoint
+            .pending_units
+            .clone_from(&checkpoint.completed_units);
+        let checkpoint_failed = Arc::clone(&self.checkpoint_failed);
+        async move {
+            if context.checkpoint(&checkpoint, 0).await.is_err() {
+                checkpoint_failed.store(true, Ordering::Release);
+            }
+            started.notify_one();
+            context.cancellation().cancelled().await;
+            Err(JobExecutionError)
+        }
+    }
+}
+
 impl JobHandler for BarrierThenSuccess {
     fn execute(
         &self,
@@ -388,5 +483,149 @@ async fn panicking_handler_fails_only_its_job_and_next_job_still_runs()
         repository.attempts(&panicking.id).await?[0].failure_code,
         Some(JobFailureCode::HandlerPanicked)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_cancellation_stops_scheduling_new_units() -> Result<(), Box<dyn std::error::Error>>
+{
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(&database, "worker-cancel", WorkerPolicy::conservative())?;
+
+    assert_eq!(
+        runtime.request_cancellation(&job.id, 0).await?,
+        JobState::Cancelled
+    );
+    assert!(matches!(
+        runtime.execute_next_at(&DelayedSuccess, 0).await?,
+        WorkerTurn::Idle
+    ));
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Cancelled);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_handler_observes_cooperative_cancellation_and_finishes_cancelled()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(
+        &database,
+        "worker-cancel-active",
+        WorkerPolicy::conservative(),
+    )?;
+    let started = Arc::new(Notify::new());
+    let observed = Arc::new(AtomicBool::new(false));
+    let handler = CheckpointThenWait {
+        started: Arc::clone(&started),
+        checkpoint: checkpoint("unit-1")?,
+        observed_cancellation: Arc::clone(&observed),
+    };
+    let (execution, cancellation) = tokio::join!(runtime.execute_next_at(&handler, 0), async {
+        started.notified().await;
+        runtime.request_cancellation(&job.id, 0).await
+    });
+    assert_eq!(cancellation?, JobState::Running);
+    assert!(matches!(
+        execution?,
+        WorkerTurn::Cancelled {
+            checkpoint_persisted: true,
+            ..
+        }
+    ));
+    assert!(observed.load(Ordering::Acquire));
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Cancelled);
+    assert_eq!(repository.checkpoints(&job.id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_persistence_failure_does_not_advertise_resumability()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(
+        &database,
+        "worker-cancel-invalid-checkpoint",
+        WorkerPolicy::conservative(),
+    )?;
+    let started = Arc::new(Notify::new());
+    let checkpoint_failed = Arc::new(AtomicBool::new(false));
+    let handler = InvalidCheckpointThenWait {
+        started: Arc::clone(&started),
+        checkpoint: checkpoint("unit-invalid")?,
+        checkpoint_failed: Arc::clone(&checkpoint_failed),
+    };
+    let (execution, cancellation) = tokio::join!(runtime.execute_next_at(&handler, 0), async {
+        started.notified().await;
+        runtime.request_cancellation(&job.id, 0).await
+    });
+    assert_eq!(cancellation?, JobState::Running);
+    assert!(matches!(
+        execution?,
+        WorkerTurn::Cancelled {
+            checkpoint_persisted: false,
+            ..
+        }
+    ));
+    assert!(checkpoint_failed.load(Ordering::Acquire));
+    assert!(repository.checkpoints(&job.id).await?.is_empty());
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Cancelled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_one_job_leaves_unrelated_queued_work_executable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let cancelled = new_job(1, 0)?;
+    let unrelated = new_job(1, 0)?;
+    repository.enqueue(&cancelled, 0).await?;
+    repository.enqueue(&unrelated, 0).await?;
+    let runtime = JobRuntime::new(
+        &database,
+        "worker-independent",
+        WorkerPolicy::conservative(),
+    )?;
+    runtime.request_cancellation(&cancelled.id, 0).await?;
+
+    assert!(matches!(
+        runtime.execute_next_at(&DelayedSuccess, 0).await?,
+        WorkerTurn::Succeeded { job_id } if job_id == unrelated.id
+    ));
+    assert_eq!(
+        repository.job(&cancelled.id).await?.state,
+        JobState::Cancelled
+    );
+    assert_eq!(
+        repository.job(&unrelated.id).await?.state,
+        JobState::Succeeded
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_cancellation_controller_prevents_new_worker_turns()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    let runtime = JobRuntime::new(&database, "worker-shutdown", WorkerPolicy::conservative())?;
+    runtime.cancellation_controller().cancel_all();
+
+    assert!(matches!(
+        runtime.execute_next_at(&DelayedSuccess, 0).await?,
+        WorkerTurn::Idle
+    ));
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Queued);
     Ok(())
 }

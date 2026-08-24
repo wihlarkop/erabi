@@ -1,9 +1,16 @@
 //! Generic Tokio worker and durable progress boundaries for Erabi jobs.
 //!
-//! Crawl, extraction, export, and cancellation behavior remain in later plans;
-//! this crate owns generic leased execution and replayable progress services.
+//! Generic leased execution, cooperative cancellation, bounded checkpoints,
+//! and replayable progress services for Erabi jobs.
 
-use std::{panic::AssertUnwindSafe, time::Duration};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use erabi_db::{
     ErabiDatabase,
@@ -13,16 +20,28 @@ use erabi_db::{
     },
 };
 use futures_util::FutureExt;
-use tokio::time::{Instant, interval_at};
+use tokio::{
+    sync::RwLock,
+    time::{Instant, interval_at},
+};
 
+mod cancellation;
 mod progress;
 
+pub use cancellation::{CancellationController, CancellationToken};
 pub use progress::{
     ProgressLiveHub, ProgressLiveHubError, ProgressPublication, ProgressPublisher,
     ProgressPublisherError, ProgressService, ProgressServiceError,
 };
 
 pub use erabi_db::repositories::{AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob};
+pub use erabi_db::repositories::{
+    CURRENT_CHECKPOINT_SCHEMA_VERSION, CheckpointArtifactReference, CheckpointCompatibility,
+    CheckpointEnvelope, CheckpointIdentity, CheckpointPosition, CheckpointRecord,
+    CheckpointRecoveryAssessment, CheckpointRecoveryDisposition, CheckpointRepository,
+    CheckpointRepositoryError, CheckpointUnitId, ExtractionResumePhase, ExtractionResumeState,
+    MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
+};
 pub use erabi_db::repositories::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
     ProgressMetadata, ProgressMetadataCode, ProgressMetadataKey, ProgressMetadataValue,
@@ -62,13 +81,15 @@ impl WorkerPolicy {
 
 /// Context supplied to an individual handler. It contains only durable queue
 /// identity and ownership evidence, never request bodies or scraped content.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct JobExecutionContext {
     job_id: JobId,
     kind: JobKind,
     attempt_number: u32,
     worker_id: String,
     lease: JobLease,
+    cancellation: CancellationToken,
+    checkpoint_writer: CheckpointWriter,
 }
 
 impl JobExecutionContext {
@@ -95,6 +116,62 @@ impl JobExecutionContext {
     #[must_use]
     pub fn lease(&self) -> &JobLease {
         &self.lease
+    }
+
+    /// Returns the cooperative cancellation signal for this active turn.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Persists a bounded checkpoint while this worker still owns the attempt.
+    ///
+    /// # Errors
+    /// Returns a typed validation, ownership, or durable persistence failure.
+    pub async fn checkpoint(
+        &self,
+        checkpoint: &CheckpointEnvelope,
+        created_at: i64,
+    ) -> Result<CheckpointRecord, JobRepositoryError> {
+        self.checkpoint_writer.append(checkpoint, created_at).await
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CheckpointWriter {
+    database: ErabiDatabase,
+    job_id: JobId,
+    attempt_id: String,
+    lease: Arc<RwLock<JobLease>>,
+    persisted: Arc<AtomicBool>,
+}
+
+impl CheckpointWriter {
+    async fn append(
+        &self,
+        checkpoint: &CheckpointEnvelope,
+        created_at: i64,
+    ) -> Result<CheckpointRecord, JobRepositoryError> {
+        let lease = self.lease.read().await.clone();
+        let record = JobRepository::new(&self.database)
+            .append_checkpoint(
+                &self.job_id,
+                &self.attempt_id,
+                &lease,
+                checkpoint,
+                created_at,
+            )
+            .await?;
+        self.persisted.store(true, Ordering::Release);
+        Ok(record)
+    }
+
+    async fn update_lease(&self, lease: JobLease) {
+        *self.lease.write().await = lease;
+    }
+
+    fn persisted(&self) -> bool {
+        self.persisted.load(Ordering::Acquire)
     }
 }
 
@@ -130,6 +207,10 @@ pub enum WorkerTurn {
         job_id: JobId,
         failure: JobFailureCode,
     },
+    Cancelled {
+        job_id: JobId,
+        checkpoint_persisted: bool,
+    },
 }
 
 /// Failure that prevents the generic worker boundary from safely proceeding.
@@ -145,9 +226,11 @@ pub enum JobRuntimeError {
 /// supervisor/poll loop without coupling job execution to HTTP route lifetime.
 #[derive(Clone, Debug)]
 pub struct JobRuntime<'database> {
+    database: ErabiDatabase,
     repository: JobRepository<'database>,
     worker_id: String,
     policy: WorkerPolicy,
+    cancellation: CancellationController,
 }
 
 impl<'database> JobRuntime<'database> {
@@ -162,15 +245,62 @@ impl<'database> JobRuntime<'database> {
         worker_id: impl Into<String>,
         policy: WorkerPolicy,
     ) -> Result<Self, JobRuntimeError> {
+        Self::with_cancellation_controller(
+            database,
+            worker_id,
+            policy,
+            CancellationController::default(),
+        )
+    }
+
+    /// Creates a worker joined to a process/runtime cancellation controller.
+    /// The controller is the bridge used by graceful shutdown to signal active
+    /// handlers without aborting them.
+    ///
+    /// # Errors
+    /// Returns an error when the worker identity or bounded lease/retry policy
+    /// is invalid.
+    pub fn with_cancellation_controller(
+        database: &'database ErabiDatabase,
+        worker_id: impl Into<String>,
+        policy: WorkerPolicy,
+        cancellation: CancellationController,
+    ) -> Result<Self, JobRuntimeError> {
         let worker_id = worker_id.into();
         if !policy.valid() || worker_id.is_empty() || worker_id.len() > 128 {
             return Err(JobRuntimeError::InvalidPolicy);
         }
         Ok(Self {
+            database: database.clone(),
             repository: JobRepository::new(database),
             worker_id,
             policy,
+            cancellation,
         })
+    }
+
+    /// Returns the controller used by handlers and process shutdown to signal
+    /// active work without aborting its task.
+    #[must_use]
+    pub fn cancellation_controller(&self) -> CancellationController {
+        self.cancellation.clone()
+    }
+
+    /// Requests cancellation for one job. Queued work is durably cancelled so
+    /// it cannot be scheduled; active work receives the cooperative signal.
+    ///
+    /// # Errors
+    /// Returns an error when the durable queue cannot inspect or update the job.
+    pub async fn request_cancellation(
+        &self,
+        job_id: &JobId,
+        now: i64,
+    ) -> Result<JobState, JobRuntimeError> {
+        self.cancellation.request(job_id);
+        self.repository
+            .cancel_queued(job_id, now)
+            .await
+            .map_err(JobRuntimeError::Repository)
     }
 
     /// Executes at most one eligible job using supplied deterministic time.
@@ -185,6 +315,9 @@ impl<'database> JobRuntime<'database> {
         handler: &H,
         now: i64,
     ) -> Result<WorkerTurn, JobRuntimeError> {
+        if self.cancellation.shutdown_requested() {
+            return Ok(WorkerTurn::Idle);
+        }
         let Some(acquired) = self
             .repository
             .acquire_next(&self.worker_id, now, self.policy.lease_duration_seconds)
@@ -193,19 +326,48 @@ impl<'database> JobRuntime<'database> {
         else {
             return Ok(WorkerTurn::Idle);
         };
+        let cancellation = self.cancellation.register(&acquired.job.id);
+        let current_lease = acquired
+            .job
+            .lease
+            .clone()
+            .ok_or(JobRuntimeError::Repository(
+                JobRepositoryError::QueueInvariant,
+            ));
+        let current_lease = match current_lease {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.cancellation.release(&acquired.job.id);
+                return Err(error);
+            }
+        };
+        let checkpoint_writer = CheckpointWriter {
+            database: self.database.clone(),
+            job_id: acquired.job.id.clone(),
+            attempt_id: acquired.attempt.id.clone(),
+            lease: Arc::new(RwLock::new(current_lease.clone())),
+            persisted: Arc::new(AtomicBool::new(false)),
+        };
         let context = JobExecutionContext {
             job_id: acquired.job.id.clone(),
             kind: acquired.job.kind.clone(),
             attempt_number: acquired.attempt.attempt_number,
             worker_id: self.worker_id.clone(),
-            lease: acquired
-                .job
-                .lease
-                .clone()
-                .ok_or(JobRuntimeError::Repository(
-                    JobRepositoryError::QueueInvariant,
-                ))?,
+            lease: current_lease,
+            cancellation,
+            checkpoint_writer,
         };
+        let outcome = self.execute_acquired(handler, context, now).await;
+        self.cancellation.release(&acquired.job.id);
+        outcome
+    }
+
+    async fn execute_acquired<H: JobHandler>(
+        &self,
+        handler: &H,
+        context: JobExecutionContext,
+        now: i64,
+    ) -> Result<WorkerTurn, JobRuntimeError> {
         let started = Instant::now();
         let mut current_lease = context.lease.clone();
         let mut heartbeat = interval_at(
@@ -230,7 +392,10 @@ impl<'database> JobRuntime<'database> {
                         )
                         .await
                     {
-                        Ok(renewed_lease) => current_lease = renewed_lease,
+                        Ok(renewed_lease) => {
+                            current_lease = renewed_lease.clone();
+                            context.checkpoint_writer.update_lease(renewed_lease).await;
+                        }
                         Err(error) => {
                             // Task 1 has no cancellation/checkpoint protocol. Let the
                             // handler reach its own boundary, but never let its stale
@@ -243,6 +408,17 @@ impl<'database> JobRuntime<'database> {
             }
         };
         let completed_at = current_queue_time(now, started)?;
+        if context.cancellation.is_cancelled() {
+            let checkpoint_persisted = context.checkpoint_writer.persisted();
+            self.repository
+                .cancel(&context.job_id, &current_lease, completed_at)
+                .await
+                .map_err(JobRuntimeError::Repository)?;
+            return Ok(WorkerTurn::Cancelled {
+                job_id: context.job_id,
+                checkpoint_persisted,
+            });
+        }
         match result {
             Ok(Ok(())) => {
                 self.repository

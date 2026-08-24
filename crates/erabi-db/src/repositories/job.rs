@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 use crate::{DbError, ErabiDatabase};
 
+use super::checkpoint::{
+    CheckpointEnvelope, CheckpointRecord, CheckpointRepository, CheckpointRepositoryError,
+};
+
 /// Stable durable identity for a queued unit of work.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct JobId(String);
@@ -79,6 +83,7 @@ pub enum JobFailureCode {
     HandlerFailed,
     HandlerPanicked,
     LeaseExpired,
+    Cancelled,
 }
 
 impl JobFailureCode {
@@ -87,6 +92,7 @@ impl JobFailureCode {
             Self::HandlerFailed => "HANDLER_FAILED",
             Self::HandlerPanicked => "HANDLER_PANICKED",
             Self::LeaseExpired => "LEASE_EXPIRED",
+            Self::Cancelled => "CANCELLED",
         }
     }
 
@@ -95,6 +101,7 @@ impl JobFailureCode {
             "HANDLER_FAILED" => Ok(Self::HandlerFailed),
             "HANDLER_PANICKED" => Ok(Self::HandlerPanicked),
             "LEASE_EXPIRED" => Ok(Self::LeaseExpired),
+            "CANCELLED" => Ok(Self::Cancelled),
             _ => Err(JobRepositoryError::QueueInvariant),
         }
     }
@@ -256,6 +263,9 @@ pub struct AcquiredJob {
 pub struct StaleJobRecovery {
     pub requeued: u32,
     pub failed: u32,
+    pub recoverable: u32,
+    pub restart_required: u32,
+    pub unsafe_checkpoints: u32,
 }
 
 /// A rebuilt in-memory scheduling view derived only from durable queue rows.
@@ -281,6 +291,8 @@ pub enum JobRepositoryError {
     LeaseLost,
     #[error("a critical durable queue invariant is inconsistent")]
     QueueInvariant,
+    #[error("durable checkpoint operation failed")]
+    Checkpoint(#[source] CheckpointRepositoryError),
 }
 
 impl JobRepositoryError {
@@ -512,6 +524,171 @@ impl<'database> JobRepository<'database> {
         }
     }
 
+    /// Cancels an active attempt only for its current durable owner. Any
+    /// checkpoint written by the handler must already be committed before this
+    /// method is called.
+    ///
+    /// # Errors
+    /// Returns an ownership or durable transition error. A stale owner can
+    /// never commit the terminal cancellation state.
+    pub async fn cancel(
+        &self,
+        job_id: &JobId,
+        lease: &JobLease,
+        now: i64,
+    ) -> Result<(), JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+            finish_attempt_in_transaction(
+                &transaction,
+                job_id,
+                lease,
+                now,
+                AttemptOutcome::Failed,
+                Some(JobFailureCode::Cancelled),
+            )
+            .await?;
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET state = 'CANCELLED', lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = 'CANCELLED', updated_at = ?1 WHERE id = ?2 AND state = 'RUNNING' AND lease_id = ?3 AND lease_owner = ?4 AND lease_generation = ?5",
+                    (
+                        now,
+                        job_id.as_str(),
+                        lease.id.as_str(),
+                        lease.owner.as_str(),
+                        i64::try_from(lease.generation)
+                            .map_err(|_| JobRepositoryError::QueueInvariant)?,
+                    ),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            if changed != 1 {
+                return Err(JobRepositoryError::LeaseLost);
+            }
+            cancel_related_run(&transaction, job.crawl_run_id.as_deref()).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Cancels queued work atomically, or reports the current non-queued state
+    /// so an active worker can be signalled cooperatively by its runtime.
+    ///
+    /// # Errors
+    /// Returns an error when the job cannot be read or the durable update fails.
+    pub async fn cancel_queued(
+        &self,
+        job_id: &JobId,
+        now: i64,
+    ) -> Result<JobState, JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            let job = select_job(&transaction, job_id).await?;
+            if job.state != JobState::Queued {
+                return Ok(job.state);
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET state = 'CANCELLED', failure_code = 'CANCELLED', updated_at = ?1 WHERE id = ?2 AND state = 'QUEUED'",
+                    (now, job_id.as_str()),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            if changed != 1 {
+                return Err(JobRepositoryError::IllegalTransition);
+            }
+            cancel_related_run(&transaction, job.crawl_run_id.as_deref()).await?;
+            Ok(JobState::Cancelled)
+        }
+        .await;
+        match result {
+            Ok(state) => transaction
+                .commit()
+                .await
+                .map(|()| state)
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Appends a bounded checkpoint while the supplied lease still owns its
+    /// running attempt.
+    ///
+    /// # Errors
+    /// Returns a typed checkpoint or lease-ownership failure.
+    pub async fn append_checkpoint(
+        &self,
+        job_id: &JobId,
+        attempt_id: &str,
+        lease: &JobLease,
+        checkpoint: &CheckpointEnvelope,
+        created_at: i64,
+    ) -> Result<CheckpointRecord, JobRepositoryError> {
+        CheckpointRepository::new(self.database)
+            .append(job_id, attempt_id, lease, checkpoint, created_at)
+            .await
+            .map_err(JobRepositoryError::Checkpoint)
+    }
+
+    /// Returns append-only checkpoint evidence in durable commit order.
+    ///
+    /// # Errors
+    /// Returns malformed/inconsistent evidence as a typed error.
+    pub async fn checkpoints(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Vec<CheckpointRecord>, JobRepositoryError> {
+        CheckpointRepository::new(self.database)
+            .records(job_id)
+            .await
+            .map_err(JobRepositoryError::Checkpoint)
+    }
+
+    /// Returns the latest checkpoint without treating missing evidence as
+    /// resumable.
+    ///
+    /// # Errors
+    /// Returns malformed/inconsistent evidence as a typed error.
+    pub async fn latest_checkpoint(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Option<CheckpointRecord>, JobRepositoryError> {
+        CheckpointRepository::new(self.database)
+            .latest(job_id)
+            .await
+            .map_err(JobRepositoryError::Checkpoint)
+    }
+
     /// Inspects every expired running lease and only requeues work when bounded
     /// total attempts allow another execution. It never repairs corruption.
     ///
@@ -522,6 +699,10 @@ impl<'database> JobRepository<'database> {
         &self,
         now: i64,
     ) -> Result<StaleJobRecovery, JobRepositoryError> {
+        let checkpoint_assessments = CheckpointRepository::new(self.database)
+            .assess_stale_jobs(now)
+            .await
+            .map_err(JobRepositoryError::Checkpoint)?;
         let mut connection = self
             .database
             .connection()
@@ -537,11 +718,27 @@ impl<'database> JobRepository<'database> {
         }
         .await;
         match result {
-            Ok(recovery) => transaction
-                .commit()
-                .await
-                .map(|()| recovery)
-                .map_err(JobRepositoryError::database),
+            Ok(mut recovery) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(JobRepositoryError::database)?;
+                for assessment in checkpoint_assessments {
+                    match assessment.disposition {
+                        super::checkpoint::CheckpointRecoveryDisposition::Recoverable => {
+                            recovery.recoverable = recovery.recoverable.saturating_add(1);
+                        }
+                        super::checkpoint::CheckpointRecoveryDisposition::RestartRequired => {
+                            recovery.restart_required = recovery.restart_required.saturating_add(1);
+                        }
+                        super::checkpoint::CheckpointRecoveryDisposition::Unsafe => {
+                            recovery.unsafe_checkpoints =
+                                recovery.unsafe_checkpoints.saturating_add(1);
+                        }
+                    }
+                }
+                Ok(recovery)
+            }
             Err(error) => {
                 let _ = transaction.rollback().await;
                 Err(error)
@@ -891,6 +1088,23 @@ async fn recover_expired_in_transaction(
         }
     }
     Ok(recovery)
+}
+
+async fn cancel_related_run(
+    connection: &Connection,
+    crawl_run_id: Option<&str>,
+) -> Result<(), JobRepositoryError> {
+    let Some(crawl_run_id) = crawl_run_id else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "UPDATE crawl_runs SET status = 'CANCELLED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING')",
+            [crawl_run_id],
+        )
+        .await
+        .map_err(JobRepositoryError::database)?;
+    Ok(())
 }
 
 async fn select_job(

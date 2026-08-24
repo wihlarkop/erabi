@@ -15,7 +15,7 @@ use erabi_db::{
     ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
     repositories::ConcurrencyState,
 };
-use erabi_jobs::{ProgressLiveHub, recover_and_rebuild_at};
+use erabi_jobs::{CancellationController, ProgressLiveHub, recover_and_rebuild_at};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -77,6 +77,7 @@ pub struct RunningRuntime {
     _database: ErabiDatabase,
     _concurrency_state: ConcurrencyState,
     _progress_live_hub: ProgressLiveHub,
+    cancellation: CancellationController,
 }
 
 impl RunningRuntime {
@@ -173,6 +174,7 @@ impl RunningRuntime {
         };
 
         let progress_live_hub = ProgressLiveHub::new();
+        let cancellation = CancellationController::default();
         let app_state = AppState::with_readiness(false)
             .with_progress_runtime(database.clone(), progress_live_hub.clone());
         match &startup_outcome {
@@ -219,6 +221,7 @@ impl RunningRuntime {
             _database: database,
             _concurrency_state: concurrency_state,
             _progress_live_hub: progress_live_hub,
+            cancellation,
         })
     }
 
@@ -238,6 +241,13 @@ impl RunningRuntime {
     #[must_use]
     pub fn runtime_mode(&self) -> RuntimeMode {
         self.app_state.runtime_mode()
+    }
+
+    /// Returns the process-owned cooperative cancellation controller used by
+    /// workers that join this runtime.
+    #[must_use]
+    pub fn cancellation_controller(&self) -> CancellationController {
+        self.cancellation.clone()
     }
 
     /// Waits for an operating-system termination signal, then shuts down safely.
@@ -279,6 +289,7 @@ impl RunningRuntime {
 
         let hooks = RuntimeShutdownHooks {
             app_state: self.app_state.clone(),
+            cancellation: self.cancellation.clone(),
         };
         let report = self.shutdown.shutdown_by(deadline, &hooks).await;
         match timeout_at(deadline, &mut self.server_task).await {
@@ -390,9 +401,8 @@ fn prepare_artifact_directories(data_dir: &Path) -> Result<(), RuntimeError> {
 async fn run_plan_four_startup_hooks(
     database: &ErabiDatabase,
 ) -> Result<ConcurrencyState, RecoveryState> {
-    recover_and_rebuild_at(database, startup_epoch_seconds())
+    let (recovery, concurrency_state) = recover_and_rebuild_at(database, startup_epoch_seconds())
         .await
-        .map(|(_, concurrency_state)| concurrency_state)
         .map_err(|error| match error {
             JobRepositoryError::QueueInvariant => RecoveryState {
                 code: "QUEUE_INVARIANT_VIOLATION".to_owned(),
@@ -404,7 +414,15 @@ async fn run_plan_four_startup_hooks(
                 message: "Durable job recovery could not complete safely. Recovery Mode is active."
                     .to_owned(),
             },
-        })
+        })?;
+    if recovery.unsafe_checkpoints > 0 {
+        return Err(RecoveryState {
+            code: "CHECKPOINT_INVARIANT_VIOLATION".to_owned(),
+            message: "Durable checkpoint evidence is inconsistent. Recovery Mode is active."
+                .to_owned(),
+        });
+    }
+    Ok(concurrency_state)
 }
 
 async fn probe_crawl4ai(config: &BootstrapConfig) -> Crawl4AiStartupHealth {
@@ -490,6 +508,7 @@ fn startup_epoch_seconds() -> i64 {
 
 struct RuntimeShutdownHooks {
     app_state: AppState,
+    cancellation: CancellationController,
 }
 
 impl ShutdownHooks for RuntimeShutdownHooks {
@@ -506,7 +525,9 @@ impl ShutdownHooks for RuntimeShutdownHooks {
     }
 
     fn signal_cooperative_cancellation(&self) -> ShutdownFuture<'_> {
-        Box::pin(async {})
+        Box::pin(async move {
+            self.cancellation.cancel_all();
+        })
     }
 
     fn settle_or_rollback_transactions(&self) -> ShutdownFuture<'_> {
@@ -515,5 +536,30 @@ impl ShutdownHooks for RuntimeShutdownHooks {
 
     fn flush_critical_state(&self) -> ShutdownFuture<'_> {
         Box::pin(async {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use erabi_db::repositories::JobId;
+    use erabi_jobs::CancellationToken;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_shutdown_signals_workers_without_extending_fixed_deadline() {
+        let cancellation = CancellationController::default();
+        let token: CancellationToken = cancellation.register(&JobId::new());
+        let coordinator = ShutdownCoordinator::new();
+        let hooks = RuntimeShutdownHooks {
+            app_state: AppState::ready(),
+            cancellation,
+        };
+
+        let report = coordinator.shutdown(&hooks).await;
+
+        assert!(token.is_cancelled());
+        assert_eq!(report.deadline, crate::GRACEFUL_SHUTDOWN_DEADLINE);
+        assert!(report.completed_cleanly());
     }
 }
