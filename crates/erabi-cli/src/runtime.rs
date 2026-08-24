@@ -10,7 +10,6 @@ use std::{
 
 use axum::Router;
 use erabi_api::{AppState, RuntimeMode, SecurityConfig, SecurityConfigError, build_router};
-use erabi_db::repositories::JobRepositoryError;
 use erabi_db::{
     ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
     repositories::ConcurrencyState,
@@ -132,20 +131,13 @@ impl RunningRuntime {
         let database = open_database(&data_dir).await?;
         let mut recovery = None;
         if options.migration_runner.apply(&database).await.is_err() {
-            recovery = Some(RecoveryState {
-                code: "MIGRATION_FAILURE".to_owned(),
-                message: "Database migration could not complete safely. Recovery Mode is active."
-                    .to_owned(),
-            });
+            recovery = Some(RecoveryState::migration_failure());
         } else if let Err(error) =
             LightweightIntegrityChecker::new(&database, &options.migration_runner, &data_dir)
                 .check()
                 .await
         {
-            recovery = Some(RecoveryState {
-                code: error.code().to_owned(),
-                message: error.safe_message().to_owned(),
-            });
+            recovery = Some(error.into());
         }
 
         let concurrency_state = if recovery.is_none() {
@@ -403,24 +395,9 @@ async fn run_plan_four_startup_hooks(
 ) -> Result<ConcurrencyState, RecoveryState> {
     let (recovery, concurrency_state) = recover_and_rebuild_at(database, startup_epoch_seconds())
         .await
-        .map_err(|error| match error {
-            JobRepositoryError::QueueInvariant => RecoveryState {
-                code: "QUEUE_INVARIANT_VIOLATION".to_owned(),
-                message: "Durable job ownership or attempt history is inconsistent. Recovery Mode is active."
-                    .to_owned(),
-            },
-            _ => RecoveryState {
-                code: "JOB_RECOVERY_UNAVAILABLE".to_owned(),
-                message: "Durable job recovery could not complete safely. Recovery Mode is active."
-                    .to_owned(),
-            },
-        })?;
+        .map_err(RecoveryState::from)?;
     if recovery.unsafe_checkpoints > 0 {
-        return Err(RecoveryState {
-            code: "CHECKPOINT_INVARIANT_VIOLATION".to_owned(),
-            message: "Durable checkpoint evidence is inconsistent. Recovery Mode is active."
-                .to_owned(),
-        });
+        return Err(RecoveryState::checkpoint_invariant_violation());
     }
     Ok(concurrency_state)
 }
