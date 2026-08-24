@@ -146,9 +146,9 @@ impl JobKind {
 pub enum JobStorageClass {
     /// Work that does not materially grow the controlled artifact store.
     StorageLight,
-    /// A root run job associated with a Crawl Run and expected to create
-    /// artifact payloads. Child action jobs remain storage-light so recovery
-    /// and control operations stay available under pressure.
+    /// Work associated with a Crawl Run and therefore conservatively capable
+    /// of growing the controlled artifact store. Durable parentage records
+    /// lineage only; it is not a storage-growth capability.
     ArtifactHeavy,
 }
 
@@ -212,11 +212,12 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
-    /// Classifies only the existing durable run/lineage capabilities. This is
-    /// deliberately independent of future Plan 06 job-kind names.
+    /// Classifies only the existing durable run association. This is
+    /// deliberately independent of future Plan 06 job-kind names and never
+    /// treats parent lineage as proof that execution is storage-light.
     #[must_use]
     pub const fn storage_class(&self) -> JobStorageClass {
-        if self.parent_job_id.is_none() && self.crawl_run_id.is_some() {
+        if self.crawl_run_id.is_some() {
             JobStorageClass::ArtifactHeavy
         } else {
             JobStorageClass::StorageLight
@@ -414,7 +415,7 @@ impl<'database> JobRepository<'database> {
     }
 
     /// Acquires one eligible job while optionally excluding artifact-heavy
-    /// roots. Admission is part of the same transaction as lease creation, so
+    /// execution. Admission is part of the same transaction as lease creation, so
     /// a blocked queued job gains neither a lease nor an attempt.
     ///
     /// # Errors
@@ -923,10 +924,10 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::Checkpoint)
     }
 
-    /// Commits a pressure-interrupted attempt and requeues it without
-    /// mutating run snapshots or cancelling the associated run. The attempt
-    /// is real history, while the pressure reason remains distinct from user
-    /// cancellation and handler failure.
+    /// Commits a pressure-interrupted attempt without mutating run snapshots
+    /// or cancelling the associated run. Requeueing requires a checkpoint
+    /// durably attached to the current attempt; without it the job is failed
+    /// with typed pressure evidence rather than advertised as resumable.
     ///
     /// # Errors
     /// Returns an ownership or durable transition error.
@@ -947,7 +948,9 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::database)?;
         let result = async {
             let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
-            let next_state = if job.current_attempt < job.max_attempts {
+            let has_current_attempt_checkpoint =
+                has_checkpoint_for_current_attempt(&transaction, job_id, lease).await?;
+            let next_state = if has_current_attempt_checkpoint && job.current_attempt < job.max_attempts {
                 JobState::Queued
             } else {
                 JobState::Failed
@@ -1349,7 +1352,7 @@ async fn select_eligible_job(
 ) -> Result<Option<JobId>, JobRepositoryError> {
     let mut rows = connection
         .query(
-            "SELECT id FROM jobs WHERE state = 'QUEUED' AND scheduled_at <= ?1 AND (?2 = 1 OR parent_job_id IS NOT NULL OR crawl_run_id IS NULL) ORDER BY priority DESC, scheduled_at, created_at, id LIMIT 1",
+            "SELECT id FROM jobs WHERE state = 'QUEUED' AND scheduled_at <= ?1 AND (?2 = 1 OR crawl_run_id IS NULL) ORDER BY priority DESC, scheduled_at, created_at, id LIMIT 1",
             (now, i64::from(allow_artifact_heavy)),
         )
         .await
@@ -1359,6 +1362,32 @@ async fn select_eligible_job(
         .map_err(JobRepositoryError::database)?
         .map(|row| row.get(0).map(JobId).map_err(JobRepositoryError::database))
         .transpose()
+}
+
+async fn has_checkpoint_for_current_attempt(
+    connection: &Connection,
+    job_id: &JobId,
+    lease: &JobLease,
+) -> Result<bool, JobRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM job_checkpoints AS checkpoints INNER JOIN job_attempts AS attempts ON attempts.id = checkpoints.attempt_id WHERE checkpoints.job_id = ?1 AND attempts.job_id = ?1 AND attempts.lease_id = ?2 AND attempts.lease_generation = ?3 AND attempts.outcome = 'RUNNING')",
+            (
+                job_id.as_str(),
+                lease.id.as_str(),
+                i64::try_from(lease.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
+            ),
+        )
+        .await
+        .map_err(JobRepositoryError::database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(JobRepositoryError::database)?
+        .ok_or(JobRepositoryError::QueueInvariant)?;
+    row.get::<i64>(0)
+        .map(|exists| exists != 0)
+        .map_err(JobRepositoryError::database)
 }
 
 async fn lease_queued_job(

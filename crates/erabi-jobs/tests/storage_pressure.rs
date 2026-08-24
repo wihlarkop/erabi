@@ -5,14 +5,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use erabi_db::repositories::{
     CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, CrawlRunRepository, JobFailureCode,
-    JobKind, JobRepository, JobState, NewJob,
+    JobKind, JobRepository, JobRepositoryError, JobState, NewJob,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
@@ -21,9 +21,9 @@ use erabi_domain::{
 };
 use erabi_jobs::{
     CancellationController, JobActionService, JobExecutionContext, JobExecutionError, JobHandler,
-    JobRuntime, JobStorageClass, StoragePressureController, StoragePressureLevel,
-    StoragePressureMonitor, StoragePressurePolicy, StoragePressurePolicyError, StorageProbe,
-    StorageProbeError, WorkerPolicy, WorkerTurn,
+    JobRuntime, JobStorageClass, RerunFullCrawlInput, StoragePressureController,
+    StoragePressureLevel, StoragePressureMonitor, StoragePressurePolicy,
+    StoragePressurePolicyError, StorageProbe, StorageProbeError, WorkerPolicy, WorkerTurn,
 };
 use tokio::sync::Barrier;
 
@@ -124,6 +124,36 @@ struct FakeProbe {
     result: Result<u64, StorageProbeError>,
 }
 
+#[derive(Clone)]
+struct MutableProbe {
+    result: Arc<Mutex<Result<u64, StorageProbeError>>>,
+    observations: Arc<AtomicUsize>,
+}
+
+impl MutableProbe {
+    fn new(result: Result<u64, StorageProbeError>) -> Self {
+        Self {
+            result: Arc::new(Mutex::new(result)),
+            observations: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set(&self, result: Result<u64, StorageProbeError>) {
+        if let Ok(mut current) = self.result.lock() {
+            *current = result;
+        }
+    }
+}
+
+impl StorageProbe for MutableProbe {
+    fn free_bytes(&self, _path: &Path) -> Result<u64, StorageProbeError> {
+        self.observations.fetch_add(1, Ordering::AcqRel);
+        self.result
+            .lock()
+            .map_or(Err(StorageProbeError::Unavailable), |result| *result)
+    }
+}
+
 impl StorageProbe for FakeProbe {
     fn free_bytes(&self, _path: &Path) -> Result<u64, StorageProbeError> {
         self.result
@@ -183,6 +213,36 @@ struct WaitForCancellation {
     pressure_seen: Arc<AtomicBool>,
 }
 
+struct PressureWithoutCheckpoint {
+    barrier: Arc<Barrier>,
+}
+
+impl JobHandler for PressureWithoutCheckpoint {
+    async fn execute(&self, context: JobExecutionContext) -> Result<(), JobExecutionError> {
+        self.barrier.wait().await;
+        context.storage_pressure().signalled().await;
+        Ok(())
+    }
+}
+
+struct FailedPressureCheckpoint {
+    barrier: Arc<Barrier>,
+    checkpoint: CheckpointEnvelope,
+    write_failed: Arc<AtomicBool>,
+}
+
+impl JobHandler for FailedPressureCheckpoint {
+    async fn execute(&self, context: JobExecutionContext) -> Result<(), JobExecutionError> {
+        self.barrier.wait().await;
+        context.storage_pressure().signalled().await;
+        self.write_failed.store(
+            context.checkpoint(&self.checkpoint).await.is_err(),
+            Ordering::Release,
+        );
+        Ok(())
+    }
+}
+
 impl JobHandler for WaitForCancellation {
     async fn execute(&self, context: JobExecutionContext) -> Result<(), JobExecutionError> {
         self.barrier.wait().await;
@@ -201,16 +261,47 @@ fn runtime(
     monitor: StoragePressureMonitor,
     cancellation: CancellationController,
 ) -> Result<JobRuntime<'_>, Box<dyn std::error::Error>> {
-    Ok(JobRuntime::with_storage_pressure_monitor(
+    runtime_with_policy(
         database,
-        "storage-pressure-worker",
+        monitor,
+        cancellation,
         WorkerPolicy {
             lease_duration_seconds: 30,
             retry_delay_seconds: 0,
         },
+    )
+}
+
+fn runtime_with_policy(
+    database: &ErabiDatabase,
+    monitor: StoragePressureMonitor,
+    cancellation: CancellationController,
+    worker_policy: WorkerPolicy,
+) -> Result<JobRuntime<'_>, Box<dyn std::error::Error>> {
+    Ok(JobRuntime::with_storage_pressure_monitor(
+        database,
+        "storage-pressure-worker",
+        worker_policy,
         cancellation,
         monitor,
     )?)
+}
+
+async fn execute_after_probe_becomes_critical<H: JobHandler>(
+    runtime: &JobRuntime<'_>,
+    handler: &H,
+    probe: &MutableProbe,
+    barrier: Arc<Barrier>,
+    now: i64,
+) -> Result<WorkerTurn, Box<dyn std::error::Error>> {
+    let execution = runtime.execute_next_at(handler, now);
+    let transition = async {
+        barrier.wait().await;
+        probe.set(Ok(50));
+        tokio::time::advance(Duration::from_secs(1)).await;
+    };
+    let (turn, ()) = tokio::join!(execution, transition);
+    Ok(turn?)
 }
 
 #[test]
@@ -375,6 +466,58 @@ async fn critical_pressure_signals_active_heavy_work_and_requeues_after_durable_
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn active_heavy_work_observes_a_real_probe_transition_on_its_heartbeat()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let heavy = heavy_job(&database, 0, 2).await?;
+    let probe = MutableProbe::new(Ok(101));
+    let monitor =
+        StoragePressureMonitor::new(probe.clone(), PathBuf::from("C:\\erabi-data"), policy()?);
+    let runtime = runtime_with_policy(
+        &database,
+        monitor,
+        CancellationController::default(),
+        WorkerPolicy {
+            lease_duration_seconds: 2,
+            retry_delay_seconds: 0,
+        },
+    )?;
+    let barrier = Arc::new(Barrier::new(2));
+    let run_id = heavy
+        .crawl_run_id
+        .as_deref()
+        .ok_or("heavy job is missing its run id")?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot_by_stored_id(run_id)
+        .await?;
+    let turn = execute_after_probe_becomes_critical(
+        &runtime,
+        &PressureCheckpoint {
+            barrier: Arc::clone(&barrier),
+            checkpoint: checkpoint(run_id, &snapshot)?,
+        },
+        &probe,
+        barrier,
+        0,
+    )
+    .await?;
+
+    assert!(matches!(
+        turn,
+        WorkerTurn::StoragePressure {
+            state: JobState::Queued,
+            checkpoint_persisted: true,
+            ..
+        }
+    ));
+    assert!(probe.observations.load(Ordering::Acquire) >= 2);
+    let repository = JobRepository::new(&database);
+    assert_eq!(repository.job(&heavy.id).await?.state, JobState::Queued);
+    assert_eq!(repository.checkpoints(&heavy.id).await?.len(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn pressure_failed_work_remains_usable_by_task_four_resume_action()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -461,6 +604,242 @@ async fn storage_light_active_work_is_not_signalled_and_user_cancellation_remain
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn pressure_without_a_current_attempt_checkpoint_fails_instead_of_requeueing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let heavy = heavy_job(&database, 0, 2).await?;
+    let probe = MutableProbe::new(Ok(101));
+    let monitor =
+        StoragePressureMonitor::new(probe.clone(), PathBuf::from("C:\\erabi-data"), policy()?);
+    let runtime = runtime_with_policy(
+        &database,
+        monitor,
+        CancellationController::default(),
+        WorkerPolicy {
+            lease_duration_seconds: 2,
+            retry_delay_seconds: 0,
+        },
+    )?;
+    let barrier = Arc::new(Barrier::new(2));
+    let turn = execute_after_probe_becomes_critical(
+        &runtime,
+        &PressureWithoutCheckpoint {
+            barrier: Arc::clone(&barrier),
+        },
+        &probe,
+        barrier,
+        0,
+    )
+    .await?;
+
+    assert!(matches!(
+        turn,
+        WorkerTurn::StoragePressure {
+            state: JobState::Failed,
+            checkpoint_persisted: false,
+            ..
+        }
+    ));
+    let repository = JobRepository::new(&database);
+    assert_eq!(repository.job(&heavy.id).await?.state, JobState::Failed);
+    assert_eq!(repository.attempts(&heavy.id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_checkpoint_write_does_not_make_pressure_interruption_resumable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let heavy = heavy_job(&database, 0, 2).await?;
+    let run_id = heavy
+        .crawl_run_id
+        .as_deref()
+        .ok_or("heavy job is missing its run id")?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot_by_stored_id(run_id)
+        .await?;
+    let mut invalid = checkpoint(run_id, &snapshot)?;
+    invalid
+        .completed_units
+        .push(invalid.completed_units[0].clone());
+    let probe = MutableProbe::new(Ok(101));
+    let monitor =
+        StoragePressureMonitor::new(probe.clone(), PathBuf::from("C:\\erabi-data"), policy()?);
+    let runtime = runtime_with_policy(
+        &database,
+        monitor,
+        CancellationController::default(),
+        WorkerPolicy {
+            lease_duration_seconds: 2,
+            retry_delay_seconds: 0,
+        },
+    )?;
+    let barrier = Arc::new(Barrier::new(2));
+    let write_failed = Arc::new(AtomicBool::new(false));
+    let turn = execute_after_probe_becomes_critical(
+        &runtime,
+        &FailedPressureCheckpoint {
+            barrier: Arc::clone(&barrier),
+            checkpoint: invalid,
+            write_failed: Arc::clone(&write_failed),
+        },
+        &probe,
+        barrier,
+        0,
+    )
+    .await?;
+
+    assert!(write_failed.load(Ordering::Acquire));
+    assert!(matches!(
+        turn,
+        WorkerTurn::StoragePressure {
+            state: JobState::Failed,
+            checkpoint_persisted: false,
+            ..
+        }
+    ));
+    let repository = JobRepository::new(&database);
+    assert_eq!(repository.job(&heavy.id).await?.state, JobState::Failed);
+    assert!(repository.checkpoints(&heavy.id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_lease_cannot_commit_a_pressure_transition_even_with_a_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let heavy = heavy_job(&database, 0, 2).await?;
+    let repository = JobRepository::new(&database);
+    let acquired = repository
+        .acquire_next("checkpoint-owner", 0, 30)
+        .await?
+        .ok_or("heavy job was not acquired")?;
+    let lease = acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("acquired job has no lease")?;
+    let run_id = heavy
+        .crawl_run_id
+        .as_deref()
+        .ok_or("heavy job is missing its run id")?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot_by_stored_id(run_id)
+        .await?;
+    repository
+        .append_checkpoint(
+            &heavy.id,
+            &acquired.attempt.id,
+            &lease,
+            &checkpoint(run_id, &snapshot)?,
+            1,
+        )
+        .await?;
+    let mut stale = lease.clone();
+    stale.owner = "stale-owner".to_owned();
+
+    assert!(matches!(
+        repository
+            .requeue_after_storage_pressure(&heavy.id, &stale, 1)
+            .await,
+        Err(JobRepositoryError::LeaseLost)
+    ));
+    assert_eq!(repository.job(&heavy.id).await?.state, JobState::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn critical_pressure_blocks_run_backed_task_four_children_but_not_control_actions_or_light_work()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let source = heavy_job(&database, 100, 1).await?;
+    let repository = JobRepository::new(&database);
+    let acquired = repository
+        .acquire_next("source-worker", 0, 30)
+        .await?
+        .ok_or("source job was not acquired")?;
+    let lease = acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("acquired job has no lease")?;
+    let run_id = source
+        .crawl_run_id
+        .as_deref()
+        .ok_or("source job is missing its run id")?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot_by_stored_id(run_id)
+        .await?;
+    repository
+        .append_checkpoint(
+            &source.id,
+            &acquired.attempt.id,
+            &lease,
+            &checkpoint(run_id, &snapshot)?,
+            1,
+        )
+        .await?;
+    assert_eq!(
+        repository
+            .fail(&source.id, &lease, 1, JobFailureCode::HandlerFailed, 1)
+            .await?,
+        JobState::Failed
+    );
+
+    let actions = JobActionService::new(database.clone(), CancellationController::default());
+    let resumed = actions.resume(&source.id, 2).await?;
+    let rerun = actions
+        .rerun_full_crawl(&source.id, 2, RerunFullCrawlInput::default())
+        .await?;
+    assert_eq!(resumed.state, JobState::Queued);
+    assert_eq!(rerun.state, JobState::Queued);
+    assert_eq!(resumed.parent_job_id, Some(source.id.clone()));
+    assert_eq!(rerun.parent_job_id, Some(source.id.clone()));
+
+    let first_light = light_job(&database, 10, 2).await?;
+    let second_light = light_job(&database, 10, 2).await?;
+    let monitor = StoragePressureMonitor::new(
+        FakeProbe { result: Ok(50) },
+        PathBuf::from("C:\\erabi-data"),
+        policy()?,
+    );
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let runtime = runtime(&database, monitor, CancellationController::default())?;
+    let handler = RecordingSuccess {
+        ids: Arc::clone(&ids),
+    };
+
+    assert!(matches!(
+        runtime.execute_next_at(&handler, 2).await?,
+        WorkerTurn::Succeeded { job_id } if job_id == first_light.id
+    ));
+    assert!(matches!(
+        runtime.execute_next_at(&handler, 2).await?,
+        WorkerTurn::Succeeded { job_id } if job_id == second_light.id
+    ));
+    assert!(matches!(
+        runtime.execute_next_at(&handler, 2).await?,
+        WorkerTurn::Idle
+    ));
+    for child in [&resumed, &rerun] {
+        let queued = repository.job(&child.job_id).await?;
+        assert_eq!(queued.state, JobState::Queued);
+        assert_eq!(queued.storage_class(), JobStorageClass::ArtifactHeavy);
+        assert_eq!(queued.current_attempt, 0);
+        assert!(queued.lease.is_none());
+        assert!(repository.attempts(&child.job_id).await?.is_empty());
+    }
+    assert_eq!(
+        ids.lock().ok().map(|ids| ids.clone()),
+        Some(vec![
+            first_light.id.to_string(),
+            second_light.id.to_string()
+        ])
+    );
+    Ok(())
+}
+
 #[test]
 fn warning_and_critical_pressure_never_delete_user_artifacts()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -491,7 +870,7 @@ fn warning_and_critical_pressure_never_delete_user_artifacts()
 }
 
 #[test]
-fn storage_class_keeps_run_roots_heavy_and_control_plane_jobs_light()
+fn storage_class_keeps_all_run_backed_execution_heavy_and_control_plane_jobs_light()
 -> Result<(), Box<dyn std::error::Error>> {
     let policy = policy()?;
     let heavy_record = erabi_db::repositories::JobRecord {
@@ -516,7 +895,7 @@ fn storage_class_keeps_run_roots_heavy_and_control_plane_jobs_light()
         ..heavy_record.clone()
     };
     assert_eq!(heavy_record.storage_class(), JobStorageClass::ArtifactHeavy);
-    assert_eq!(light_record.storage_class(), JobStorageClass::StorageLight);
+    assert_eq!(light_record.storage_class(), JobStorageClass::ArtifactHeavy);
     assert!(!policy.classify(50).allows_artifact_heavy());
     Ok(())
 }

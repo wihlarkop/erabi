@@ -5,7 +5,6 @@ use std::{
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use axum::Router;
@@ -22,8 +21,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
     task::JoinHandle,
-    time::{timeout, timeout_at},
+    time::{Duration, Instant, MissedTickBehavior, interval_at, timeout, timeout_at},
 };
+
+const STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 use crate::{
     BindMode, BootstrapConfig, BootstrapConfigError, Crawl4AiStartupHealth, ProcessLock,
@@ -80,6 +81,7 @@ pub struct RunningRuntime {
     _concurrency_state: ConcurrencyState,
     _progress_live_hub: ProgressLiveHub,
     storage_pressure: StoragePressureMonitor,
+    storage_pressure_task: JoinHandle<()>,
     cancellation: CancellationController,
 }
 
@@ -210,6 +212,8 @@ impl RunningRuntime {
             app_state.set_ready(true);
         }
         let (stop_server, stop_receiver) = watch::channel(false);
+        let storage_pressure_task =
+            spawn_storage_pressure_refresh(storage_pressure.clone(), stop_receiver.clone());
         let server_task = spawn_server(listener, router, stop_receiver);
 
         Ok(Self {
@@ -223,6 +227,7 @@ impl RunningRuntime {
             _concurrency_state: concurrency_state,
             _progress_live_hub: progress_live_hub,
             storage_pressure,
+            storage_pressure_task,
             cancellation,
         })
     }
@@ -306,6 +311,12 @@ impl RunningRuntime {
             cancellation: self.cancellation.clone(),
         };
         let report = self.shutdown.shutdown_by(deadline, &hooks).await;
+        if timeout_at(deadline, &mut self.storage_pressure_task)
+            .await
+            .is_err()
+        {
+            self.storage_pressure_task.abort();
+        }
         match timeout_at(deadline, &mut self.server_task).await {
             Ok(Ok(Ok(()))) => Ok(report),
             Ok(Ok(Err(_)) | Err(_)) => Err(RuntimeError::Server),
@@ -424,6 +435,31 @@ async fn run_plan_four_startup_hooks(
     Ok(concurrency_state)
 }
 
+fn spawn_storage_pressure_refresh(
+    storage_pressure: StoragePressureMonitor,
+    mut stop_receiver: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut refresh = interval_at(
+            Instant::now() + STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL,
+            STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL,
+        );
+        refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = refresh.tick() => {
+                    let _ = storage_pressure.refresh();
+                }
+                changed = stop_receiver.changed() => {
+                    if changed.is_err() || *stop_receiver.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
 async fn probe_crawl4ai(config: &BootstrapConfig) -> Crawl4AiStartupHealth {
     let Some(url) = config.crawl4ai().base_url() else {
         return Crawl4AiStartupHealth::Degraded {
@@ -540,8 +576,10 @@ impl ShutdownHooks for RuntimeShutdownHooks {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use erabi_db::repositories::JobId;
-    use erabi_jobs::CancellationToken;
+    use erabi_jobs::{CancellationToken, StoragePressureLevel, StorageProbe, StorageProbeError};
 
     use super::*;
 
@@ -560,5 +598,45 @@ mod tests {
         assert!(token.is_cancelled());
         assert_eq!(report.deadline, crate::GRACEFUL_SHUTDOWN_DEADLINE);
         assert!(report.completed_cleanly());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_runtime_refreshes_storage_diagnostics_without_an_external_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(Clone)]
+        struct MutableProbe(Arc<Mutex<u64>>);
+
+        impl StorageProbe for MutableProbe {
+            fn free_bytes(&self, _path: &Path) -> Result<u64, StorageProbeError> {
+                self.0
+                    .lock()
+                    .map_or(Err(StorageProbeError::Unavailable), |bytes| Ok(*bytes))
+            }
+        }
+
+        let free_bytes = Arc::new(Mutex::new(101));
+        let monitor = StoragePressureMonitor::new(
+            MutableProbe(Arc::clone(&free_bytes)),
+            "C:\\erabi-data",
+            StoragePressurePolicy::new(100, 50)?,
+        );
+        let (stop, receiver) = watch::channel(false);
+        let task = spawn_storage_pressure_refresh(monitor.clone(), receiver);
+        tokio::task::yield_now().await;
+        if let Ok(mut bytes) = free_bytes.lock() {
+            *bytes = 50;
+        } else {
+            return Err("test storage probe lock was poisoned".into());
+        }
+        tokio::time::advance(STORAGE_PRESSURE_IDLE_REFRESH_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            monitor.controller().state().level,
+            StoragePressureLevel::Critical
+        );
+        let _ = stop.send(true);
+        task.await?;
+        Ok(())
     }
 }

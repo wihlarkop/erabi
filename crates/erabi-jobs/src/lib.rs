@@ -457,6 +457,11 @@ impl<'database> JobRuntime<'database> {
                 result = &mut handler => break result,
                 _ = heartbeat.tick() => {
                     let heartbeat_now = current_queue_time(now, started)?;
+                    // Active artifact-heavy work must observe real filesystem
+                    // transitions without depending on another worker or a
+                    // diagnostics request. The monitor owns the probe and the
+                    // controller publishes its cooperative token.
+                    let _ = self.storage_pressure.refresh();
                     match self
                         .repository
                         .heartbeat(
