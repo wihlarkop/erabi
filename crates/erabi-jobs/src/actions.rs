@@ -104,7 +104,7 @@ impl JobActionService {
     /// # Errors
     /// Returns a typed lifecycle, attempt, lineage, or persistence error.
     pub async fn retry(&self, job_id: &JobId, now: i64) -> Result<JobActionResult, JobActionError> {
-        let source = self.source(job_id).await?;
+        let source = self.recoverable_source(job_id).await?;
         if source.current_attempt == 0 {
             return Err(JobActionError::IllegalLifecycleState);
         }
@@ -138,7 +138,7 @@ impl JobActionService {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
-        let source = self.source(job_id).await?;
+        let source = self.recoverable_source(job_id).await?;
         if source.current_attempt >= source.max_attempts {
             return Err(JobActionError::AttemptsExhausted);
         }
@@ -174,7 +174,7 @@ impl JobActionService {
         now: i64,
         input: RerunFullCrawlInput,
     ) -> Result<JobActionResult, JobActionError> {
-        let source = self.source(job_id).await?;
+        let source = self.terminal_source(job_id).await?;
         let snapshot = self
             .snapshot_for(&source)
             .await?
@@ -203,7 +203,7 @@ impl JobActionService {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
-        let source = self.source(job_id).await?;
+        let source = self.recoverable_source(job_id).await?;
         let (_snapshot, _) = self.compatible_checkpoint(&source).await?;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
@@ -228,7 +228,7 @@ impl JobActionService {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
-        let source = self.source(job_id).await?;
+        let source = self.recoverable_source(job_id).await?;
         self.snapshot_for(&source).await?;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
@@ -310,12 +310,24 @@ impl JobActionService {
         })
     }
 
-    async fn source(&self, job_id: &JobId) -> Result<JobRecord, JobActionError> {
+    /// Returns a terminal job eligible for an independent full rerun.
+    async fn terminal_source(&self, job_id: &JobId) -> Result<JobRecord, JobActionError> {
         let job = JobRepository::new(&self.database)
             .job(job_id)
             .await
             .map_err(action_repository_error)?;
         if matches!(job.state, JobState::Queued | JobState::Running) {
+            return Err(JobActionError::IllegalLifecycleState);
+        }
+        Ok(job)
+    }
+
+    /// Returns failed/cancelled work eligible for in-place recovery. A
+    /// successful job keeps its completed evidence; a new full crawl is the
+    /// explicit action for running it again.
+    async fn recoverable_source(&self, job_id: &JobId) -> Result<JobRecord, JobActionError> {
+        let job = self.terminal_source(job_id).await?;
+        if !matches!(job.state, JobState::Failed | JobState::Cancelled) {
             return Err(JobActionError::IllegalLifecycleState);
         }
         Ok(job)
@@ -381,35 +393,41 @@ fn independent_rerun_snapshot(
     input: RerunFullCrawlInput,
     now: i64,
 ) -> Result<CrawlRunSnapshot, JobActionError> {
-    match source.robots().decision() {
-        RobotsDecision::Respect => Ok(source.clone()),
+    let occurred_at = now.to_string();
+    let robots = match source.robots().decision() {
+        RobotsDecision::Respect => RobotsAudit::respect(
+            source.robots().actor(),
+            &occurred_at,
+            source.robots().affected_scope(),
+            source.robots().user_agent(),
+            source.robots().crawler_version_id(),
+        ),
         RobotsDecision::Override { .. } => {
             let reason = input
                 .robots_override_reason
                 .ok_or(JobActionError::RobotsOverrideReasonRequired)?;
-            let decided_at = now.to_string();
-            let robots = RobotsAudit::override_with_reason(
+            RobotsAudit::override_with_reason(
                 reason,
                 source.robots().actor(),
-                &decided_at,
+                &occurred_at,
                 source.robots().affected_scope(),
                 source.robots().user_agent(),
                 source.robots().crawler_version_id(),
             )
-            .map_err(robots_override_reason_error)?;
-            CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
-                run_type: source.run_type(),
-                configuration: source.configuration().clone(),
-                selected_seed_ids: source.selected_seed_ids().to_vec(),
-                run_profile_id: source.run_profile_id(),
-                settings: source.settings().clone(),
-                robots,
-                actor: source.actor().to_owned(),
-                created_at: decided_at,
-            })
-            .map_err(robots_override_reason_error)
+            .map_err(robots_override_reason_error)?
         }
-    }
+    };
+    CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
+        run_type: source.run_type(),
+        configuration: source.configuration().clone(),
+        selected_seed_ids: source.selected_seed_ids().to_vec(),
+        run_profile_id: source.run_profile_id(),
+        settings: source.settings().clone(),
+        robots,
+        actor: source.actor().to_owned(),
+        created_at: occurred_at,
+    })
+    .map_err(robots_override_reason_error)
 }
 
 fn robots_override_reason_error(_: SnapshotError) -> JobActionError {

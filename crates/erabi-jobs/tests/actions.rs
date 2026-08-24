@@ -120,6 +120,26 @@ async fn cancel_active(
     Ok(())
 }
 
+async fn succeed_active(
+    database: &ErabiDatabase,
+    job: &NewJob,
+    checkpoint: Option<CheckpointEnvelope>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repository = JobRepository::new(database);
+    let acquired = repository
+        .acquire_next("action-test-worker", 0, 30)
+        .await?
+        .ok_or("job was not acquired")?;
+    let lease = acquired.job.lease.clone().ok_or("lease missing")?;
+    if let Some(checkpoint) = checkpoint {
+        repository
+            .append_checkpoint(&job.id, &acquired.attempt.id, &lease, &checkpoint, 1)
+            .await?;
+    }
+    repository.succeed(&job.id, &lease, 2).await?;
+    Ok(())
+}
+
 fn compatible_checkpoint(
     run_id: CrawlRunId,
     snapshot: &CrawlRunSnapshot,
@@ -319,7 +339,33 @@ async fn restart_reuses_the_same_run_and_rerun_creates_an_independent_run()
     let rerun_snapshot = CrawlRunRepository::new(&database)
         .snapshot_by_stored_id(rerun_run_id)
         .await?;
-    assert_eq!(rerun_snapshot.snapshot_hash(), snapshot.snapshot_hash());
+    assert_ne!(rerun_snapshot.snapshot_hash(), snapshot.snapshot_hash());
+    assert_eq!(rerun_snapshot.run_type(), snapshot.run_type());
+    assert_eq!(rerun_snapshot.configuration(), snapshot.configuration());
+    assert_eq!(
+        rerun_snapshot.selected_seed_ids(),
+        snapshot.selected_seed_ids()
+    );
+    assert_eq!(rerun_snapshot.run_profile_id(), snapshot.run_profile_id());
+    assert_eq!(rerun_snapshot.settings(), snapshot.settings());
+    assert_eq!(rerun_snapshot.actor(), snapshot.actor());
+    assert_eq!(rerun_snapshot.robots().actor(), snapshot.robots().actor());
+    assert_eq!(
+        rerun_snapshot.checkpoint_compatibility_hash(),
+        snapshot.checkpoint_compatibility_hash()
+    );
+    assert_eq!(rerun_snapshot.created_at(), "3");
+    assert_eq!(rerun_snapshot.robots().decided_at(), "3");
+    assert!(matches!(
+        rerun_snapshot.robots().decision(),
+        RobotsDecision::Respect
+    ));
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .created_audit_occurred_at_by_stored_id(rerun_run_id)
+            .await?,
+        "3"
+    );
     assert_ne!(rerun.crawl_run_id, Some(run_id.to_string()));
     assert_eq!(rerun.parent_job_id, Some(job.id));
     Ok(())
@@ -406,6 +452,57 @@ async fn independent_rerun_requires_fresh_robots_override_evidence()
         rerun.robots().decision(),
         RobotsDecision::Override { reason } if reason == "renewed approval"
     ));
+    assert_eq!(rerun.created_at(), "5");
+    assert_eq!(rerun.robots().decided_at(), "5");
+    assert_eq!(rerun.actor(), source_snapshot.actor());
+    assert_eq!(rerun.robots().actor(), source_snapshot.robots().actor());
+    assert_ne!(rerun.snapshot_hash(), source_snapshot.snapshot_hash());
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .created_audit_occurred_at_by_stored_id(
+                result.crawl_run_id.as_deref().ok_or("run missing")?
+            )
+            .await?,
+        "5"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn succeeded_work_rejects_in_place_recovery_but_allows_independent_rerun()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    succeed_active(
+        &database,
+        &job,
+        Some(compatible_checkpoint(run_id, &snapshot)?),
+    )
+    .await?;
+    let service = JobActionService::new(database.clone(), CancellationController::default());
+
+    assert!(matches!(
+        service.retry(&job.id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service.retry_failed_parts(&job.id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service.resume(&job.id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service.restart_from_beginning(&job.id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+
+    let rerun = service
+        .rerun_full_crawl(&job.id, 4, RerunFullCrawlInput::default())
+        .await?;
+    assert_ne!(rerun.crawl_run_id, Some(run_id.to_string()));
+    assert_eq!(rerun.parent_job_id, Some(job.id));
     Ok(())
 }
 

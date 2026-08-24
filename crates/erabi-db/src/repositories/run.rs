@@ -147,6 +147,37 @@ impl<'database> CrawlRunRepository<'database> {
             ))
         })
     }
+
+    /// Reads the recorded timestamp for a Crawl Run's durable creation audit
+    /// event using the opaque run identifier stored by related repositories.
+    ///
+    /// # Errors
+    /// Returns `NotFound` only when the corresponding audit event is absent;
+    /// other durable failures remain distinct repository errors.
+    pub async fn created_audit_occurred_at_by_stored_id(
+        &self,
+        stored_id: &str,
+    ) -> Result<String, CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let row = connection
+            .prepare(
+                "SELECT occurred_at FROM audit_events WHERE id = ?1 AND event_type = 'CRAWL_RUN_CREATED'",
+            )
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .query_row([format!("run:{stored_id}")])
+            .await
+            .map_err(|error| match error {
+                turso::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
+                other => CrawlRunRepositoryError::Database(DbError::from(other)),
+            })?;
+        row.get(0)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))
+    }
 }
 
 pub(crate) async fn insert_run_in_transaction(
