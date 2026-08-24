@@ -28,6 +28,7 @@ use tokio::{
 mod actions;
 mod cancellation;
 mod progress;
+mod storage_pressure;
 
 pub use actions::{
     JobAction, JobActionError, JobActionResult, JobActionService, RerunFullCrawlInput,
@@ -37,7 +38,14 @@ pub use progress::{
     ProgressLiveHub, ProgressLiveHubError, ProgressPublication, ProgressPublisher,
     ProgressPublisherError, ProgressService, ProgressServiceError,
 };
+pub use storage_pressure::{
+    DEFAULT_CRITICAL_FREE_BYTES, DEFAULT_WARNING_FREE_BYTES, FileSystemStorageProbe,
+    StoragePressureController, StoragePressureLevel, StoragePressureMonitor, StoragePressurePolicy,
+    StoragePressurePolicyError, StoragePressureState, StoragePressureToken, StorageProbe,
+    StorageProbeError,
+};
 
+pub use erabi_db::repositories::JobStorageClass;
 pub use erabi_db::repositories::{AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob};
 pub use erabi_db::repositories::{
     CURRENT_CHECKPOINT_SCHEMA_VERSION, CheckpointArtifactReference, CheckpointCompatibility,
@@ -93,6 +101,7 @@ pub struct JobExecutionContext {
     worker_id: String,
     lease: JobLease,
     cancellation: CancellationToken,
+    storage_pressure: StoragePressureToken,
     checkpoint_writer: CheckpointWriter,
 }
 
@@ -126,6 +135,13 @@ impl JobExecutionContext {
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    /// Returns the cooperative signal for critical storage pressure. This is
+    /// distinct from user-requested cancellation.
+    #[must_use]
+    pub const fn storage_pressure(&self) -> &StoragePressureToken {
+        &self.storage_pressure
     }
 
     /// Persists a bounded checkpoint while this worker still owns the attempt.
@@ -186,7 +202,7 @@ impl CheckpointWriter {
 }
 
 /// A sanitized expected handler error. Error payloads are deliberately not
-/// persisted; only [`JobFailureCode::HandlerFailed`] is durable.
+/// persisted; only stable typed failure codes are durable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobExecutionError;
 
@@ -221,6 +237,11 @@ pub enum WorkerTurn {
         job_id: JobId,
         checkpoint_persisted: bool,
     },
+    StoragePressure {
+        job_id: JobId,
+        state: JobState,
+        checkpoint_persisted: bool,
+    },
 }
 
 /// Failure that prevents the generic worker boundary from safely proceeding.
@@ -241,6 +262,7 @@ pub struct JobRuntime<'database> {
     worker_id: String,
     policy: WorkerPolicy,
     cancellation: CancellationController,
+    storage_pressure: StoragePressureMonitor,
 }
 
 impl<'database> JobRuntime<'database> {
@@ -276,6 +298,28 @@ impl<'database> JobRuntime<'database> {
         policy: WorkerPolicy,
         cancellation: CancellationController,
     ) -> Result<Self, JobRuntimeError> {
+        Self::with_storage_pressure_monitor(
+            database,
+            worker_id,
+            policy,
+            cancellation,
+            StoragePressureMonitor::unavailable(StoragePressurePolicy::default()),
+        )
+    }
+
+    /// Creates a worker with a probe bound to Erabi's authoritative data path.
+    /// The monitor is shared with runtime/API state through its controller.
+    ///
+    /// # Errors
+    /// Returns an error when the worker identity or bounded lease/retry policy
+    /// is invalid.
+    pub fn with_storage_pressure_monitor(
+        database: &'database ErabiDatabase,
+        worker_id: impl Into<String>,
+        policy: WorkerPolicy,
+        cancellation: CancellationController,
+        storage_pressure: StoragePressureMonitor,
+    ) -> Result<Self, JobRuntimeError> {
         let worker_id = worker_id.into();
         if !policy.valid() || worker_id.is_empty() || worker_id.len() > 128 {
             return Err(JobRuntimeError::InvalidPolicy);
@@ -286,6 +330,7 @@ impl<'database> JobRuntime<'database> {
             worker_id,
             policy,
             cancellation,
+            storage_pressure,
         })
     }
 
@@ -324,15 +369,25 @@ impl<'database> JobRuntime<'database> {
         if self.cancellation.shutdown_requested() {
             return Ok(WorkerTurn::Idle);
         }
+        let pressure_state = self.storage_pressure.refresh();
         let Some(acquired) = self
             .repository
-            .acquire_next(&self.worker_id, now, self.policy.lease_duration_seconds)
+            .acquire_next_with_storage_admission(
+                &self.worker_id,
+                now,
+                self.policy.lease_duration_seconds,
+                pressure_state.allows_artifact_heavy(),
+            )
             .await
             .map_err(JobRuntimeError::Repository)?
         else {
             return Ok(WorkerTurn::Idle);
         };
         let cancellation = self.cancellation.register(&acquired.job.id);
+        let storage_pressure = self
+            .storage_pressure
+            .controller()
+            .register(&acquired.job.id, acquired.job.storage_class());
         let current_lease = acquired
             .job
             .lease
@@ -344,6 +399,7 @@ impl<'database> JobRuntime<'database> {
             Ok(lease) => lease,
             Err(error) => {
                 self.cancellation.release(&acquired.job.id, false);
+                self.storage_pressure.controller().release(&acquired.job.id);
                 return Err(error);
             }
         };
@@ -364,6 +420,7 @@ impl<'database> JobRuntime<'database> {
             worker_id: self.worker_id.clone(),
             lease: current_lease,
             cancellation,
+            storage_pressure,
             checkpoint_writer,
         };
         let outcome = self.execute_acquired(handler, context, now, started).await;
@@ -376,6 +433,7 @@ impl<'database> JobRuntime<'database> {
                     | WorkerTurn::Cancelled { .. })
             ),
         );
+        self.storage_pressure.controller().release(&acquired.job.id);
         outcome
     }
 
@@ -434,6 +492,19 @@ impl<'database> JobRuntime<'database> {
                 .map_err(JobRuntimeError::Repository)?;
             return Ok(WorkerTurn::Cancelled {
                 job_id: context.job_id,
+                checkpoint_persisted,
+            });
+        }
+        if context.storage_pressure.is_signalled() {
+            let checkpoint_persisted = context.checkpoint_writer.persisted();
+            let state = self
+                .repository
+                .requeue_after_storage_pressure(&context.job_id, &current_lease, completed_at)
+                .await
+                .map_err(JobRuntimeError::Repository)?;
+            return Ok(WorkerTurn::StoragePressure {
+                job_id: context.job_id,
+                state,
                 checkpoint_persisted,
             });
         }

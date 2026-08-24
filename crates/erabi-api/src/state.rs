@@ -6,7 +6,10 @@ use std::sync::{
 };
 
 use erabi_db::ErabiDatabase;
-use erabi_jobs::{CancellationController, JobActionService, ProgressLiveHub};
+use erabi_jobs::{
+    CancellationController, JobActionService, ProgressLiveHub, StoragePressureController,
+    StoragePressurePolicy, StoragePressureState,
+};
 
 /// Runtime service mode used to protect mutable surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -87,6 +90,7 @@ pub struct AppState {
     accepting_mutations: Arc<AtomicBool>,
     progress: Option<Arc<ProgressRuntimeState>>,
     job_actions: Option<Arc<JobActionRuntimeState>>,
+    storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
 impl AppState {
@@ -108,6 +112,7 @@ impl AppState {
             accepting_mutations: Arc::new(AtomicBool::new(true)),
             progress: None,
             job_actions: None,
+            storage_pressure: None,
         }
     }
 
@@ -144,6 +149,26 @@ impl AppState {
     #[must_use]
     pub(crate) fn job_actions_runtime(&self) -> Option<Arc<JobActionRuntimeState>> {
         self.job_actions.clone()
+    }
+
+    /// Attaches the typed storage-pressure state shared with worker admission.
+    #[must_use]
+    pub fn with_storage_pressure_controller(
+        mut self,
+        controller: StoragePressureController,
+    ) -> Self {
+        self.storage_pressure = Some(Arc::new(controller));
+        self
+    }
+
+    /// Returns safe operational storage state. A state-less test shell is
+    /// unavailable rather than incorrectly reporting healthy storage.
+    #[must_use]
+    pub fn storage_pressure(&self) -> StoragePressureState {
+        self.storage_pressure.as_ref().map_or_else(
+            || StoragePressureState::unavailable(StoragePressurePolicy::default()),
+            |controller| controller.state(),
+        )
     }
 
     /// Reads the current readiness state.

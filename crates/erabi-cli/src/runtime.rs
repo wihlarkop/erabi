@@ -14,7 +14,10 @@ use erabi_db::{
     ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
     repositories::ConcurrencyState,
 };
-use erabi_jobs::{CancellationController, ProgressLiveHub, recover_and_rebuild_at};
+use erabi_jobs::{
+    CancellationController, ProgressLiveHub, StoragePressureMonitor, StoragePressurePolicy,
+    StoragePressureState, recover_and_rebuild_at,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -76,6 +79,7 @@ pub struct RunningRuntime {
     _database: ErabiDatabase,
     _concurrency_state: ConcurrencyState,
     _progress_live_hub: ProgressLiveHub,
+    storage_pressure: StoragePressureMonitor,
     cancellation: CancellationController,
 }
 
@@ -152,6 +156,9 @@ impl RunningRuntime {
         } else {
             ConcurrencyState::default()
         };
+        let storage_pressure =
+            StoragePressureMonitor::filesystem(data_dir.clone(), StoragePressurePolicy::default());
+        let _ = storage_pressure.refresh();
 
         let crawl4ai = if let Some(health) = options.crawl4ai_health {
             health
@@ -169,7 +176,8 @@ impl RunningRuntime {
         let cancellation = CancellationController::default();
         let app_state = AppState::with_readiness(false)
             .with_progress_runtime(database.clone(), progress_live_hub.clone())
-            .with_job_actions_runtime(database.clone(), cancellation.clone());
+            .with_job_actions_runtime(database.clone(), cancellation.clone())
+            .with_storage_pressure_controller(storage_pressure.controller().clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
                 app_state.enter_recovery(recovery.code.clone(), recovery.message.clone());
@@ -214,6 +222,7 @@ impl RunningRuntime {
             _database: database,
             _concurrency_state: concurrency_state,
             _progress_live_hub: progress_live_hub,
+            storage_pressure,
             cancellation,
         })
     }
@@ -241,6 +250,18 @@ impl RunningRuntime {
     #[must_use]
     pub fn cancellation_controller(&self) -> CancellationController {
         self.cancellation.clone()
+    }
+
+    /// Returns the last typed storage-pressure observation for diagnostics.
+    #[must_use]
+    pub fn storage_pressure_state(&self) -> StoragePressureState {
+        self.storage_pressure.controller().state()
+    }
+
+    /// Refreshes the authoritative data-directory free-space observation.
+    #[must_use]
+    pub fn refresh_storage_pressure(&self) -> StoragePressureState {
+        self.storage_pressure.refresh()
     }
 
     /// Waits for an operating-system termination signal, then shuts down safely.

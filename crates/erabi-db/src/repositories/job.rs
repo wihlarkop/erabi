@@ -86,6 +86,7 @@ pub enum JobFailureCode {
     HandlerPanicked,
     LeaseExpired,
     Cancelled,
+    StoragePressure,
 }
 
 impl JobFailureCode {
@@ -95,6 +96,7 @@ impl JobFailureCode {
             Self::HandlerPanicked => "HANDLER_PANICKED",
             Self::LeaseExpired => "LEASE_EXPIRED",
             Self::Cancelled => "CANCELLED",
+            Self::StoragePressure => "STORAGE_PRESSURE",
         }
     }
 
@@ -104,6 +106,7 @@ impl JobFailureCode {
             "HANDLER_PANICKED" => Ok(Self::HandlerPanicked),
             "LEASE_EXPIRED" => Ok(Self::LeaseExpired),
             "CANCELLED" => Ok(Self::Cancelled),
+            "STORAGE_PRESSURE" => Ok(Self::StoragePressure),
             _ => Err(JobRepositoryError::QueueInvariant),
         }
     }
@@ -136,6 +139,17 @@ impl JobKind {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Explicit scheduling capability used by disk-pressure admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobStorageClass {
+    /// Work that does not materially grow the controlled artifact store.
+    StorageLight,
+    /// A root run job associated with a Crawl Run and expected to create
+    /// artifact payloads. Child action jobs remain storage-light so recovery
+    /// and control operations stay available under pressure.
+    ArtifactHeavy,
 }
 
 /// A durable job creation request. `max_attempts` counts total executions,
@@ -195,6 +209,19 @@ pub struct JobRecord {
     pub failure_code: Option<JobFailureCode>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl JobRecord {
+    /// Classifies only the existing durable run/lineage capabilities. This is
+    /// deliberately independent of future Plan 06 job-kind names.
+    #[must_use]
+    pub const fn storage_class(&self) -> JobStorageClass {
+        if self.parent_job_id.is_none() && self.crawl_run_id.is_some() {
+            JobStorageClass::ArtifactHeavy
+        } else {
+            JobStorageClass::StorageLight
+        }
+    }
 }
 
 /// The Crawl Run relationship selected by a durable recovery action.
@@ -313,6 +340,8 @@ pub enum JobRepositoryError {
     RetryAlreadyContinued,
     #[error("the current worker no longer owns this lease")]
     LeaseLost,
+    #[error("new artifact-heavy work is blocked by critical storage pressure")]
+    StorageAdmissionBlocked,
     #[error("a critical durable queue invariant is inconsistent")]
     QueueInvariant,
     #[error("durable checkpoint operation failed")]
@@ -380,6 +409,24 @@ impl<'database> JobRepository<'database> {
         now: i64,
         lease_duration_seconds: i64,
     ) -> Result<Option<AcquiredJob>, JobRepositoryError> {
+        self.acquire_next_with_storage_admission(worker_id, now, lease_duration_seconds, true)
+            .await
+    }
+
+    /// Acquires one eligible job while optionally excluding artifact-heavy
+    /// roots. Admission is part of the same transaction as lease creation, so
+    /// a blocked queued job gains neither a lease nor an attempt.
+    ///
+    /// # Errors
+    /// Returns an error for invalid worker/lease input, an inconsistent queue,
+    /// or a failed durable transaction.
+    pub async fn acquire_next_with_storage_admission(
+        &self,
+        worker_id: &str,
+        now: i64,
+        lease_duration_seconds: i64,
+        allow_artifact_heavy: bool,
+    ) -> Result<Option<AcquiredJob>, JobRepositoryError> {
         if !valid_worker_id(worker_id) || lease_duration_seconds <= 0 {
             return Err(JobRepositoryError::QueueInvariant);
         }
@@ -395,11 +442,19 @@ impl<'database> JobRepository<'database> {
         let result = async {
             ensure_queue_invariants(&transaction).await?;
             recover_expired_in_transaction(&transaction, now).await?;
-            let Some(id) = select_eligible_job(&transaction, now).await? else {
+            let Some(id) = select_eligible_job(&transaction, now, allow_artifact_heavy).await?
+            else {
                 return Ok(None);
             };
-            let acquired =
-                lease_queued_job(&transaction, &id, worker_id, now, lease_duration_seconds).await?;
+            let acquired = lease_queued_job(
+                &transaction,
+                &id,
+                worker_id,
+                now,
+                lease_duration_seconds,
+                allow_artifact_heavy,
+            )
+            .await?;
             Ok(Some(acquired))
         }
         .await;
@@ -868,6 +923,78 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::Checkpoint)
     }
 
+    /// Commits a pressure-interrupted attempt and requeues it without
+    /// mutating run snapshots or cancelling the associated run. The attempt
+    /// is real history, while the pressure reason remains distinct from user
+    /// cancellation and handler failure.
+    ///
+    /// # Errors
+    /// Returns an ownership or durable transition error.
+    pub async fn requeue_after_storage_pressure(
+        &self,
+        job_id: &JobId,
+        lease: &JobLease,
+        now: i64,
+    ) -> Result<JobState, JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+            let next_state = if job.current_attempt < job.max_attempts {
+                JobState::Queued
+            } else {
+                JobState::Failed
+            };
+            finish_attempt_in_transaction(
+                &transaction,
+                job_id,
+                lease,
+                now,
+                AttemptOutcome::Failed,
+                Some(JobFailureCode::StoragePressure),
+            )
+            .await?;
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET state = ?1, scheduled_at = ?2, lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = 'STORAGE_PRESSURE', updated_at = ?2 WHERE id = ?3 AND state = 'RUNNING' AND lease_id = ?4 AND lease_owner = ?5 AND lease_generation = ?6",
+                    (
+                        next_state.as_sql(),
+                        now,
+                        job_id.as_str(),
+                        lease.id.as_str(),
+                        lease.owner.as_str(),
+                        i64::try_from(lease.generation)
+                            .map_err(|_| JobRepositoryError::QueueInvariant)?,
+                    ),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            if changed != 1 {
+                return Err(JobRepositoryError::LeaseLost);
+            }
+            Ok(next_state)
+        }
+        .await;
+        match result {
+            Ok(state) => transaction
+                .commit()
+                .await
+                .map(|()| state)
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Returns append-only checkpoint evidence in durable commit order.
     ///
     /// # Errors
@@ -1218,11 +1345,12 @@ async fn action_child_crawl_run_id(
 async fn select_eligible_job(
     connection: &Connection,
     now: i64,
+    allow_artifact_heavy: bool,
 ) -> Result<Option<JobId>, JobRepositoryError> {
     let mut rows = connection
         .query(
-            "SELECT id FROM jobs WHERE state = 'QUEUED' AND scheduled_at <= ?1 ORDER BY priority DESC, scheduled_at, created_at, id LIMIT 1",
-            [now],
+            "SELECT id FROM jobs WHERE state = 'QUEUED' AND scheduled_at <= ?1 AND (?2 = 1 OR parent_job_id IS NOT NULL OR crawl_run_id IS NULL) ORDER BY priority DESC, scheduled_at, created_at, id LIMIT 1",
+            (now, i64::from(allow_artifact_heavy)),
         )
         .await
         .map_err(JobRepositoryError::database)?;
@@ -1239,6 +1367,7 @@ async fn lease_queued_job(
     worker_id: &str,
     now: i64,
     lease_duration_seconds: i64,
+    allow_artifact_heavy: bool,
 ) -> Result<AcquiredJob, JobRepositoryError> {
     let job = select_job(connection, job_id).await?;
     if job.state != JobState::Queued
@@ -1246,6 +1375,9 @@ async fn lease_queued_job(
         || job.current_attempt >= job.max_attempts
     {
         return Err(JobRepositoryError::IllegalTransition);
+    }
+    if !allow_artifact_heavy && job.storage_class() == JobStorageClass::ArtifactHeavy {
+        return Err(JobRepositoryError::StorageAdmissionBlocked);
     }
     let lease_id = Uuid::now_v7().to_string();
     let lease_generation = job.lease_generation.saturating_add(1);

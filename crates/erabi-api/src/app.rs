@@ -149,6 +149,7 @@ async fn runtime_diagnostics(
     Json(RuntimeDiagnosticsResponse {
         mode: app_state.runtime_mode(),
         crawl4ai: app_state.crawl4ai_availability(),
+        storage_pressure: app_state.storage_pressure(),
     })
 }
 
@@ -292,6 +293,7 @@ struct ReadinessResponse {
 struct RuntimeDiagnosticsResponse {
     mode: RuntimeMode,
     crawl4ai: Crawl4AiAvailability,
+    storage_pressure: erabi_jobs::StoragePressureState,
 }
 
 /// `OpenAPI` document generated from the currently available stable route contracts.
