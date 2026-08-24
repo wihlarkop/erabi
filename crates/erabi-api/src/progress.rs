@@ -50,56 +50,47 @@ pub(crate) async fn job_progress_sse(
         );
     };
 
-    let job_id = match raw_job_id.parse::<JobId>() {
-        Ok(job_id) => job_id,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                ApiErrorEnvelope::new(
-                    "INVALID_JOB_ID",
-                    "The progress stream job identifier is invalid.",
-                    trace_id.as_str(),
-                ),
-            );
-        }
+    let Ok(job_id) = raw_job_id.parse::<JobId>() else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ApiErrorEnvelope::new(
+                "INVALID_JOB_ID",
+                "The progress stream job identifier is invalid.",
+                trace_id.as_str(),
+            ),
+        );
     };
-    let cursor = match parse_last_event_id(&headers) {
-        Ok(cursor) => cursor,
-        Err(()) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                ApiErrorEnvelope::new(
-                    "INVALID_LAST_EVENT_ID",
-                    "Last-Event-ID must be a positive durable progress sequence.",
-                    trace_id.as_str(),
-                ),
-            );
-        }
+    let Ok(cursor) = parse_last_event_id(&headers) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ApiErrorEnvelope::new(
+                "INVALID_LAST_EVENT_ID",
+                "Last-Event-ID must be a positive durable progress sequence.",
+                trace_id.as_str(),
+            ),
+        );
     };
 
     // Subscribe first. An event committed while the durable replay query runs is
     // therefore either returned by replay, queued live, or both; sequence-based
     // de-duplication makes all three cases safe.
     let receiver = runtime.live_hub().subscribe();
-    let request = match replay_request(cursor) {
-        Ok(request) => request,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                ApiErrorEnvelope::new(
-                    "INVALID_LAST_EVENT_ID",
-                    "Last-Event-ID is outside the supported progress sequence range.",
-                    trace_id.as_str(),
-                ),
-            );
-        }
+    let Ok(request) = replay_request(cursor) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ApiErrorEnvelope::new(
+                "INVALID_LAST_EVENT_ID",
+                "Last-Event-ID is outside the supported progress sequence range.",
+                trace_id.as_str(),
+            ),
+        );
     };
     let initial = match ProgressService::new(runtime.database())
         .replay(&job_id, request)
         .await
     {
         Ok(page) => page,
-        Err(error) => return initial_replay_error(error, &trace_id),
+        Err(error) => return initial_replay_error(&error, &trace_id),
     };
     let replay_more = initial.next_after.is_some();
     let state = ProgressStreamState {
@@ -167,9 +158,8 @@ async fn next_progress_item(
             }
             let terminal = event.terminal.is_some();
             state.cursor = event.sequence.get();
-            let encoded = match encode_progress_event(&event) {
-                Ok(encoded) => encoded,
-                Err(_) => return None,
+            let Ok(encoded) = encode_progress_event(&event) else {
+                return None;
             };
             state.done = terminal;
             return Some((Ok(encoded), state));
@@ -238,7 +228,7 @@ fn replay_request(cursor: u64) -> Result<ProgressReplayRequest, ProgressReposito
     ProgressReplayRequest::new(after, REPLAY_PAGE_SIZE)
 }
 
-fn initial_replay_error(error: ProgressServiceError, trace_id: &TraceId) -> Response {
+fn initial_replay_error(error: &ProgressServiceError, trace_id: &TraceId) -> Response {
     match error {
         ProgressServiceError::Repository(ProgressRepositoryError::JobNotFound) => error_response(
             StatusCode::NOT_FOUND,
