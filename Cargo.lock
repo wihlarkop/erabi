@@ -713,6 +713,8 @@ dependencies = [
  "axum",
  "erabi-db",
  "erabi-domain",
+ "erabi-jobs",
+ "futures-util",
  "secrecy",
  "serde",
  "serde_json",
