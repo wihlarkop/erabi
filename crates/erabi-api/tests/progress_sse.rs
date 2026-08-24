@@ -166,10 +166,7 @@ async fn invalid_cursor_and_unknown_job_return_stable_errors()
 
     let unknown = JobId::new();
     let missing = router
-        .oneshot(
-            request(&format!("/api/v1/events/jobs/{unknown}/progress"))
-                .body(Body::empty())?,
-        )
+        .oneshot(request(&format!("/api/v1/events/jobs/{unknown}/progress")).body(Body::empty())?)
         .await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     assert_eq!(error_code(missing).await?, "JOB_NOT_FOUND");
@@ -181,9 +178,7 @@ async fn malformed_job_id_is_rejected_before_streaming() -> Result<(), Box<dyn s
     let hub = ProgressLiveHub::new();
     let (_database, _job_id, router, _hub) = fixture(hub).await?;
     let response = router
-        .oneshot(
-            request("/api/v1/events/jobs/not-a-job-id/progress").body(Body::empty())?,
-        )
+        .oneshot(request("/api/v1/events/jobs/not-a-job-id/progress").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(error_code(response).await?, "INVALID_JOB_ID");

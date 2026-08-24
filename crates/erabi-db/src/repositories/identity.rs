@@ -9,7 +9,7 @@ use super::JobId;
 /// A sanitized failure to parse a durable job identifier from an API boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum JobIdParseError {
-    /// Erabi job identities are always canonical UUIDv7 values.
+    /// Erabi job identities are always canonical `UUIDv7` values.
     #[error("job identifiers must be UUIDv7 values")]
     Invalid,
 }
