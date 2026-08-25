@@ -103,10 +103,42 @@ fn unmatched_url_is_preserved_as_unmatched_decision() -> Result<(), Box<dyn std:
 fn invalid_matchers_are_rejected_at_construction_and_deserialization() {
     assert!(UrlMatcher::regex("[").is_err());
     assert!(UrlMatcher::path_glob(None, "").is_err());
+    assert!(UrlMatcher::path_glob(Some("bad host".into()), "/products/*").is_err());
+    assert!(UrlMatcher::path_glob(None, "products/*").is_err());
+    assert!(UrlMatcher::try_path_prefix(None, "products").is_err());
+    assert!(UrlMatcher::try_path_prefix(Some("bad host".into()), "/products").is_err());
+    assert!(
+        UrlMatcher::try_exact_host_path_template("bad host", "/products/{id}", BTreeMap::new(),)
+            .is_err()
+    );
+    assert!(
+        UrlMatcher::try_exact_host_path_template("example.test", "/products/{id", BTreeMap::new(),)
+            .is_err()
+    );
+    assert!(
+        UrlMatcher::try_exact_host_path_template(
+            "example.test",
+            "/products/{id}",
+            BTreeMap::from([("bad key".into(), "en".into())]),
+        )
+        .is_err()
+    );
     assert!(serde_json::from_str::<UrlMatcher>(r#"{"Regex":{"pattern":"["}}"#).is_err());
     assert!(
         serde_json::from_str::<UrlMatcher>(r#"{"PathGlob":{"host":null,"pattern":""}}"#).is_err()
     );
+    assert!(
+        serde_json::from_str::<UrlMatcher>(r#"{"PathPrefix":{"host":null,"prefix":"products"}}"#)
+            .is_err()
+    );
+    assert!(serde_json::from_str::<UrlMatcher>(
+        r#"{"ExactHostPathTemplate":{"host":"bad host","path_template":"/products/{id}","query":{}}}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<UrlMatcher>(
+        r#"{"ExactHostPathTemplate":{"host":"example.test","path_template":"/products/{id","query":{}}}"#
+    )
+    .is_err());
 }
 
 #[test]

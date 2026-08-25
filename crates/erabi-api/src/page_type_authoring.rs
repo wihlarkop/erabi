@@ -240,29 +240,12 @@ impl MatcherDefinitionRequest {
                 host,
                 path_template,
                 query,
-            } => {
-                if !valid_host(&host)
-                    || !valid_path_template(&path_template)
-                    || !valid_query(&query)
-                {
-                    return Err("The exact host/path template is invalid.");
-                }
-                Ok(UrlMatcher::exact_host_path_template(
-                    host,
-                    path_template,
-                    query,
-                ))
-            }
+            } => UrlMatcher::try_exact_host_path_template(host, path_template, query)
+                .map_err(|_| "The exact host/path template is invalid."),
             Self::PathPrefix { host, prefix } => {
-                if !valid_optional_host(host.as_deref()) || !valid_path_prefix(&prefix) {
-                    return Err("The path prefix is invalid.");
-                }
-                Ok(UrlMatcher::path_prefix(host, prefix))
+                UrlMatcher::try_path_prefix(host, prefix).map_err(|_| "The path prefix is invalid.")
             }
             Self::PathGlob { host, pattern } => {
-                if !valid_optional_host(host.as_deref()) || !valid_path_glob(&pattern) {
-                    return Err("The path glob is invalid.");
-                }
                 UrlMatcher::path_glob(host, pattern).map_err(|_| "The path glob is invalid.")
             }
             Self::Regex { pattern } => {
@@ -1023,54 +1006,6 @@ fn valid_page_type_name(name: &str) -> bool {
     !name.trim().is_empty() && name.chars().count() <= 256
 }
 
-fn valid_host(host: &str) -> bool {
-    if host.trim().is_empty() || host.chars().any(char::is_whitespace) {
-        return false;
-    }
-    let Ok(parsed) = url::Url::parse(&format!("https://{host}/")) else {
-        return false;
-    };
-    parsed.port().is_none()
-        && parsed
-            .host_str()
-            .is_some_and(|value| value.eq_ignore_ascii_case(host))
-}
-
-fn valid_optional_host(host: Option<&str>) -> bool {
-    host.is_none_or(valid_host)
-}
-
-fn valid_path_template(path: &str) -> bool {
-    !path.is_empty()
-        && path.starts_with('/')
-        && path.split('/').skip(1).all(|segment| {
-            if segment.starts_with('{') || segment.ends_with('}') {
-                segment.len() > 2
-                    && segment.starts_with('{')
-                    && segment.ends_with('}')
-                    && !segment[1..segment.len() - 1]
-                        .chars()
-                        .any(|character| matches!(character, '{' | '}' | '/' | '*'))
-            } else {
-                !segment.contains(['{', '}', '*'])
-            }
-        })
-}
-
-fn valid_path_prefix(path: &str) -> bool {
-    !path.is_empty() && path.starts_with('/') && !path.contains(['*', '{', '}'])
-}
-
-fn valid_path_glob(path: &str) -> bool {
-    !path.is_empty() && path.starts_with('/')
-}
-
-fn valid_query(query: &BTreeMap<String, String>) -> bool {
-    query
-        .keys()
-        .all(|key| !key.is_empty() && !key.chars().any(char::is_whitespace))
-}
-
 #[allow(clippy::needless_pass_by_value)]
 fn page_type_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
     let (status, code, message) = match error {
@@ -1129,6 +1064,11 @@ fn page_type_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
             "URL_MATCHER_NOT_OWNED_BY_PAGE_TYPE",
             "The URLMatcher does not belong to this PageType.",
         ),
+        CrawlerRepositoryError::InvalidUrlMatcherDefinition => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_URL_MATCHER",
+            "The URLMatcher definition is invalid.",
+        ),
         CrawlerRepositoryError::CorruptState => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "PERSISTED_STATE_INVALID",
@@ -1166,4 +1106,22 @@ fn now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     format!("unix:{seconds}")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn persisted_matcher_corruption_maps_to_the_stable_api_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = page_type_error(CrawlerRepositoryError::CorruptState, &TraceId::for_test());
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(body["code"], "PERSISTED_STATE_INVALID");
+        Ok(())
+    }
 }

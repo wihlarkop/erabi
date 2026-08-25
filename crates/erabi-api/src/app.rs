@@ -42,6 +42,11 @@ const TRACE_HEADER: HeaderName = HeaderName::from_static("x-erabi-trace-id");
 pub(crate) struct TraceId(String);
 
 impl TraceId {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self("test-trace-id".into())
+    }
+
     fn from_request(request: &Request<axum::body::Body>) -> Self {
         let trace_id = request
             .headers()

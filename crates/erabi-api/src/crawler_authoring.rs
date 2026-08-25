@@ -446,6 +446,11 @@ fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
             "URL_MATCHER_NOT_OWNED_BY_PAGE_TYPE",
             "The URLMatcher does not belong to this PageType.",
         ),
+        CrawlerRepositoryError::InvalidUrlMatcherDefinition => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_URL_MATCHER",
+            "The URLMatcher definition is invalid.",
+        ),
         CrawlerRepositoryError::InvalidLifecycleTransition => (
             StatusCode::CONFLICT,
             "INVALID_LIFECYCLE_TRANSITION",

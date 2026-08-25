@@ -64,6 +64,8 @@ pub enum CrawlerRepositoryError {
     UrlMatcherNotFound,
     #[error("URLMatcher does not belong to the requested PageType")]
     UrlMatcherNotOwnedByPageType,
+    #[error("URLMatcher definition is invalid")]
+    InvalidUrlMatcherDefinition,
     #[error("CrawlerVersion lifecycle transition is invalid")]
     InvalidLifecycleTransition,
     #[error("CrawlerVersion lifecycle transition conflicted with another request")]
@@ -751,6 +753,9 @@ impl<'database> CrawlerRepository<'database> {
         occurred_at: &str,
     ) -> Result<UrlMatcherRecord, CrawlerRepositoryError> {
         let matcher_id = new_opaque_id();
+        matcher
+            .validate_definition()
+            .map_err(|_| CrawlerRepositoryError::InvalidUrlMatcherDefinition)?;
         let matcher_json = serde_json::to_string(matcher).map_err(|error| {
             CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
         })?;
@@ -816,6 +821,9 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<UrlMatcherRecord, CrawlerRepositoryError> {
+        matcher
+            .validate_definition()
+            .map_err(|_| CrawlerRepositoryError::InvalidUrlMatcherDefinition)?;
         let matcher_json = serde_json::to_string(matcher).map_err(|error| {
             CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
         })?;
@@ -1355,8 +1363,64 @@ async fn load_mutation_version(
     }
     // A mutation must not compound an existing mismatch between the declared
     // version projection and typed child rows.
+    validate_seed_hint_projection(connection, &version).await?;
     load_page_type_records(connection, &version).await?;
     Ok(version)
+}
+
+async fn validate_seed_hint_projection(
+    connection: &Connection,
+    version: &CrawlerVersion,
+) -> Result<(), CrawlerRepositoryError> {
+    let expected = version
+        .seeds()
+        .iter()
+        .map(|seed| {
+            (
+                seed.id.to_string(),
+                seed.entry_page_type_hint.map(|id| id.to_string()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() != version.seeds().len()
+        || version.seeds().iter().any(|seed| {
+            seed.entry_page_type_hint
+                .is_some_and(|hint| !version.page_type_ids().contains(&hint))
+        })
+    {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+
+    let mut rows = connection
+        .query(
+            "SELECT id, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1",
+            [version.id().to_string()],
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    let mut actual = BTreeMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+    {
+        let id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
+        let hint = row
+            .get::<Option<String>>(1)
+            .map_err(CrawlerRepositoryError::database)?;
+        if Uuid::parse_str(&id).map_or(true, |value| value.get_version_num() != 7)
+            || hint
+                .as_deref()
+                .is_some_and(|value| parse_page_type_id(value).is_err())
+            || actual.insert(id, hint).is_some()
+        {
+            return Err(CrawlerRepositoryError::CorruptState);
+        }
+    }
+    if actual != expected {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+    Ok(())
 }
 
 async fn load_page_type_records(
@@ -2077,13 +2141,13 @@ async fn semantic_hash(
     .await?;
     let matchers = child_values(
         connection,
-        "SELECT url_matchers.id, url_matchers.page_type_id, url_matchers.ordinal, url_matchers.matcher_json FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1",
+        "SELECT url_matchers.id, url_matchers.page_type_id, url_matchers.matcher_json FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1",
         version.id(),
         |row| {
-            let matcher: String = row
-                .get(3)
+            let matcher_json: String = row
+                .get(2)
                 .map_err(CrawlerRepositoryError::database)?;
-            let matcher = serde_json::from_str::<Value>(&matcher)
+            let matcher = serde_json::from_str::<UrlMatcher>(&matcher_json)
                 .map_err(|_| CrawlerRepositoryError::CorruptState)?;
             let mut object = Map::new();
             object.insert(
@@ -2095,10 +2159,11 @@ async fn semantic_hash(
                 Value::String(row.get(1).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
-                "ordinal".into(),
-                Value::from(row.get::<i64>(2).map_err(CrawlerRepositoryError::database)?),
+                "matcher".into(),
+                serde_json::to_value(matcher).map_err(|error| {
+                    CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
+                })?,
             );
-            object.insert("matcher".into(), matcher);
             Ok(Value::Object(object))
         },
     )
@@ -2707,7 +2772,7 @@ mod tests {
     use crate::MigrationRunner;
     use erabi_domain::{
         CanonicalizationPolicyId, CrawlerVersion, DiscoveryTransitionId, DomainScopeId, PageTypeId,
-        Seed, UrlMatcher,
+        Seed, UrlMatcher, resolve_page_type,
     };
 
     async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -2955,6 +3020,7 @@ mod tests {
                     matchers.reverse();
                 }
                 for (page_type_id, ordinal, pattern) in matchers {
+                    let matcher = UrlMatcher::exact_url(pattern.parse()?);
                     connection
                         .execute(
                             "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
@@ -2962,8 +3028,7 @@ mod tests {
                                 new_opaque_id(),
                                 page_type_id.to_string(),
                                 ordinal,
-                                serde_json::json!({"kind": "exact", "pattern": pattern})
-                                    .to_string(),
+                                serde_json::to_string(&matcher)?,
                             ),
                         )
                         .await?;
@@ -3047,7 +3112,7 @@ mod tests {
         let (source_crawler, source_version) = symmetric_graph_version(
             &database,
             "Symmetric UUID source",
-            SymmetricGraphShape::SelfTransition,
+            SymmetricGraphShape::MatchersShareOwner,
             false,
             false,
         )
@@ -3055,7 +3120,7 @@ mod tests {
         let (renamed_crawler, renamed_version) = symmetric_graph_version(
             &database,
             "Symmetric UUID renamed",
-            SymmetricGraphShape::SelfTransition,
+            SymmetricGraphShape::MatchersShareOwner,
             true,
             false,
         )
@@ -3301,8 +3366,12 @@ mod tests {
             .await?;
         connection
             .execute(
-                "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 0, '{\"kind\":\"prefix\"}')",
-                (new_opaque_id(), page_type_id.to_string()),
+                "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 0, ?3)",
+                (
+                    new_opaque_id(),
+                    page_type_id.to_string(),
+                    serde_json::to_string(&UrlMatcher::path_prefix(None, "/catalog"))?,
+                ),
             )
             .await?;
         connection
@@ -3559,6 +3628,7 @@ mod tests {
                 )
                 .await?;
             for ordinal in 0..2_i64 {
+                let matcher = UrlMatcher::path_prefix(None, format!("/page-{index}/{ordinal}"));
                 connection
                     .execute(
                         "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
@@ -3566,11 +3636,7 @@ mod tests {
                             new_opaque_id(),
                             page_id.to_string(),
                             ordinal,
-                            serde_json::json!({
-                                "page_type_id": page_id.to_string(),
-                                "next_page_type_id": next_page_id.to_string(),
-                            })
-                            .to_string(),
+                            serde_json::to_string(&matcher)?,
                         ),
                     )
                     .await?;
@@ -4170,17 +4236,15 @@ mod tests {
                 "2026-08-25T02:02:00Z",
             )
             .await?;
-        let connection = database.connection().await?;
-        connection
-            .execute(
-                "INSERT INTO seeds (id, crawler_version_id, original_url, canonical_url, enabled, label, entry_page_type_hint_id) VALUES (?1, ?2, ?3, ?3, 1, NULL, ?4)",
-                (
-                    new_opaque_id(),
-                    draft.id().to_string(),
-                    "https://example.test/seeded",
-                    page.id.to_string(),
-                ),
-            )
+        let mut version = repository.version(crawler.id(), draft.id()).await?.version;
+        let mut seed = Seed::new(
+            "https://example.test/seeded".parse()?,
+            "https://example.test/seeded".parse()?,
+        );
+        seed.entry_page_type_hint = Some(page.id);
+        version.add_seed(seed)?;
+        repository
+            .save_draft(&version, "operator", "2026-08-25T02:02:30Z")
             .await?;
         assert!(matches!(
             repository
@@ -4195,20 +4259,11 @@ mod tests {
             Err(CrawlerRepositoryError::PageTypeInUse)
         ));
 
-        // Remove the reference through the test-only raw connection and
-        // publish. The migration triggers, rather than the repository, are
-        // the final immutable boundary.
-        connection
-            .execute(
-                "DELETE FROM seeds WHERE crawler_version_id = ?1",
-                [draft.id().to_string()],
-            )
-            .await?;
-        let mut published = draft.clone();
-        published.publish()?;
-        repository
-            .publish_and_activate(&crawler, &published, "operator", "2026-08-25T02:04:00Z")
-            .await?;
+        let published = repository
+            .publish(crawler.id(), draft.id(), "operator", "2026-08-25T02:04:00Z")
+            .await?
+            .version;
+        let connection = database.connection().await?;
         assert!(connection
             .execute(
                 "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'blocked', 0, '{}')",
@@ -4270,40 +4325,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_persisted_matcher_is_corruption_not_not_found()
+    async fn semantically_invalid_persisted_matchers_are_corrupt_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for matcher_json in [
+            r#"{"Regex":{"pattern":"["}}"#,
+            r#"{"PathGlob":{"host":null,"pattern":""}}"#,
+            r#"{"PathPrefix":{"host":null,"prefix":"products"}}"#,
+            r#"{"ExactHostPathTemplate":{"host":"bad host","path_template":"/products/{id}","query":{}}}"#,
+            r#"{"ExactHostPathTemplate":{"host":"example.test","path_template":"/products/{id","query":{}}}"#,
+        ] {
+            let database = database().await?;
+            let repository = CrawlerRepository::new(&database);
+            let crawler = Crawler::new("Malformed matcher");
+            repository.create(&crawler).await?;
+            let draft = repository
+                .create_draft(crawler.id(), "operator", "2026-08-25T03:00:00Z")
+                .await?;
+            let page = repository
+                .create_page_type(
+                    crawler.id(),
+                    draft.id(),
+                    "Broken",
+                    0,
+                    "operator",
+                    "2026-08-25T03:01:00Z",
+                )
+                .await?;
+            let connection = database.connection().await?;
+            connection
+                .execute(
+                    "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 0, ?3)",
+                    (new_opaque_id(), page.id.to_string(), matcher_json),
+                )
+                .await?;
+            assert!(matches!(
+                repository.list_page_types(crawler.id(), draft.id()).await,
+                Err(CrawlerRepositoryError::CorruptState)
+            ));
+            assert!(matches!(
+                repository
+                    .configuration_hash(crawler.id(), draft.id())
+                    .await,
+                Err(CrawlerRepositoryError::CorruptState)
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_write_rejects_an_invalid_legacy_matcher_value()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let repository = CrawlerRepository::new(&database);
-        let crawler = Crawler::new("Malformed matcher");
+        let crawler = Crawler::new("Invalid direct matcher");
         repository.create(&crawler).await?;
         let draft = repository
-            .create_draft(crawler.id(), "operator", "2026-08-25T03:00:00Z")
+            .create_draft(crawler.id(), "operator", "2026-08-25T03:10:00Z")
             .await?;
         let page = repository
             .create_page_type(
                 crawler.id(),
                 draft.id(),
-                "Broken",
+                "Products",
                 0,
                 "operator",
-                "2026-08-25T03:01:00Z",
+                "2026-08-25T03:11:00Z",
             )
             .await?;
+        let invalid = UrlMatcher::path_prefix(Some("bad host".into()), "products");
+        assert!(matches!(
+            repository
+                .create_url_matcher(
+                    crawler.id(),
+                    draft.id(),
+                    page.id,
+                    &invalid,
+                    "operator",
+                    "2026-08-25T03:12:00Z",
+                )
+                .await,
+            Err(CrawlerRepositoryError::InvalidUrlMatcherDefinition)
+        ));
+        assert!(
+            repository
+                .list_url_matchers(crawler.id(), draft.id(), page.id)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn matcher_ordinal_is_presentation_only_but_definition_and_multiplicity_hash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let crawler = Crawler::new("Matcher ordinal semantics");
+        repository.create(&crawler).await?;
+        let draft = repository
+            .create_draft(crawler.id(), "operator", "2026-08-25T03:20:00Z")
+            .await?;
+        let page = repository
+            .create_page_type(
+                crawler.id(),
+                draft.id(),
+                "Products",
+                0,
+                "operator",
+                "2026-08-25T03:21:00Z",
+            )
+            .await?;
+        let prefix = repository
+            .create_url_matcher(
+                crawler.id(),
+                draft.id(),
+                page.id,
+                &UrlMatcher::path_prefix(Some("example.test".into()), "/products"),
+                "operator",
+                "2026-08-25T03:22:00Z",
+            )
+            .await?;
+        let exact = repository
+            .create_url_matcher(
+                crawler.id(),
+                draft.id(),
+                page.id,
+                &UrlMatcher::exact_url("https://example.test/products/42".parse()?),
+                "operator",
+                "2026-08-25T03:23:00Z",
+            )
+            .await?;
+        let target: url::Url = "https://example.test/products/42".parse()?;
+        let before_decision = resolve_page_type(
+            &target,
+            &repository
+                .list_page_types(crawler.id(), draft.id())
+                .await?
+                .iter()
+                .map(PageTypeRecord::domain_page_type)
+                .collect::<Vec<_>>(),
+        );
+        let before_hash = repository
+            .configuration_hash(crawler.id(), draft.id())
+            .await?;
+
         let connection = database.connection().await?;
         connection
             .execute(
-                "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 0, ?3)",
+                "UPDATE url_matchers SET ordinal = CASE id WHEN ?1 THEN 10 WHEN ?2 THEN 0 END WHERE id IN (?1, ?2)",
+                (prefix.id.as_str(), exact.id.as_str()),
+            )
+            .await?;
+        let after_hash = repository
+            .configuration_hash(crawler.id(), draft.id())
+            .await?;
+        assert_eq!(before_hash, after_hash);
+        let ordered = repository
+            .list_url_matchers(crawler.id(), draft.id(), page.id)
+            .await?;
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|matcher| matcher.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![exact.id.as_str(), prefix.id.as_str()]
+        );
+        let after_decision = resolve_page_type(
+            &target,
+            &repository
+                .list_page_types(crawler.id(), draft.id())
+                .await?
+                .iter()
+                .map(PageTypeRecord::domain_page_type)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(before_decision, after_decision);
+
+        connection
+            .execute(
+                "UPDATE url_matchers SET matcher_json = ?1 WHERE id = ?2",
                 (
-                    new_opaque_id(),
-                    page.id.to_string(),
-                    r#"{"Regex":{"pattern":"["}}"#,
+                    serde_json::to_string(&UrlMatcher::exact_url(
+                        "https://example.test/products/99".parse()?,
+                    ))?,
+                    exact.id.as_str(),
                 ),
             )
             .await?;
-        assert!(matches!(
-            repository.list_page_types(crawler.id(), draft.id()).await,
-            Err(CrawlerRepositoryError::CorruptState)
-        ));
+        let definition_hash = repository
+            .configuration_hash(crawler.id(), draft.id())
+            .await?;
+        assert_ne!(after_hash, definition_hash);
+
+        connection
+            .execute(
+                "DELETE FROM url_matchers WHERE id = ?1",
+                [exact.id.as_str()],
+            )
+            .await?;
+        assert_ne!(
+            definition_hash,
+            repository
+                .configuration_hash(crawler.id(), draft.id())
+                .await?
+        );
         Ok(())
     }
 }
