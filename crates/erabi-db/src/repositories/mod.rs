@@ -20,7 +20,7 @@ pub use checkpoint::{
 pub use configuration::ConfigurationRepository;
 pub use crawler::{
     CrawlerAuditMetadata, CrawlerPointers, CrawlerRepository, CrawlerRepositoryError,
-    CrawlerVersionRecord,
+    CrawlerVersionRecord, PageTypeRecord, UrlMatcherRecord,
 };
 pub use identity::JobIdParseError;
 pub use job::{

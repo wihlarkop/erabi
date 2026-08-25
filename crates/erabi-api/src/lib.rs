@@ -8,6 +8,7 @@ mod app;
 mod crawler_authoring;
 mod error;
 mod job_actions;
+mod page_type_authoring;
 mod progress;
 mod redaction;
 mod run_safety;

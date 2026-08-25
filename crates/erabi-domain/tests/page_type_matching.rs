@@ -143,3 +143,197 @@ fn equal_best_matcher_evidence_is_order_independent() -> Result<(), Box<dyn std:
     }
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn specificity_components_are_compared_in_the_frozen_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let exact_host = PageType::new(
+        "Template",
+        0,
+        vec![UrlMatcher::exact_host_path_template(
+            "example.test",
+            "/products/{id}/reviews",
+            BTreeMap::from([("locale".into(), "en".into())]),
+        )],
+    );
+    let prefix = PageType::new(
+        "Prefix",
+        0,
+        vec![UrlMatcher::path_prefix(
+            Some("example.test".into()),
+            "/products",
+        )],
+    );
+    let regex = PageType::new("Regex", 0, vec![UrlMatcher::regex("products")?]);
+    let decision = resolve_page_type(
+        &"https://example.test/products/42/reviews?locale=en".parse()?,
+        &[regex, prefix, exact_host],
+    );
+    assert!(matches!(
+        decision,
+        PageTypeMatchDecision::Matched(candidate) if candidate.page_type_name == "Template"
+    ));
+
+    let high_priority_prefix = PageType::new(
+        "High priority",
+        10,
+        vec![UrlMatcher::path_prefix(
+            Some("example.test".into()),
+            "/products",
+        )],
+    );
+    let low_priority_exact = PageType::new(
+        "Low priority",
+        0,
+        vec![UrlMatcher::exact_url(
+            "https://example.test/products/42/reviews?locale=en".parse()?,
+        )],
+    );
+    assert!(matches!(
+        resolve_page_type(
+            &"https://example.test/products/42/reviews?locale=en".parse()?,
+            &[low_priority_exact, high_priority_prefix],
+        ),
+        PageTypeMatchDecision::Matched(candidate) if candidate.page_type_name == "High priority"
+    ));
+
+    let more_literals = PageType::new(
+        "More literals",
+        0,
+        vec![UrlMatcher::exact_host_path_template(
+            "example.test",
+            "/products/{id}/reviews",
+            BTreeMap::new(),
+        )],
+    );
+    let fewer_literals = PageType::new(
+        "Fewer literals",
+        0,
+        vec![UrlMatcher::exact_host_path_template(
+            "example.test",
+            "/products/{id}/{section}",
+            BTreeMap::new(),
+        )],
+    );
+    assert!(matches!(
+        resolve_page_type(
+            &"https://example.test/products/42/reviews".parse()?,
+            &[fewer_literals, more_literals],
+        ),
+        PageTypeMatchDecision::Matched(candidate) if candidate.page_type_name == "More literals"
+    ));
+
+    let more_query = PageType::new(
+        "More query",
+        0,
+        vec![UrlMatcher::exact_host_path_template(
+            "example.test",
+            "/products/{id}",
+            BTreeMap::from([
+                ("locale".into(), "en".into()),
+                ("view".into(), "full".into()),
+            ]),
+        )],
+    );
+    let less_query = PageType::new(
+        "Less query",
+        0,
+        vec![UrlMatcher::exact_host_path_template(
+            "example.test",
+            "/products/{id}",
+            BTreeMap::from([("locale".into(), "en".into())]),
+        )],
+    );
+    assert!(matches!(
+        resolve_page_type(
+            &"https://example.test/products/42?locale=en&view=full".parse()?,
+            &[less_query, more_query],
+        ),
+        PageTypeMatchDecision::Matched(candidate) if candidate.page_type_name == "More query"
+    ));
+
+    let more_literals_regex = PageType::new(
+        "More regex literals",
+        0,
+        vec![UrlMatcher::regex(r"/products/[0-9]+")?],
+    );
+    let fewer_literals_regex = PageType::new(
+        "Fewer regex literals",
+        0,
+        vec![UrlMatcher::regex(r"/products/.+")?],
+    );
+    assert!(matches!(
+        resolve_page_type(
+            &"https://example.test/products/42".parse()?,
+            &[fewer_literals_regex, more_literals_regex],
+        ),
+        PageTypeMatchDecision::Matched(candidate) if candidate.page_type_name == "More regex literals"
+    ));
+
+    let fewer_wildcards = PageType::new(
+        "Fewer wildcards",
+        0,
+        vec![UrlMatcher::path_glob(None, "/products/*")?],
+    );
+    let more_wildcards = PageType::new(
+        "More wildcards",
+        0,
+        vec![UrlMatcher::path_glob(None, "/products/**")?],
+    );
+    assert!(matches!(
+        resolve_page_type(
+            &"https://example.test/products/42".parse()?,
+            &[more_wildcards, fewer_wildcards],
+        ),
+        PageTypeMatchDecision::Matched(candidate) if candidate.page_type_name == "Fewer wildcards"
+    ));
+    Ok(())
+}
+
+#[test]
+fn reverse_page_type_order_preserves_winner_and_all_ties() -> Result<(), Box<dyn std::error::Error>>
+{
+    let a = PageType::new(
+        "Same name",
+        5,
+        vec![UrlMatcher::path_prefix(
+            Some("example.test".into()),
+            "/same",
+        )],
+    );
+    let b = PageType {
+        id: erabi_domain::PageTypeId::new(),
+        name: a.name.clone(),
+        priority: a.priority,
+        matchers: a.matchers.clone(),
+    };
+    let forward = resolve_page_type(
+        &"https://example.test/same/page".parse()?,
+        &[a.clone(), b.clone()],
+    );
+    let reverse = resolve_page_type(&"https://example.test/same/page".parse()?, &[b, a]);
+    assert!(
+        matches!(forward, PageTypeMatchDecision::Ambiguous { ref candidates } if candidates.len() == 2)
+    );
+    assert!(
+        matches!(reverse, PageTypeMatchDecision::Ambiguous { ref candidates } if candidates.len() == 2)
+    );
+    assert_eq!(
+        match forward {
+            PageTypeMatchDecision::Ambiguous { candidates } => candidates
+                .into_iter()
+                .map(|candidate| candidate.page_type_id.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            _ => unreachable!(),
+        },
+        match reverse {
+            PageTypeMatchDecision::Ambiguous { candidates } => candidates
+                .into_iter()
+                .map(|candidate| candidate.page_type_id.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            _ => unreachable!(),
+        }
+    );
+    Ok(())
+}

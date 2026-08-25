@@ -406,6 +406,11 @@ fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
             "VERSION_NOT_DRAFT",
             "Only a Draft can be published.",
         ),
+        CrawlerRepositoryError::VersionNotActiveDraft => (
+            StatusCode::CONFLICT,
+            "VERSION_NOT_ACTIVE_DRAFT",
+            "Only the active Draft can be mutated.",
+        ),
         CrawlerRepositoryError::VersionNotPublished => (
             StatusCode::CONFLICT,
             "VERSION_NOT_PUBLISHED",
@@ -415,6 +420,31 @@ fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
             StatusCode::CONFLICT,
             "PUBLISHED_VERSION_IMMUTABLE",
             "Published CrawlerVersions are immutable.",
+        ),
+        CrawlerRepositoryError::PageTypeNotFound => (
+            StatusCode::NOT_FOUND,
+            "PAGE_TYPE_NOT_FOUND",
+            "The requested PageType does not exist.",
+        ),
+        CrawlerRepositoryError::PageTypeNotOwnedByVersion => (
+            StatusCode::CONFLICT,
+            "PAGE_TYPE_NOT_OWNED_BY_VERSION",
+            "The PageType does not belong to this CrawlerVersion.",
+        ),
+        CrawlerRepositoryError::PageTypeInUse => (
+            StatusCode::CONFLICT,
+            "PAGE_TYPE_IN_USE",
+            "The PageType is still referenced by the Draft configuration.",
+        ),
+        CrawlerRepositoryError::UrlMatcherNotFound => (
+            StatusCode::NOT_FOUND,
+            "URL_MATCHER_NOT_FOUND",
+            "The requested URLMatcher does not exist.",
+        ),
+        CrawlerRepositoryError::UrlMatcherNotOwnedByPageType => (
+            StatusCode::CONFLICT,
+            "URL_MATCHER_NOT_OWNED_BY_PAGE_TYPE",
+            "The URLMatcher does not belong to this PageType.",
         ),
         CrawlerRepositoryError::InvalidLifecycleTransition => (
             StatusCode::CONFLICT,

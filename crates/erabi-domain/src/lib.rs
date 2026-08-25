@@ -41,4 +41,4 @@ pub use source::Source;
 pub use status::{CrawlRunStatus, CrawlRunType, SourceStatus, SourceTargetType};
 pub use test_evidence::TestEvidence;
 pub use transition::{DiscoveryTransition, TransitionBudget};
-pub use url_matcher::{SpecificityKey, UrlMatcher, UrlMatcherKind};
+pub use url_matcher::{SpecificityKey, UrlMatcher, UrlMatcherDefinition, UrlMatcherKind};

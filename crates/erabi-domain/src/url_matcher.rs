@@ -31,6 +31,43 @@ pub struct SpecificityKey {
     pub literal_characters: u32,
     pub inverse_wildcards: Reverse<u32>,
 }
+
+impl SpecificityKey {
+    /// Returns the user-facing wildcard/capture count represented by the
+    /// inverse value used for lexicographic resolution.
+    #[must_use]
+    pub const fn wildcard_capture_count(self) -> u32 {
+        self.inverse_wildcards.0
+    }
+}
+
+/// A typed, non-serde view of a validated URL matcher definition.
+///
+/// The private serde representation remains an implementation detail of the
+/// durable domain contract. API layers can use this view to expose their own
+/// stable transport representation without leaking that serde layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UrlMatcherDefinition {
+    ExactUrl {
+        url: url::Url,
+    },
+    ExactHostPathTemplate {
+        host: String,
+        path_template: String,
+        query: BTreeMap<String, String>,
+    },
+    PathPrefix {
+        host: Option<String>,
+        prefix: String,
+    },
+    PathGlob {
+        host: Option<String>,
+        pattern: String,
+    },
+    Regex {
+        pattern: String,
+    },
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Definition {
     ExactUrl {
@@ -148,6 +185,33 @@ impl UrlMatcher {
                 UrlMatcherKind::PathPrefixOrGlob
             }
             Definition::Regex { .. } => UrlMatcherKind::Regex,
+        }
+    }
+    /// Returns a typed view of the matcher without exposing its serde shape.
+    #[must_use]
+    pub fn definition(&self) -> UrlMatcherDefinition {
+        match &self.definition {
+            Definition::ExactUrl { url } => UrlMatcherDefinition::ExactUrl { url: url.clone() },
+            Definition::ExactHostPathTemplate {
+                host,
+                path_template,
+                query,
+            } => UrlMatcherDefinition::ExactHostPathTemplate {
+                host: host.clone(),
+                path_template: path_template.clone(),
+                query: query.clone(),
+            },
+            Definition::PathPrefix { host, prefix } => UrlMatcherDefinition::PathPrefix {
+                host: host.clone(),
+                prefix: prefix.clone(),
+            },
+            Definition::PathGlob { host, pattern } => UrlMatcherDefinition::PathGlob {
+                host: host.clone(),
+                pattern: pattern.clone(),
+            },
+            Definition::Regex { pattern } => UrlMatcherDefinition::Regex {
+                pattern: pattern.clone(),
+            },
         }
     }
     #[must_use]

@@ -9,6 +9,7 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -24,6 +25,11 @@ use crate::{
         cancel as cancel_job, remove as remove_job, reprioritize as reprioritize_job,
         rerun_full_crawl, restart as restart_job, resume as resume_job, retry as retry_job,
         retry_failed_parts,
+    },
+    page_type_authoring::{
+        create_matcher, create_page_type, delete_matcher, delete_page_type, list_matchers,
+        list_page_types, match_page_type, read_matcher, read_page_type, update_matcher,
+        update_page_type,
     },
     progress::job_progress_sse,
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
@@ -85,6 +91,26 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate",
             post(reactivate_version),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types",
+            get(list_page_types).post(create_page_type),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}",
+            get(read_page_type).put(update_page_type).delete(delete_page_type),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers",
+            get(list_matchers).post(create_matcher),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers/{matcher_id}",
+            get(read_matcher).put(update_matcher).delete(delete_matcher),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/match-page-type",
+            post(match_page_type),
         )
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
         .route(
@@ -322,6 +348,12 @@ struct OpenApiDocument {
     openapi: &'static str,
     info: OpenApiInfo,
     paths: BTreeMap<&'static str, OpenApiPath>,
+    components: OpenApiComponents,
+}
+
+#[derive(Serialize)]
+struct OpenApiComponents {
+    schemas: BTreeMap<&'static str, Value>,
 }
 
 impl OpenApiDocument {
@@ -362,6 +394,26 @@ impl OpenApiDocument {
             OpenApiPath::post("Reactivate a historical Published version"),
         );
         paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types",
+            OpenApiPath::get_post("List or create PageTypes"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}",
+            OpenApiPath::get_put_delete("Read, update, or delete a PageType"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers",
+            OpenApiPath::get_post("List or create typed URLMatchers"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers/{matcher_id}",
+            OpenApiPath::get_put_delete("Read, update, or delete a URLMatcher"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/match-page-type",
+            OpenApiPath::post("Explain deterministic PageType matching"),
+        );
+        paths.insert(
             "/api/v1/events/jobs/{job_id}/progress",
             OpenApiPath::get("Replayable job progress stream"),
         );
@@ -394,6 +446,9 @@ impl OpenApiDocument {
                 version: env!("CARGO_PKG_VERSION"),
             },
             paths,
+            components: OpenApiComponents {
+                schemas: task2_openapi_schemas(),
+            },
         }
     }
 }
@@ -411,6 +466,8 @@ struct OpenApiPath {
     #[serde(skip_serializing_if = "Option::is_none")]
     post: Option<OpenApiOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    put: Option<OpenApiOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     delete: Option<OpenApiOperation>,
 }
 
@@ -419,6 +476,7 @@ impl OpenApiPath {
         Self {
             get: Some(OpenApiOperation { summary }),
             post: None,
+            put: None,
             delete: None,
         }
     }
@@ -427,6 +485,7 @@ impl OpenApiPath {
         Self {
             get: None,
             post: Some(OpenApiOperation { summary }),
+            put: None,
             delete: None,
         }
     }
@@ -435,7 +494,17 @@ impl OpenApiPath {
         Self {
             get: Some(OpenApiOperation { summary }),
             post: Some(OpenApiOperation { summary }),
+            put: None,
             delete: None,
+        }
+    }
+
+    const fn get_put_delete(summary: &'static str) -> Self {
+        Self {
+            get: Some(OpenApiOperation { summary }),
+            post: None,
+            put: Some(OpenApiOperation { summary }),
+            delete: Some(OpenApiOperation { summary }),
         }
     }
 
@@ -443,6 +512,7 @@ impl OpenApiPath {
         Self {
             get: None,
             post: None,
+            put: None,
             delete: Some(OpenApiOperation { summary }),
         }
     }
@@ -451,4 +521,115 @@ impl OpenApiPath {
 #[derive(Serialize)]
 struct OpenApiOperation {
     summary: &'static str,
+}
+
+#[allow(clippy::too_many_lines)]
+fn task2_openapi_schemas() -> BTreeMap<&'static str, Value> {
+    let mut schemas = BTreeMap::new();
+    let matcher_variants = vec![
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "url"],
+            "properties": {
+                "kind": {"const": "EXACT_URL"},
+                "url": {"type": "string", "format": "uri"}
+            }
+        }),
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "host", "path_template", "query"],
+            "properties": {
+                "kind": {"const": "EXACT_HOST_PATH_TEMPLATE"},
+                "host": {"type": "string"},
+                "path_template": {"type": "string"},
+                "query": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "prefix"],
+            "properties": {
+                "kind": {"const": "PATH_PREFIX"},
+                "host": {"type": ["string", "null"]},
+                "prefix": {"type": "string"}
+            }
+        }),
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "pattern"],
+            "properties": {
+                "kind": {"const": "PATH_GLOB"},
+                "host": {"type": ["string", "null"]},
+                "pattern": {"type": "string"}
+            }
+        }),
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "pattern"],
+            "properties": {
+                "kind": {"const": "REGEX"},
+                "pattern": {"type": "string"}
+            }
+        }),
+    ];
+    schemas.insert(
+        "PageTypeRequest",
+        serde_json::json!({
+            "type": "object",
+            "required": ["name", "priority"],
+            "properties": {"name": {"type": "string", "maxLength": 256}, "priority": {"type": "integer"}}
+        }),
+    );
+    schemas.insert(
+        "UrlMatcherRequest",
+        serde_json::json!({"oneOf": matcher_variants.clone()}),
+    );
+    let matcher_response_variants = matcher_variants
+        .iter()
+        .map(|variant| {
+            serde_json::json!({
+                "allOf": [
+                    variant,
+                    {"type": "object", "required": ["id", "ordinal"], "properties": {"id": {"type": "string", "format": "uuid"}, "ordinal": {"type": "integer", "minimum": 0}}}
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    schemas.insert(
+        "UrlMatcherResponse",
+        serde_json::json!({
+            "description": "The typed matcher variants above plus application id and presentation ordinal.",
+            "oneOf": matcher_response_variants
+        }),
+    );
+    schemas.insert(
+        "PageTypeResponse",
+        serde_json::json!({
+            "type": "object",
+            "required": ["id", "crawler_version_id", "name", "priority", "matchers"],
+            "properties": {"id": {"type": "string", "format": "uuid"}, "crawler_version_id": {"type": "string", "format": "uuid"}, "name": {"type": "string"}, "priority": {"type": "integer"}, "matchers": {"type": "array", "items": {"$ref": "#/components/schemas/UrlMatcherResponse"}}}
+        }),
+    );
+    schemas.insert(
+        "MatchCandidate",
+        serde_json::json!({
+            "type": "object",
+            "required": ["page_type_id", "page_type_name", "explicit_priority", "best_matcher_kind", "matcher_kind_rank", "best_matched_patterns", "literal_path_segments", "explicit_query_constraints", "literal_characters", "wildcard_capture_count"],
+            "properties": {"page_type_id": {"type": "string", "format": "uuid"}, "page_type_name": {"type": "string"}, "explicit_priority": {"type": "integer"}, "best_matcher_kind": {"type": "string"}, "matcher_kind_rank": {"type": "integer"}, "best_matched_patterns": {"type": "array", "items": {"type": "string"}}, "literal_path_segments": {"type": "integer"}, "explicit_query_constraints": {"type": "integer"}, "literal_characters": {"type": "integer"}, "wildcard_capture_count": {"type": "integer"}}
+        }),
+    );
+    schemas.insert(
+        "MatchDecision",
+        serde_json::json!({
+            "oneOf": [
+                {"type": "object", "required": ["decision", "candidate", "candidates"], "properties": {"decision": {"const": "MATCHED"}, "candidate": {"$ref": "#/components/schemas/MatchCandidate"}, "candidates": {"type": "array", "maxItems": 0}}},
+                {"type": "object", "required": ["decision", "candidate", "candidates"], "properties": {"decision": {"const": "AMBIGUOUS_PAGE_TYPE"}, "candidate": {"type": "null"}, "candidates": {"type": "array", "minItems": 2, "items": {"$ref": "#/components/schemas/MatchCandidate"}}}},
+                {"type": "object", "required": ["decision", "candidate", "candidates"], "properties": {"decision": {"const": "UNMATCHED"}, "candidate": {"type": "null"}, "candidates": {"type": "array", "maxItems": 0}}}
+            ]
+        }),
+    );
+    schemas
 }
