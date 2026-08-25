@@ -5,6 +5,7 @@
 //! crates rather than being recreated in HTTP handlers.
 
 mod app;
+mod crawler_authoring;
 mod error;
 mod job_actions;
 mod progress;

@@ -15,6 +15,10 @@ use uuid::Uuid;
 
 use crate::{
     AppState, Crawl4AiAvailability, MutationAdmission, RuntimeMode, SecurityConfig,
+    crawler_authoring::{
+        create_crawler, create_draft, list_crawlers, list_versions, publish_version,
+        reactivate_version, read_crawler, read_version,
+    },
     error::{ApiErrorEnvelope, error_response},
     job_actions::{
         cancel as cancel_job, remove as remove_job, reprioritize as reprioritize_job,
@@ -66,6 +70,22 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .merge(documentation)
         .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
+        .route("/api/v1/crawlers", get(list_crawlers).post(create_crawler))
+        .route("/api/v1/crawlers/{crawler_id}", get(read_crawler))
+        .route("/api/v1/crawlers/{crawler_id}/versions", get(list_versions))
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}",
+            get(read_version),
+        )
+        .route("/api/v1/crawlers/{crawler_id}/drafts", post(create_draft))
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish",
+            post(publish_version),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate",
+            post(reactivate_version),
+        )
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
         .route(
             "/api/v1/events/jobs/{job_id}/progress",
@@ -314,6 +334,34 @@ impl OpenApiDocument {
             OpenApiPath::get("Safe runtime diagnostics"),
         );
         paths.insert(
+            "/api/v1/crawlers",
+            OpenApiPath::get_post("List or create Crawlers"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}",
+            OpenApiPath::get("Read a Crawler"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions",
+            OpenApiPath::get("List CrawlerVersions"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}",
+            OpenApiPath::get("Read a CrawlerVersion"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/drafts",
+            OpenApiPath::post("Create an active Draft"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish",
+            OpenApiPath::post("Publish the active Draft"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate",
+            OpenApiPath::post("Reactivate a historical Published version"),
+        );
+        paths.insert(
             "/api/v1/events/jobs/{job_id}/progress",
             OpenApiPath::get("Replayable job progress stream"),
         );
@@ -378,6 +426,14 @@ impl OpenApiPath {
     const fn post(summary: &'static str) -> Self {
         Self {
             get: None,
+            post: Some(OpenApiOperation { summary }),
+            delete: None,
+        }
+    }
+
+    const fn get_post(summary: &'static str) -> Self {
+        Self {
+            get: Some(OpenApiOperation { summary }),
             post: Some(OpenApiOperation { summary }),
             delete: None,
         }

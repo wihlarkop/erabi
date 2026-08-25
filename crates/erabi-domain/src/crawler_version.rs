@@ -144,9 +144,48 @@ impl CrawlerVersion {
                 "only published crawler versions can create drafts",
             ));
         }
-        let mut clone = self.clone();
-        clone.id = CrawlerVersionId::new();
-        clone.state = CrawlerVersionState::Draft;
+        let source_page_type_ids = self.page_type_ids.clone();
+        if self.seeds.iter().any(|seed| {
+            seed.entry_page_type_hint
+                .is_some_and(|hint| !source_page_type_ids.contains(&hint))
+        }) {
+            return Err(ProductError::conflict(
+                "published seed references a missing Page Type",
+            ));
+        }
+        let mut clone = Self {
+            id: CrawlerVersionId::new(),
+            crawler_id: self.crawler_id,
+            state: CrawlerVersionState::Draft,
+            seeds: self.seeds.clone(),
+            page_type_ids: self.page_type_ids.clone(),
+            transition_ids: self.transition_ids.clone(),
+            canonicalization_policy_id: self.canonicalization_policy_id,
+            domain_scope_id: self.domain_scope_id,
+        };
+        for seed in &mut clone.seeds {
+            seed.id = crate::SeedId::new();
+        }
+        let seed_hint_indexes = clone
+            .seeds
+            .iter()
+            .map(|seed| {
+                seed.entry_page_type_hint.and_then(|hint| {
+                    source_page_type_ids
+                        .iter()
+                        .position(|source| *source == hint)
+                })
+            })
+            .collect::<Vec<_>>();
+        for page_type_id in &mut clone.page_type_ids {
+            *page_type_id = crate::PageTypeId::new();
+        }
+        for (seed, hint_index) in clone.seeds.iter_mut().zip(seed_hint_indexes) {
+            seed.entry_page_type_hint = hint_index.map(|index| clone.page_type_ids[index]);
+        }
+        for transition_id in &mut clone.transition_ids {
+            *transition_id = crate::DiscoveryTransitionId::new();
+        }
         Ok(clone)
     }
 }

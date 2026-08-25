@@ -18,7 +18,10 @@ pub use checkpoint::{
     MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
 };
 pub use configuration::ConfigurationRepository;
-pub use crawler::{CrawlerPointers, CrawlerRepository};
+pub use crawler::{
+    CrawlerAuditMetadata, CrawlerPointers, CrawlerRepository, CrawlerRepositoryError,
+    CrawlerVersionRecord,
+};
 pub use identity::JobIdParseError;
 pub use job::{
     AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,

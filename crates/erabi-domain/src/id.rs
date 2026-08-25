@@ -9,6 +9,15 @@ macro_rules! typed_uuid_id {
             pub fn new() -> Self {
                 Self(uuid::Uuid::now_v7())
             }
+
+            /// Rehydrates an application-generated `UUIDv7` identity.
+            ///
+            /// Persisted/API identifiers are accepted only when they retain
+            /// Erabi's `UUIDv7` identity contract.
+            #[must_use]
+            pub fn from_uuid(value: uuid::Uuid) -> Option<Self> {
+                (value.get_version_num() == 7).then_some(Self(value))
+            }
             #[must_use]
             pub const fn as_uuid(&self) -> &uuid::Uuid {
                 &self.0

@@ -11,6 +11,8 @@ use erabi_jobs::{
     StoragePressurePolicy, StoragePressureState,
 };
 
+use crate::crawler_authoring::CrawlerAuthoringService;
+
 /// Runtime service mode used to protect mutable surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "mode")]
@@ -90,6 +92,7 @@ pub struct AppState {
     accepting_mutations: Arc<AtomicBool>,
     progress: Option<Arc<ProgressRuntimeState>>,
     job_actions: Option<Arc<JobActionRuntimeState>>,
+    crawler_authoring: Option<Arc<CrawlerAuthoringService>>,
     storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
@@ -112,6 +115,7 @@ impl AppState {
             accepting_mutations: Arc::new(AtomicBool::new(true)),
             progress: None,
             job_actions: None,
+            crawler_authoring: None,
             storage_pressure: None,
         }
     }
@@ -146,9 +150,20 @@ impl AppState {
         self
     }
 
+    /// Attaches the protected Crawler/Draft/Published authoring service.
+    #[must_use]
+    pub fn with_crawler_authoring_runtime(mut self, database: ErabiDatabase) -> Self {
+        self.crawler_authoring = Some(Arc::new(CrawlerAuthoringService::new(database)));
+        self
+    }
+
     #[must_use]
     pub(crate) fn job_actions_runtime(&self) -> Option<Arc<JobActionRuntimeState>> {
         self.job_actions.clone()
+    }
+
+    pub(crate) fn crawler_authoring_runtime(&self) -> Option<Arc<CrawlerAuthoringService>> {
+        self.crawler_authoring.clone()
     }
 
     /// Attaches the typed storage-pressure state shared with worker admission.
