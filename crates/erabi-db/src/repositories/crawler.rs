@@ -207,10 +207,16 @@ impl<'database> CrawlerRepository<'database> {
     ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
         let version = CrawlerVersion::draft(crawler_id);
         let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
+        let transaction = match connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
-            .map_err(Self::database)?;
+        {
+            Ok(transaction) => transaction,
+            Err(error) if is_lifecycle_contention(&error) => {
+                return Err(self.classify_lifecycle_contention(crawler_id, error).await);
+            }
+            Err(error) => return Err(Self::database(error)),
+        };
         let result =
             insert_draft_in_transaction(&transaction, &version, None, actor, occurred_at).await;
         finish_transaction!(transaction, result).map(|()| version)
@@ -224,10 +230,16 @@ impl<'database> CrawlerRepository<'database> {
         occurred_at: &str,
     ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
         let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
+        let transaction = match connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
-            .map_err(Self::database)?;
+        {
+            Ok(transaction) => transaction,
+            Err(error) if is_lifecycle_contention(&error) => {
+                return Err(self.classify_lifecycle_contention(crawler_id, error).await);
+            }
+            Err(error) => return Err(Self::database(error)),
+        };
         let result = clone_draft_in_transaction(
             &transaction,
             crawler_id,
@@ -397,6 +409,33 @@ impl<'database> CrawlerRepository<'database> {
         let record = self.version(crawler_id, version_id).await?;
         semantic_hash(&connection, &record.version).await
     }
+
+    async fn classify_lifecycle_contention(
+        &self,
+        crawler_id: CrawlerId,
+        original_error: turso::Error,
+    ) -> CrawlerRepositoryError {
+        const MAX_CONTENTION_RECHECKS: usize = 4;
+
+        for attempt in 0..MAX_CONTENTION_RECHECKS {
+            tokio::task::yield_now().await;
+            let connection = match self.database.connection().await {
+                Ok(connection) => connection,
+                Err(error) => return CrawlerRepositoryError::database(error),
+            };
+            match active_draft_for(&connection, crawler_id).await {
+                Ok(Some(_)) => return CrawlerRepositoryError::ActiveDraftExists,
+                Ok(None) if attempt + 1 == MAX_CONTENTION_RECHECKS => break,
+                Ok(None) => {}
+                Err(error) => return error,
+            }
+        }
+        CrawlerRepositoryError::database(original_error)
+    }
+}
+
+fn is_lifecycle_contention(error: &turso::Error) -> bool {
+    matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 }
 
 async fn insert_draft_in_transaction(
@@ -885,9 +924,12 @@ async fn audit_metadata(
         let payload_json: String = row.get(3).map_err(CrawlerRepositoryError::database)?;
         let payload: Value = serde_json::from_str(&payload_json)
             .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-        metadata.actor = Some(actor);
-        metadata.occurred_at = Some(occurred_at);
         if event_type == "CRAWLER_DRAFT_CREATED" || event_type == "CRAWLER_VERSION_PUBLISHED" {
+            // This DTO projects the creation/publication record, not the latest
+            // lifecycle event. Reactivation remains durably auditable without
+            // mixing its actor/time with publication-only metadata.
+            metadata.actor = Some(actor);
+            metadata.occurred_at = Some(occurred_at);
             metadata.config_hash = payload
                 .get("config_hash")
                 .and_then(Value::as_str)
@@ -1171,40 +1213,6 @@ async fn semantic_hash(
     connection: &Connection,
     version: &CrawlerVersion,
 ) -> Result<String, CrawlerRepositoryError> {
-    let mut identity_ids = BTreeSet::new();
-    identity_ids.insert(version.id().to_string());
-    identity_ids.insert(version.crawler_id().to_string());
-    identity_ids.extend(version.seeds().iter().map(|seed| seed.id.to_string()));
-    identity_ids.extend(version.page_type_ids().iter().map(ToString::to_string));
-    identity_ids.extend(version.transition_ids().iter().map(ToString::to_string));
-    collect_child_identity_ids(
-        connection,
-        "SELECT id FROM seeds WHERE crawler_version_id = ?1",
-        version.id(),
-        &mut identity_ids,
-    )
-    .await?;
-    collect_child_identity_ids(
-        connection,
-        "SELECT id FROM page_types WHERE crawler_version_id = ?1",
-        version.id(),
-        &mut identity_ids,
-    )
-    .await?;
-    collect_child_identity_ids(
-        connection,
-        "SELECT url_matchers.id FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1",
-        version.id(),
-        &mut identity_ids,
-    )
-    .await?;
-    collect_child_identity_ids(
-        connection,
-        "SELECT id FROM discovery_transitions WHERE crawler_version_id = ?1",
-        version.id(),
-        &mut identity_ids,
-    )
-    .await?;
     let mut version_json = serde_json::to_value(version).map_err(|error| {
         CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
     })?;
@@ -1212,68 +1220,41 @@ async fn semantic_hash(
         object.remove("id");
         object.remove("crawler_id");
         object.remove("state");
-        object.remove("page_type_ids");
-        object.remove("transition_ids");
-        if let Some(Value::Array(seeds)) = object.get_mut("seeds") {
-            for seed in &mut *seeds {
-                if let Value::Object(seed) = seed {
-                    seed.remove("id");
-                    if seed.contains_key("entry_page_type_hint") {
-                        seed.insert("entry_page_type_hint".into(), Value::Bool(true));
-                    }
-                }
-            }
-            seeds.sort_by_key(canonical_sort_key);
-        }
-        object.insert(
-            "declared_page_type_count".into(),
-            Value::from(version.page_type_ids().len()),
-        );
-        object.insert(
-            "declared_transition_count".into(),
-            Value::from(version.transition_ids().len()),
-        );
-        object.insert(
-            "canonicalization_configured".into(),
-            Value::Bool(version.canonicalization_policy_id().is_some()),
-        );
-        object.insert(
-            "domain_scope_configured".into(),
-            Value::Bool(version.domain_scope_id().is_some()),
-        );
     }
 
     let seeds = child_values(
         connection,
-        "SELECT original_url, canonical_url, enabled, label, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1 ORDER BY id",
+        "SELECT id, original_url, canonical_url, enabled, label, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1",
         version.id(),
         |row| {
             let mut object = Map::new();
             object.insert(
-                "original_url".into(),
+                "id".into(),
                 Value::String(row.get(0).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
-                "canonical_url".into(),
+                "original_url".into(),
                 Value::String(row.get(1).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
+                "canonical_url".into(),
+                Value::String(row.get(2).map_err(CrawlerRepositoryError::database)?),
+            );
+            object.insert(
                 "enabled".into(),
-                Value::from(row.get::<i64>(2).map_err(CrawlerRepositoryError::database)?),
+                Value::from(row.get::<i64>(3).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
                 "label".into(),
-                row.get::<Option<String>>(3)
+                row.get::<Option<String>>(4)
                     .map_err(CrawlerRepositoryError::database)?
                     .map_or(Value::Null, Value::String),
             );
             object.insert(
                 "entry_page_type_hint".into(),
-                Value::Bool(
-                    row.get::<Option<String>>(4)
-                        .map_err(CrawlerRepositoryError::database)?
-                        .is_some(),
-                ),
+                row.get::<Option<String>>(5)
+                    .map_err(CrawlerRepositoryError::database)?
+                    .map_or(Value::Null, Value::String),
             );
             Ok(Value::Object(object))
         },
@@ -1281,22 +1262,24 @@ async fn semantic_hash(
     .await?;
     let pages = child_values(
         connection,
-        "SELECT name, priority, configuration_json FROM page_types WHERE crawler_version_id = ?1 ORDER BY id",
+        "SELECT id, name, priority, configuration_json FROM page_types WHERE crawler_version_id = ?1",
         version.id(),
         |row| {
-            let configuration: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
+            let configuration: String = row.get(3).map_err(CrawlerRepositoryError::database)?;
             let configuration = serde_json::from_str::<Value>(&configuration)
                 .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-            let mut configuration = configuration;
-            normalize_identity_values(&mut configuration, &identity_ids);
             let mut object = Map::new();
             object.insert(
-                "name".into(),
+                "id".into(),
                 Value::String(row.get(0).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
+                "name".into(),
+                Value::String(row.get(1).map_err(CrawlerRepositoryError::database)?),
+            );
+            object.insert(
                 "priority".into(),
-                Value::from(row.get::<i64>(1).map_err(CrawlerRepositoryError::database)?),
+                Value::from(row.get::<i64>(2).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert("configuration".into(), configuration);
             Ok(Value::Object(object))
@@ -1305,7 +1288,7 @@ async fn semantic_hash(
     .await?;
     let matchers = child_values(
         connection,
-        "SELECT page_types.name, page_types.priority, url_matchers.ordinal, url_matchers.matcher_json FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1 ORDER BY url_matchers.id",
+        "SELECT url_matchers.id, url_matchers.page_type_id, url_matchers.ordinal, url_matchers.matcher_json FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1",
         version.id(),
         |row| {
             let matcher: String = row
@@ -1313,16 +1296,14 @@ async fn semantic_hash(
                 .map_err(CrawlerRepositoryError::database)?;
             let matcher = serde_json::from_str::<Value>(&matcher)
                 .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-            let mut matcher = matcher;
-            normalize_identity_values(&mut matcher, &identity_ids);
             let mut object = Map::new();
             object.insert(
-                "page_type_name".into(),
+                "id".into(),
                 Value::String(row.get(0).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
-                "page_type_priority".into(),
-                Value::from(row.get::<i64>(1).map_err(CrawlerRepositoryError::database)?),
+                "page_type_id".into(),
+                Value::String(row.get(1).map_err(CrawlerRepositoryError::database)?),
             );
             object.insert(
                 "ordinal".into(),
@@ -1335,26 +1316,177 @@ async fn semantic_hash(
     .await?;
     let transitions = child_values(
         connection,
-        "SELECT configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1 ORDER BY id",
+        "SELECT id, configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1",
         version.id(),
         |row| {
-            let configuration: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
-            let mut configuration: Value = serde_json::from_str(&configuration)
+            let configuration: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
+            let configuration: Value = serde_json::from_str(&configuration)
                 .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-            normalize_identity_values(&mut configuration, &identity_ids);
-            Ok(configuration)
+            Ok(serde_json::json!({
+                "id": row.get::<String>(0).map_err(CrawlerRepositoryError::database)?,
+                "configuration": configuration,
+            }))
         },
     )
     .await?;
-    let mut payload = BTreeMap::new();
-    payload.insert("version", version_json);
-    payload.insert("seeds", sorted_array(seeds));
-    payload.insert("page_types", sorted_array(pages));
-    payload.insert("url_matchers", sorted_array(matchers));
-    payload.insert("transitions", sorted_array(transitions));
+
+    let identity_groups = vec![
+        identity_group(
+            "seed",
+            version.seeds().iter().map(|seed| seed.id.to_string()),
+            &seeds,
+        ),
+        identity_group(
+            "page_type",
+            version.page_type_ids().iter().map(ToString::to_string),
+            &pages,
+        ),
+        identity_group("url_matcher", std::iter::empty(), &matchers),
+        identity_group(
+            "transition",
+            version.transition_ids().iter().map(ToString::to_string),
+            &transitions,
+        ),
+    ];
+    let mut labels = BTreeMap::new();
+    let mut canonical_payload = None;
+    let template = SemanticHashTemplate {
+        version: version_json,
+        seeds,
+        page_types: pages,
+        url_matchers: matchers,
+        transitions,
+    };
+    select_canonical_payload(
+        &identity_groups,
+        0,
+        &mut labels,
+        &template,
+        &mut canonical_payload,
+    );
+    let payload = canonical_payload.ok_or(CrawlerRepositoryError::CorruptState)?;
     canonical_sha256(&payload).map_err(|error| {
         CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
     })
+}
+
+struct SemanticHashTemplate {
+    version: Value,
+    seeds: Vec<Value>,
+    page_types: Vec<Value>,
+    url_matchers: Vec<Value>,
+    transitions: Vec<Value>,
+}
+
+struct IdentityGroup {
+    label_prefix: &'static str,
+    ids: Vec<String>,
+}
+
+fn identity_group(
+    label_prefix: &'static str,
+    declared_ids: impl Iterator<Item = String>,
+    rows: &[Value],
+) -> IdentityGroup {
+    let mut ids = declared_ids.collect::<BTreeSet<_>>();
+    ids.extend(
+        rows.iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str).map(ToOwned::to_owned)),
+    );
+    IdentityGroup {
+        label_prefix,
+        ids: ids.into_iter().collect(),
+    }
+}
+
+fn select_canonical_payload(
+    groups: &[IdentityGroup],
+    group_index: usize,
+    labels: &mut BTreeMap<String, String>,
+    template: &SemanticHashTemplate,
+    best: &mut Option<Value>,
+) {
+    if group_index == groups.len() {
+        let payload = remapped_semantic_payload(template, labels);
+        if best
+            .as_ref()
+            .is_none_or(|current| canonical_sort_key(&payload) < canonical_sort_key(current))
+        {
+            *best = Some(payload);
+        }
+        return;
+    }
+
+    let group = &groups[group_index];
+    let mut slots = (0..group.ids.len()).collect::<Vec<_>>();
+    loop {
+        for (id, slot) in group.ids.iter().zip(&slots) {
+            labels.insert(id.clone(), format!("@{}:{slot}", group.label_prefix));
+        }
+        select_canonical_payload(groups, group_index + 1, labels, template, best);
+        for id in &group.ids {
+            labels.remove(id);
+        }
+        if !next_permutation(&mut slots) {
+            break;
+        }
+    }
+}
+
+fn next_permutation(values: &mut [usize]) -> bool {
+    let Some(pivot) = (1..values.len()).rfind(|&index| values[index - 1] < values[index]) else {
+        return false;
+    };
+    let successor = (pivot..values.len())
+        .rfind(|&index| values[index] > values[pivot - 1])
+        .unwrap_or(pivot);
+    values.swap(pivot - 1, successor);
+    values[pivot..].reverse();
+    true
+}
+
+fn remapped_semantic_payload(
+    template: &SemanticHashTemplate,
+    labels: &BTreeMap<String, String>,
+) -> Value {
+    let mut version = template.version.clone();
+    remap_identity_labels(&mut version, labels);
+    sort_version_collections(&mut version);
+    let mut payload = BTreeMap::new();
+    payload.insert("version", version);
+    payload.insert("seeds", remapped_sorted_array(&template.seeds, labels));
+    payload.insert(
+        "page_types",
+        remapped_sorted_array(&template.page_types, labels),
+    );
+    payload.insert(
+        "url_matchers",
+        remapped_sorted_array(&template.url_matchers, labels),
+    );
+    payload.insert(
+        "transitions",
+        remapped_sorted_array(&template.transitions, labels),
+    );
+    serde_json::to_value(payload).unwrap_or(Value::Null)
+}
+
+fn remapped_sorted_array(values: &[Value], labels: &BTreeMap<String, String>) -> Value {
+    let mut values = values.to_vec();
+    for value in &mut values {
+        remap_identity_labels(value, labels);
+    }
+    sorted_array(values)
+}
+
+fn sort_version_collections(value: &mut Value) {
+    let Value::Object(object) = value else {
+        return;
+    };
+    for field in ["seeds", "page_type_ids", "transition_ids"] {
+        if let Some(Value::Array(values)) = object.get_mut(field) {
+            values.sort_by_key(canonical_sort_key);
+        }
+    }
 }
 
 async fn child_values<F>(
@@ -1381,30 +1513,13 @@ where
     Ok(values)
 }
 
-async fn collect_child_identity_ids(
-    connection: &Connection,
-    sql: &str,
-    version_id: CrawlerVersionId,
-    ids: &mut BTreeSet<String>,
-) -> Result<(), CrawlerRepositoryError> {
-    let mut rows = connection
-        .query(sql, [version_id.to_string()])
-        .await
-        .map_err(CrawlerRepositoryError::database)?;
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
-        ids.insert(row.get(0).map_err(CrawlerRepositoryError::database)?);
-    }
-    Ok(())
-}
-
 fn remap_json_references(
     serialized: &str,
     maps: &[&BTreeMap<String, String>],
 ) -> Result<String, CrawlerRepositoryError> {
+    // Task 1 treats child JSON as opaque: only exact values matching known
+    // version-local identities are remapped. Future typed schemas own any
+    // field-aware reference handling rather than guessing at arbitrary keys.
     let mut value: Value =
         serde_json::from_str(serialized).map_err(|_| CrawlerRepositoryError::CorruptState)?;
     remap_json_value(&mut value, maps);
@@ -1431,16 +1546,20 @@ fn remap_json_value(value: &mut Value, maps: &[&BTreeMap<String, String>]) {
     }
 }
 
-fn normalize_identity_values(value: &mut Value, identity_ids: &BTreeSet<String>) {
+fn remap_identity_labels(value: &mut Value, labels: &BTreeMap<String, String>) {
     match value {
         Value::Array(values) => values
             .iter_mut()
-            .for_each(|value| normalize_identity_values(value, identity_ids)),
+            .for_each(|value| remap_identity_labels(value, labels)),
         Value::Object(values) => values
             .values_mut()
-            .for_each(|value| normalize_identity_values(value, identity_ids)),
-        Value::String(string) if identity_ids.contains(string) => *string = "@identity".into(),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+            .for_each(|value| remap_identity_labels(value, labels)),
+        Value::String(string) => {
+            if let Some(label) = labels.get(string) {
+                *string = label.clone();
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -1493,12 +1612,301 @@ fn serialize(value: &impl serde::Serialize) -> Result<String, DbError> {
 mod tests {
     use super::*;
     use crate::MigrationRunner;
-    use erabi_domain::{CrawlerVersion, DiscoveryTransitionId, PageTypeId, Seed};
+    use erabi_domain::{
+        CanonicalizationPolicyId, CrawlerVersion, DiscoveryTransitionId, DomainScopeId, PageTypeId,
+        Seed,
+    };
 
     async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
         let database = ErabiDatabase::in_memory().await?;
         MigrationRunner::default().apply(&database).await?;
         Ok(database)
+    }
+
+    async fn count_by_crawler(
+        connection: &Connection,
+        sql: &str,
+        crawler_id: CrawlerId,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(connection
+            .prepare(sql)
+            .await?
+            .query_row([crawler_id.to_string()])
+            .await?
+            .get(0)?)
+    }
+
+    async fn count_all(
+        connection: &Connection,
+        sql: &str,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(connection.prepare(sql).await?.query_row(()).await?.get(0)?)
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum PageReference {
+        Source,
+        Target,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum TransitionTarget {
+        Target,
+        Source,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ChildInsertionOrder {
+        Forward,
+        Reverse,
+    }
+
+    #[derive(Clone, Copy)]
+    struct GraphShape {
+        seed_hint: PageReference,
+        transition_target: TransitionTarget,
+        configuration_reference: PageReference,
+        child_insertion: ChildInsertionOrder,
+    }
+
+    const fn standard_graph_shape() -> GraphShape {
+        GraphShape {
+            seed_hint: PageReference::Source,
+            transition_target: TransitionTarget::Target,
+            configuration_reference: PageReference::Source,
+            child_insertion: ChildInsertionOrder::Forward,
+        }
+    }
+
+    async fn graph_version(
+        database: &ErabiDatabase,
+        name: &str,
+        shape: GraphShape,
+    ) -> Result<(Crawler, CrawlerVersion), Box<dyn std::error::Error>> {
+        let repository = CrawlerRepository::new(database);
+        let crawler = Crawler::new(name);
+        repository.create(&crawler).await?;
+
+        let source_page = PageTypeId::new();
+        let target_page = PageTypeId::new();
+        let transition = DiscoveryTransitionId::new();
+        let mut seed = Seed::new(
+            "https://example.test/catalog".parse()?,
+            "https://example.test/catalog".parse()?,
+        );
+        seed.entry_page_type_hint = Some(if shape.seed_hint == PageReference::Target {
+            target_page
+        } else {
+            source_page
+        });
+        let mut version = CrawlerVersion::draft(crawler.id());
+        version.set_page_type_ids(vec![source_page, target_page])?;
+        version.set_transition_ids(vec![transition])?;
+        version.add_seed(seed)?;
+        repository
+            .save_draft(&version, "operator", "2026-08-25T00:00:00Z")
+            .await?;
+
+        let connection = database.connection().await?;
+        let page_rows = if shape.child_insertion == ChildInsertionOrder::Reverse {
+            [(target_page, "Target"), (source_page, "Source")]
+        } else {
+            [(source_page, "Source"), (target_page, "Target")]
+        };
+        let configuration_target = if shape.configuration_reference == PageReference::Target {
+            target_page
+        } else {
+            source_page
+        };
+        for (id, page_name) in page_rows {
+            connection
+                .execute(
+                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, 10, ?4)",
+                    (
+                        id.to_string(),
+                        version.id().to_string(),
+                        page_name,
+                        serde_json::json!({"related_page_type_id": configuration_target.to_string()}).to_string(),
+                    ),
+                )
+                .await?;
+        }
+        connection
+            .execute(
+                "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                (
+                    transition.to_string(),
+                    version.id().to_string(),
+                    serde_json::json!({
+                        "source_page_type_id": source_page.to_string(),
+                        "target_page_type_id": if shape.transition_target == TransitionTarget::Source {
+                            source_page.to_string()
+                        } else {
+                            target_page.to_string()
+                        },
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        Ok((crawler, version))
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn semantic_hash_preserves_reference_topology_without_version_local_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+
+        let (clone_crawler, source) =
+            graph_version(&database, "Clone equivalent", standard_graph_shape()).await?;
+        let source = repository
+            .publish(
+                clone_crawler.id(),
+                source.id(),
+                "publisher",
+                "2026-08-25T00:01:00Z",
+            )
+            .await?
+            .version;
+        let source_hash = repository
+            .configuration_hash(clone_crawler.id(), source.id())
+            .await?;
+        let cloned = repository
+            .create_draft_from_published(
+                clone_crawler.id(),
+                source.id(),
+                "operator",
+                "2026-08-25T00:02:00Z",
+            )
+            .await?;
+        assert_ne!(source.id(), cloned.id());
+        assert_ne!(source.seeds()[0].id, cloned.seeds()[0].id);
+        assert_ne!(source.page_type_ids(), cloned.page_type_ids());
+        assert_ne!(source.transition_ids(), cloned.transition_ids());
+        assert_eq!(
+            source_hash,
+            repository
+                .configuration_hash(clone_crawler.id(), cloned.id())
+                .await?
+        );
+
+        let (source_hint_crawler, source_hint) =
+            graph_version(&database, "Hint A", standard_graph_shape()).await?;
+        let (target_hint_crawler, target_hint) = graph_version(
+            &database,
+            "Hint B",
+            GraphShape {
+                seed_hint: PageReference::Target,
+                ..standard_graph_shape()
+            },
+        )
+        .await?;
+        assert_ne!(
+            repository
+                .configuration_hash(source_hint_crawler.id(), source_hint.id())
+                .await?,
+            repository
+                .configuration_hash(target_hint_crawler.id(), target_hint.id())
+                .await?
+        );
+
+        let (directed_transition_crawler, directed_transition) =
+            graph_version(&database, "Transition A to B", standard_graph_shape()).await?;
+        let (self_transition_crawler, self_transition) = graph_version(
+            &database,
+            "Transition A to A",
+            GraphShape {
+                transition_target: TransitionTarget::Source,
+                ..standard_graph_shape()
+            },
+        )
+        .await?;
+        assert_ne!(
+            repository
+                .configuration_hash(directed_transition_crawler.id(), directed_transition.id())
+                .await?,
+            repository
+                .configuration_hash(self_transition_crawler.id(), self_transition.id())
+                .await?
+        );
+
+        let (source_reference_crawler, source_reference) = graph_version(
+            &database,
+            "Configuration reference A",
+            standard_graph_shape(),
+        )
+        .await?;
+        let (target_reference_crawler, target_reference) = graph_version(
+            &database,
+            "Configuration reference B",
+            GraphShape {
+                configuration_reference: PageReference::Target,
+                ..standard_graph_shape()
+            },
+        )
+        .await?;
+        assert_ne!(
+            repository
+                .configuration_hash(source_reference_crawler.id(), source_reference.id())
+                .await?,
+            repository
+                .configuration_hash(target_reference_crawler.id(), target_reference.id())
+                .await?
+        );
+
+        let (first_scope_crawler, mut first_scope) = graph_version(
+            &database,
+            "Canonicalization and scope A",
+            standard_graph_shape(),
+        )
+        .await?;
+        first_scope.set_canonicalization_policy_id(Some(CanonicalizationPolicyId::new()))?;
+        first_scope.set_domain_scope_id(Some(DomainScopeId::new()))?;
+        repository
+            .save_draft(&first_scope, "operator", "2026-08-25T00:00:01Z")
+            .await?;
+        let (second_scope_crawler, mut second_scope) = graph_version(
+            &database,
+            "Canonicalization and scope B",
+            standard_graph_shape(),
+        )
+        .await?;
+        second_scope.set_canonicalization_policy_id(Some(CanonicalizationPolicyId::new()))?;
+        second_scope.set_domain_scope_id(Some(DomainScopeId::new()))?;
+        repository
+            .save_draft(&second_scope, "operator", "2026-08-25T00:00:01Z")
+            .await?;
+        assert_ne!(
+            repository
+                .configuration_hash(first_scope_crawler.id(), first_scope.id())
+                .await?,
+            repository
+                .configuration_hash(second_scope_crawler.id(), second_scope.id())
+                .await?
+        );
+
+        let (forward_insertion_crawler, forward_insertion) =
+            graph_version(&database, "Insertion independent A", standard_graph_shape()).await?;
+        let (reversed_insertion_crawler, reversed_insertion) = graph_version(
+            &database,
+            "Insertion independent B",
+            GraphShape {
+                child_insertion: ChildInsertionOrder::Reverse,
+                ..standard_graph_shape()
+            },
+        )
+        .await?;
+        assert_eq!(
+            repository
+                .configuration_hash(forward_insertion_crawler.id(), forward_insertion.id())
+                .await?,
+            repository
+                .configuration_hash(reversed_insertion_crawler.id(), reversed_insertion.id())
+                .await?
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1688,13 +2096,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_audit_metadata_is_not_mixed_with_reactivation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let crawler = Crawler::new("Audit projection");
+        repository.create(&crawler).await?;
+        let initial = repository
+            .create_draft(crawler.id(), "author-a", "2026-08-25T00:00:00Z")
+            .await?;
+        let initial = repository
+            .publish(
+                crawler.id(),
+                initial.id(),
+                "author-a",
+                "2026-08-25T00:01:00Z",
+            )
+            .await?
+            .version;
+        let draft = repository
+            .create_draft_from_published(
+                crawler.id(),
+                initial.id(),
+                "author-a",
+                "2026-08-25T00:02:00Z",
+            )
+            .await?;
+        let published = repository
+            .publish(crawler.id(), draft.id(), "author-a", "2026-08-25T00:03:00Z")
+            .await?
+            .version;
+        let published_hash = repository
+            .configuration_hash(crawler.id(), published.id())
+            .await?;
+
+        repository
+            .reactivate_published_typed(
+                crawler.id(),
+                published.id(),
+                "operator-b",
+                "2026-08-25T00:04:00Z",
+            )
+            .await?;
+        let read = repository.version(crawler.id(), published.id()).await?;
+        assert_eq!(read.audit.actor.as_deref(), Some("author-a"));
+        assert_eq!(
+            read.audit.occurred_at.as_deref(),
+            Some("2026-08-25T00:03:00Z")
+        );
+        assert_eq!(
+            read.audit.config_hash.as_deref(),
+            Some(published_hash.as_str())
+        );
+        assert_eq!(read.audit.base_version_id, Some(initial.id()));
+
+        let connection = database.connection().await?;
+        let reactivation = connection
+            .prepare(
+                "SELECT actor, occurred_at FROM audit_events WHERE entity_id = ?1 AND event_type = 'CRAWLER_VERSION_REACTIVATED'",
+            )
+            .await?
+            .query_row([published.id().to_string()])
+            .await?;
+        let reactivation_actor: String = reactivation.get(0)?;
+        let reactivation_at: String = reactivation.get(1)?;
+        assert_eq!(reactivation_actor, "operator-b");
+        assert_eq!(reactivation_at, "2026-08-25T00:04:00Z");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn concurrent_initial_draft_creation_has_one_winner()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let crawler = Crawler::new("Concurrent");
         CrawlerRepository::new(&database).create(&crawler).await?;
         let left_database = database.clone();
-        let right_database = database;
+        let right_database = database.clone();
         let left = CrawlerRepository::new(&left_database);
         let right = CrawlerRepository::new(&right_database);
         let (left, right) = tokio::join!(
@@ -1710,8 +2188,7 @@ mod tests {
                 || matches!(
                     left,
                     Err(CrawlerRepositoryError::ActiveDraftExists
-                        | CrawlerRepositoryError::ConcurrentVersionTransition
-                        | CrawlerRepositoryError::Database(_))
+                        | CrawlerRepositoryError::ConcurrentVersionTransition)
                 )
         );
         assert!(
@@ -1719,9 +2196,50 @@ mod tests {
                 || matches!(
                     right,
                     Err(CrawlerRepositoryError::ActiveDraftExists
-                        | CrawlerRepositoryError::ConcurrentVersionTransition
-                        | CrawlerRepositoryError::Database(_))
+                        | CrawlerRepositoryError::ConcurrentVersionTransition)
                 )
+        );
+        let repository = CrawlerRepository::new(&database);
+        assert!(
+            repository
+                .pointers(&crawler)
+                .await?
+                .active_draft_version_id
+                .is_some()
+        );
+        let connection = database.connection().await?;
+        assert_eq!(
+            count_by_crawler(
+                &connection,
+                "SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1",
+                crawler.id()
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
+            0
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            0
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
+            0
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            0
+        );
+        assert_eq!(
+            count_all(
+                &connection,
+                "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION'"
+            )
+            .await?,
+            1
         );
         Ok(())
     }
@@ -1772,8 +2290,7 @@ mod tests {
                 || matches!(
                     left,
                     Err(CrawlerRepositoryError::ActiveDraftExists
-                        | CrawlerRepositoryError::ConcurrentVersionTransition
-                        | CrawlerRepositoryError::Database(_))
+                        | CrawlerRepositoryError::ConcurrentVersionTransition)
                 )
         );
         assert!(
@@ -1781,22 +2298,46 @@ mod tests {
                 || matches!(
                     right,
                     Err(CrawlerRepositoryError::ActiveDraftExists
-                        | CrawlerRepositoryError::ConcurrentVersionTransition
-                        | CrawlerRepositoryError::Database(_))
+                        | CrawlerRepositoryError::ConcurrentVersionTransition)
                 )
         );
 
         let pointers = repository.pointers(&crawler).await?;
         assert!(pointers.active_draft_version_id.is_some());
-        let version_count: i64 = database
-            .connection()
-            .await?
-            .prepare("SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1")
-            .await?
-            .query_row([crawler.id().to_string()])
-            .await?
-            .get(0)?;
-        assert_eq!(version_count, 2);
+        let connection = database.connection().await?;
+        assert_eq!(
+            count_by_crawler(
+                &connection,
+                "SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1",
+                crawler.id()
+            )
+            .await?,
+            2
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
+            0
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            0
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
+            0
+        );
+        assert_eq!(
+            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            0
+        );
+        assert_eq!(
+            count_all(
+                &connection,
+                "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION'"
+            )
+            .await?,
+            3
+        );
         Ok(())
     }
 
