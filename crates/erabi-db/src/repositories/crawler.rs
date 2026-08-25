@@ -1421,6 +1421,7 @@ struct SemanticEntity {
 struct SemanticCanonicalization {
     known_kinds: BTreeMap<String, SemanticEntityKind>,
     labels: BTreeMap<String, String>,
+    incoming: BTreeMap<String, Vec<Value>>,
 }
 
 fn refine_semantic_labels(
@@ -1435,18 +1436,26 @@ fn refine_semantic_labels(
         .iter()
         .map(|entity| (entity.id.clone(), entity.kind))
         .collect::<BTreeMap<_, _>>();
-    let mut labels = labels_for_entities(&entities, &known_kinds, None);
+    let mut labels = labels_for_entities(
+        &entities,
+        &known_kinds,
+        None,
+        &incoming_incidence(&entities, &known_kinds, None),
+    );
     for _ in 0..entities.len() {
-        let refined = labels_for_entities(&entities, &known_kinds, Some(&labels));
+        let incoming = incoming_incidence(&entities, &known_kinds, Some(&labels));
+        let refined = labels_for_entities(&entities, &known_kinds, Some(&labels), &incoming);
         if same_semantic_partition(&labels, &refined) {
             labels = refined;
             break;
         }
         labels = refined;
     }
+    let incoming = incoming_incidence(&entities, &known_kinds, Some(&labels));
     SemanticCanonicalization {
         known_kinds,
         labels,
+        incoming,
     }
 }
 
@@ -1512,6 +1521,7 @@ fn labels_for_entities(
     entities: &[SemanticEntity],
     known_kinds: &BTreeMap<String, SemanticEntityKind>,
     previous_labels: Option<&BTreeMap<String, String>>,
+    incoming: &BTreeMap<String, Vec<Value>>,
 ) -> BTreeMap<String, String> {
     let mut signatures = BTreeMap::<SemanticEntityKind, Vec<(String, String)>>::new();
     for entity in entities {
@@ -1523,6 +1533,7 @@ fn labels_for_entities(
             Some((&entity.id, entity.kind)),
         );
         let signature = canonical_sort_key(&serde_json::json!({
+            "incoming": sorted_array(incoming.get(&entity.id).cloned().unwrap_or_default()),
             "kind": entity.kind.label_prefix(),
             "value": value,
         }));
@@ -1548,6 +1559,95 @@ fn labels_for_entities(
         }
     }
     labels
+}
+
+fn incoming_incidence(
+    entities: &[SemanticEntity],
+    known_kinds: &BTreeMap<String, SemanticEntityKind>,
+    labels: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, Vec<Value>> {
+    let mut incoming = BTreeMap::<String, Vec<Value>>::new();
+    for entity in entities {
+        let source = labels
+            .and_then(|labels| labels.get(&entity.id))
+            .cloned()
+            .unwrap_or_else(|| format!("@{}", entity.kind.label_prefix()));
+        for reference in semantic_references(&entity.value, known_kinds, &entity.id) {
+            incoming
+                .entry(reference.target)
+                .or_default()
+                .push(serde_json::json!({
+                    "path": reference.path,
+                    "source": source,
+                }));
+        }
+    }
+    incoming
+}
+
+struct SemanticReference {
+    target: String,
+    path: String,
+}
+
+fn semantic_references(
+    value: &Value,
+    known_kinds: &BTreeMap<String, SemanticEntityKind>,
+    owner_id: &str,
+) -> Vec<SemanticReference> {
+    let mut references = Vec::new();
+    collect_semantic_references(value, known_kinds, owner_id, "", &mut references);
+    references
+}
+
+fn collect_semantic_references(
+    value: &Value,
+    known_kinds: &BTreeMap<String, SemanticEntityKind>,
+    owner_id: &str,
+    path: &str,
+    references: &mut Vec<SemanticReference>,
+) {
+    match value {
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                collect_semantic_references(
+                    value,
+                    known_kinds,
+                    owner_id,
+                    &format!("{path}/{index}"),
+                    references,
+                );
+            }
+        }
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                if let Some(value) = values.get(key) {
+                    collect_semantic_references(
+                        value,
+                        known_kinds,
+                        owner_id,
+                        &format!("{path}/{}", json_pointer_segment(key)),
+                        references,
+                    );
+                }
+            }
+        }
+        Value::String(value) => {
+            if known_kinds.contains_key(value) && !(path == "/id" && value == owner_id) {
+                references.push(SemanticReference {
+                    target: value.clone(),
+                    path: path.to_owned(),
+                });
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn json_pointer_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 fn same_semantic_partition(
@@ -1608,7 +1708,30 @@ fn remapped_semantic_payload(
             canonicalization,
         ),
     );
+    payload.insert(
+        "incoming_incidence_profiles",
+        anonymous_incidence_profiles(canonicalization),
+    );
     serde_json::to_value(payload).unwrap_or(Value::Null)
+}
+
+fn anonymous_incidence_profiles(canonicalization: &SemanticCanonicalization) -> Value {
+    let profiles = canonicalization
+        .labels
+        .iter()
+        .filter_map(|(id, label)| {
+            canonicalization.known_kinds.get(id).map(|kind| {
+                serde_json::json!({
+                    "incoming": sorted_array(
+                        canonicalization.incoming.get(id).cloned().unwrap_or_default(),
+                    ),
+                    "kind": kind.label_prefix(),
+                    "label": label,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    sorted_array(profiles)
 }
 
 fn remapped_sorted_array(
@@ -1706,23 +1829,72 @@ fn remap_semantic_references(
     labels: Option<&BTreeMap<String, String>>,
     owner: Option<(&str, SemanticEntityKind)>,
 ) {
+    let mut local_references = BTreeMap::new();
+    let mut next_reference_index = BTreeMap::new();
+    remap_semantic_references_in_scope(
+        value,
+        known_kinds,
+        labels,
+        owner,
+        &mut local_references,
+        &mut next_reference_index,
+    );
+}
+
+fn remap_semantic_references_in_scope(
+    value: &mut Value,
+    known_kinds: &BTreeMap<String, SemanticEntityKind>,
+    labels: Option<&BTreeMap<String, String>>,
+    owner: Option<(&str, SemanticEntityKind)>,
+    local_references: &mut BTreeMap<String, String>,
+    next_reference_index: &mut BTreeMap<String, usize>,
+) {
     match value {
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|value| remap_semantic_references(value, known_kinds, labels, owner)),
-        Value::Object(values) => values
-            .values_mut()
-            .for_each(|value| remap_semantic_references(value, known_kinds, labels, owner)),
+        Value::Array(values) => {
+            for value in values {
+                remap_semantic_references_in_scope(
+                    value,
+                    known_kinds,
+                    labels,
+                    owner,
+                    local_references,
+                    next_reference_index,
+                );
+            }
+        }
+        Value::Object(values) => {
+            let mut keys = values.keys().cloned().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                if let Some(value) = values.get_mut(&key) {
+                    remap_semantic_references_in_scope(
+                        value,
+                        known_kinds,
+                        labels,
+                        owner,
+                        local_references,
+                        next_reference_index,
+                    );
+                }
+            }
+        }
         Value::String(string) => {
             if let Some((owner_id, owner_kind)) = owner
                 && string == owner_id
             {
                 *string = format!("@self:{}", owner_kind.label_prefix());
             } else if let Some(kind) = known_kinds.get(string) {
-                *string = labels
+                let label = labels
                     .and_then(|labels| labels.get(string))
                     .cloned()
                     .unwrap_or_else(|| format!("@{}", kind.label_prefix()));
+                let next = next_reference_index.entry(label.clone()).or_insert(0);
+                let replacement = local_references.entry(string.clone()).or_insert_with(|| {
+                    let replacement = format!("{label}#{next}");
+                    *next += 1;
+                    replacement
+                });
+                string.clone_from(replacement);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -1932,6 +2104,250 @@ mod tests {
             )
             .await?;
         Ok((crawler, version))
+    }
+
+    #[derive(Clone, Copy)]
+    enum SymmetricGraphShape {
+        SelfTransition,
+        DistinctTransition,
+        MatchersShareOwner,
+        MatchersSplitOwners,
+    }
+
+    async fn symmetric_graph_version(
+        database: &ErabiDatabase,
+        name: &str,
+        shape: SymmetricGraphShape,
+        swap_members: bool,
+        reverse_insertion: bool,
+    ) -> Result<(Crawler, CrawlerVersion), Box<dyn std::error::Error>> {
+        let repository = CrawlerRepository::new(database);
+        let crawler = Crawler::new(name);
+        repository.create(&crawler).await?;
+
+        let first_page = PageTypeId::new();
+        let second_page = PageTypeId::new();
+        let (source_page, target_page) = if swap_members {
+            (second_page, first_page)
+        } else {
+            (first_page, second_page)
+        };
+        let transition_id = DiscoveryTransitionId::new();
+
+        let mut version = CrawlerVersion::draft(crawler.id());
+        let mut page_type_ids = vec![first_page, second_page];
+        if reverse_insertion {
+            page_type_ids.reverse();
+        }
+        version.set_page_type_ids(page_type_ids)?;
+        if matches!(
+            shape,
+            SymmetricGraphShape::SelfTransition | SymmetricGraphShape::DistinctTransition
+        ) {
+            version.set_transition_ids(vec![transition_id])?;
+        }
+        repository
+            .save_draft(&version, "operator", "2026-08-25T00:00:00Z")
+            .await?;
+
+        let connection = database.connection().await?;
+        let mut page_rows = vec![first_page, second_page];
+        if reverse_insertion {
+            page_rows.reverse();
+        }
+        for page_id in page_rows {
+            connection
+                .execute(
+                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'Symmetric', 10, '{}')",
+                    (page_id.to_string(), version.id().to_string()),
+                )
+                .await?;
+        }
+
+        match shape {
+            SymmetricGraphShape::SelfTransition | SymmetricGraphShape::DistinctTransition => {
+                let target = if matches!(shape, SymmetricGraphShape::SelfTransition) {
+                    source_page
+                } else {
+                    target_page
+                };
+                connection
+                    .execute(
+                        "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                        (
+                            transition_id.to_string(),
+                            version.id().to_string(),
+                            serde_json::json!({
+                                "source_page_type_id": source_page.to_string(),
+                                "target_page_type_id": target.to_string(),
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await?;
+            }
+            SymmetricGraphShape::MatchersShareOwner | SymmetricGraphShape::MatchersSplitOwners => {
+                let second_owner = if matches!(shape, SymmetricGraphShape::MatchersShareOwner) {
+                    source_page
+                } else {
+                    target_page
+                };
+                let mut matchers = vec![
+                    (source_page, 0_i64, "https://example.test/first"),
+                    (second_owner, 1_i64, "https://example.test/second"),
+                ];
+                if reverse_insertion {
+                    matchers.reverse();
+                }
+                for (page_type_id, ordinal, pattern) in matchers {
+                    connection
+                        .execute(
+                            "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
+                            (
+                                new_opaque_id(),
+                                page_type_id.to_string(),
+                                ordinal,
+                                serde_json::json!({"kind": "exact", "pattern": pattern})
+                                    .to_string(),
+                            ),
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok((crawler, version))
+    }
+
+    #[tokio::test]
+    async fn symmetric_page_types_preserve_same_member_transition_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let (self_crawler, self_version) = symmetric_graph_version(
+            &database,
+            "Symmetric self transition",
+            SymmetricGraphShape::SelfTransition,
+            false,
+            false,
+        )
+        .await?;
+        let (distinct_crawler, distinct_version) = symmetric_graph_version(
+            &database,
+            "Symmetric distinct transition",
+            SymmetricGraphShape::DistinctTransition,
+            false,
+            false,
+        )
+        .await?;
+
+        assert_ne!(
+            repository
+                .configuration_hash(self_crawler.id(), self_version.id())
+                .await?,
+            repository
+                .configuration_hash(distinct_crawler.id(), distinct_version.id())
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symmetric_page_types_preserve_matcher_ownership_grouping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let (shared_crawler, shared_version) = symmetric_graph_version(
+            &database,
+            "Symmetric shared matcher owner",
+            SymmetricGraphShape::MatchersShareOwner,
+            false,
+            false,
+        )
+        .await?;
+        let (split_crawler, split_version) = symmetric_graph_version(
+            &database,
+            "Symmetric split matcher owners",
+            SymmetricGraphShape::MatchersSplitOwners,
+            false,
+            false,
+        )
+        .await?;
+
+        assert_ne!(
+            repository
+                .configuration_hash(shared_crawler.id(), shared_version.id())
+                .await?,
+            repository
+                .configuration_hash(split_crawler.id(), split_version.id())
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symmetric_graph_hash_ignores_member_uuid_renaming()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let (source_crawler, source_version) = symmetric_graph_version(
+            &database,
+            "Symmetric UUID source",
+            SymmetricGraphShape::SelfTransition,
+            false,
+            false,
+        )
+        .await?;
+        let (renamed_crawler, renamed_version) = symmetric_graph_version(
+            &database,
+            "Symmetric UUID renamed",
+            SymmetricGraphShape::SelfTransition,
+            true,
+            false,
+        )
+        .await?;
+
+        assert_eq!(
+            repository
+                .configuration_hash(source_crawler.id(), source_version.id())
+                .await?,
+            repository
+                .configuration_hash(renamed_crawler.id(), renamed_version.id())
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symmetric_graph_hash_ignores_reverse_insertion_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let (forward_crawler, forward_version) = symmetric_graph_version(
+            &database,
+            "Symmetric insertion forward",
+            SymmetricGraphShape::MatchersShareOwner,
+            false,
+            false,
+        )
+        .await?;
+        let (reverse_crawler, reverse_version) = symmetric_graph_version(
+            &database,
+            "Symmetric insertion reverse",
+            SymmetricGraphShape::MatchersShareOwner,
+            false,
+            true,
+        )
+        .await?;
+
+        assert_eq!(
+            repository
+                .configuration_hash(forward_crawler.id(), forward_version.id())
+                .await?,
+            repository
+                .configuration_hash(reverse_crawler.id(), reverse_version.id())
+                .await?
+        );
+        Ok(())
     }
 
     #[tokio::test]
