@@ -14,7 +14,6 @@ pub struct DiscoveryBudgetCandidate {
     pub transition_links_on_source_page: u32,
     pub transition_total_links: u64,
     pub prospective_download_bytes: u64,
-    pub depth_contribution: u32,
 }
 
 /// Typed reasons why a prospective decision is preserve-only/excluded.
@@ -101,9 +100,12 @@ impl<'a> DiscoveryBudgetEvaluator<'a> {
                 DiscoveryBudgetExclusion::MaxDuration,
             ));
         }
+        let transition_depth_contribution = self
+            .transition
+            .map_or(0, |transition| transition.depth_contribution);
         let prospective_depth = candidate
             .current_depth
-            .checked_add(candidate.depth_contribution)
+            .checked_add(transition_depth_contribution)
             .ok_or(DiscoveryBudgetError::Overflow)?;
         if prospective_depth > self.guardrails.max_depth {
             return Ok(DiscoveryBudgetDecision::Excluded(

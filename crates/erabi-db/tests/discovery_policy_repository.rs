@@ -1,7 +1,7 @@
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
 use erabi_domain::{
     Crawler, CrawlerVersionGuardrails, DiscoveryTransition, DomainScopeKind, DomainScopePolicy,
-    PageTypeDiscoveryGuardrails, TestEvidenceId, TransitionBudget,
+    PageTypeDiscoveryGuardrails, Seed, TestEvidenceId, TransitionBudget,
 };
 
 fn transition(
@@ -34,6 +34,43 @@ async fn setup() -> Result<(ErabiDatabase, Crawler), Box<dyn std::error::Error>>
     let crawler = Crawler::new("Discovery policy repository");
     CrawlerRepository::new(&database).create(&crawler).await?;
     Ok((database, crawler))
+}
+
+async fn persistent_setup()
+-> Result<(tempfile::TempDir, ErabiDatabase, Crawler), Box<dyn std::error::Error>> {
+    let data_dir = tempfile::tempdir()?;
+    let database = ErabiDatabase::open_local(data_dir.path().join("erabi.db")).await?;
+    MigrationRunner::default().apply(&database).await?;
+    let crawler = Crawler::new("Discovery policy repository");
+    CrawlerRepository::new(&database).create(&crawler).await?;
+    Ok((data_dir, database, crawler))
+}
+
+async fn raw_connection(
+    data_dir: &tempfile::TempDir,
+) -> Result<turso::Connection, Box<dyn std::error::Error>> {
+    let database_path = data_dir.path().join("erabi.db");
+    let raw_database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
+        .build()
+        .await?;
+    Ok(raw_database.connect()?)
+}
+
+async fn seeded_draft(
+    database: &ErabiDatabase,
+    crawler: &Crawler,
+) -> Result<(erabi_domain::CrawlerVersion, Seed), Box<dyn std::error::Error>> {
+    let repository = CrawlerRepository::new(database);
+    let mut version = repository
+        .create_draft(crawler.id(), "operator", "now")
+        .await?;
+    let seed = Seed::new(
+        "https://example.test/original".parse()?,
+        "https://example.test/canonical".parse()?,
+    );
+    version.add_seed(seed.clone())?;
+    repository.save_draft(&version, "operator", "now").await?;
+    Ok((version, seed))
 }
 
 #[tokio::test]
@@ -260,5 +297,81 @@ async fn transition_page_type_ownership_and_persisted_corruption_fail_closed()
         )
     ));
 
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn full_seed_projection_mismatches_fail_closed_on_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (data_dir, database, crawler) = persistent_setup().await?;
+    let repository = CrawlerRepository::new(&database);
+    let (version, seed) = seeded_draft(&database, &crawler).await?;
+    assert!(repository.version(crawler.id(), version.id()).await.is_ok());
+    raw_connection(&data_dir)
+        .await?
+        .execute(
+            "UPDATE seeds SET enabled = 0 WHERE id = ?1",
+            [seed.id.to_string()],
+        )
+        .await?;
+    assert!(matches!(
+        repository.version(crawler.id(), version.id()).await,
+        Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
+    ));
+
+    let (data_dir, database, crawler) = persistent_setup().await?;
+    let repository = CrawlerRepository::new(&database);
+    let (version, seed) = seeded_draft(&database, &crawler).await?;
+    raw_connection(&data_dir)
+        .await?
+        .execute(
+            "UPDATE seeds SET canonical_url = ?1 WHERE id = ?2",
+            ("https://other.test/", seed.id.to_string()),
+        )
+        .await?;
+    assert!(matches!(
+        repository.version(crawler.id(), version.id()).await,
+        Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
+    ));
+
+    let (data_dir, database, crawler) = persistent_setup().await?;
+    let repository = CrawlerRepository::new(&database);
+    let (version, seed) = seeded_draft(&database, &crawler).await?;
+    raw_connection(&data_dir)
+        .await?
+        .execute("DELETE FROM seeds WHERE id = ?1", [seed.id.to_string()])
+        .await?;
+    assert!(matches!(
+        repository.version(crawler.id(), version.id()).await,
+        Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
+    ));
+
+    let (data_dir, database, crawler) = persistent_setup().await?;
+    let repository = CrawlerRepository::new(&database);
+    let (version, _) = seeded_draft(&database, &crawler).await?;
+    let extra_seed = Seed::new(
+        "https://example.test/extra-original".parse()?,
+        "https://example.test/extra-canonical".parse()?,
+    );
+    raw_connection(&data_dir)
+        .await?
+        .execute(
+            "INSERT INTO seeds (id, crawler_version_id, original_url, canonical_url, enabled, label, entry_page_type_hint_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                extra_seed.id.to_string(),
+                version.id().to_string(),
+                extra_seed.original_url.as_str(),
+                extra_seed.canonical_url.as_str(),
+                1_i64,
+                Option::<String>::None,
+                Option::<String>::None,
+            ),
+        )
+        .await?;
+    assert!(matches!(
+        repository.version(crawler.id(), version.id()).await,
+        Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
+    ));
     Ok(())
 }

@@ -7,7 +7,7 @@ use axum::{
 };
 use erabi_api::{AppState, SecurityConfig, build_router};
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
-use erabi_domain::Seed;
+use erabi_domain::{Crawler, CrawlerVersionGuardrails, Seed};
 use secrecy::SecretString;
 use tower::ServiceExt;
 
@@ -15,6 +15,14 @@ async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
     MigrationRunner::default().apply(&database).await?;
     Ok(database)
+}
+
+async fn persistent_database()
+-> Result<(tempfile::TempDir, ErabiDatabase), Box<dyn std::error::Error>> {
+    let data_dir = tempfile::tempdir()?;
+    let database = ErabiDatabase::open_local(data_dir.path().join("erabi.db")).await?;
+    MigrationRunner::default().apply(&database).await?;
+    Ok((data_dir, database))
 }
 
 fn router(database: &ErabiDatabase) -> Result<Router, Box<dyn std::error::Error>> {
@@ -318,5 +326,99 @@ async fn remote_discovery_policy_mutations_require_bearer_authentication()
         .await?;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(json(response).await?["code"], "AUTHENTICATION_REQUIRED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn domain_scope_classification_fails_closed_for_corrupt_seed_projection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (data_dir, database) = persistent_database().await?;
+    let router = router(&database)?;
+    let repository = CrawlerRepository::new(&database);
+    let crawler = Crawler::new("Corrupt seed projection");
+    repository.create(&crawler).await?;
+    let mut version = repository
+        .create_draft(crawler.id(), "operator", "now")
+        .await?;
+    let seed = Seed::new(
+        "https://example.test/original".parse()?,
+        "https://example.test/canonical".parse()?,
+    );
+    version.add_seed(seed.clone())?;
+    repository.save_draft(&version, "operator", "now").await?;
+    let database_path = data_dir.path().join("erabi.db");
+    let raw_database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
+        .build()
+        .await?;
+    raw_database
+        .connect()?
+        .execute(
+            "UPDATE seeds SET enabled = 0 WHERE id = ?1",
+            [seed.id.to_string()],
+        )
+        .await?;
+
+    let response = router
+        .oneshot(request(
+            "POST",
+            &format!(
+                "/api/v1/crawlers/{}/versions/{}/classify-domain-scope",
+                crawler.id(),
+                version.id()
+            ),
+            r#"{"url":"https://example.test/next"}"#,
+        )?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json(response).await?["code"], "PERSISTED_STATE_INVALID");
+    Ok(())
+}
+
+#[tokio::test]
+async fn page_type_guardrail_reference_blocks_draft_delete_with_in_use_conflict()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let router = router(&database)?;
+    let repository = CrawlerRepository::new(&database);
+    let crawler = Crawler::new("Guardrail PageType reference");
+    repository.create(&crawler).await?;
+    let version = repository
+        .create_draft(crawler.id(), "operator", "now")
+        .await?;
+    let page_type = repository
+        .create_page_type(crawler.id(), version.id(), "Listing", 1, "operator", "now")
+        .await?;
+    let mut guardrails = CrawlerVersionGuardrails::default();
+    guardrails
+        .page_types
+        .push(erabi_domain::PageTypeDiscoveryGuardrails {
+            page_type_id: page_type.id,
+            page_budget: Some(10),
+            health_threshold: None,
+        });
+    repository
+        .update_crawler_version_guardrails(
+            crawler.id(),
+            version.id(),
+            &guardrails,
+            "operator",
+            "now",
+        )
+        .await?;
+
+    let response = router
+        .oneshot(request(
+            "DELETE",
+            &format!(
+                "/api/v1/crawlers/{}/versions/{}/page-types/{}",
+                crawler.id(),
+                version.id(),
+                page_type.id
+            ),
+            "{}",
+        )?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json(response).await?["code"], "PAGE_TYPE_IN_USE");
     Ok(())
 }

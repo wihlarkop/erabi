@@ -247,6 +247,7 @@ impl<'database> CrawlerRepository<'database> {
         let mut versions = Vec::new();
         while let Some(row) = rows.next().await.map_err(Self::database)? {
             let version = version_from_row(&row)?;
+            validate_seed_projection(&connection, &version).await?;
             load_transition_records(&connection, &version).await?;
             let audit = audit_metadata(&connection, version.id()).await?;
             versions.push(CrawlerVersionRecord { version, audit });
@@ -276,6 +277,7 @@ impl<'database> CrawlerRepository<'database> {
         if version.crawler_id() != crawler_id {
             return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
         }
+        validate_seed_projection(&connection, &version).await?;
         load_transition_records(&connection, &version).await?;
         let audit = audit_metadata(&connection, version.id()).await?;
         Ok(CrawlerVersionRecord { version, audit })
@@ -775,7 +777,7 @@ impl<'database> CrawlerRepository<'database> {
             ids.push(transition.id);
             updated
                 .set_transition_ids(ids)
-                .map_err(|_| CrawlerRepositoryError::PublishedVersionImmutable)?;
+                .map_err(|error| map_semantic_error(error.code))?;
             let version_configuration =
                 serialize(&updated).map_err(CrawlerRepositoryError::database)?;
             let transition_configuration = serialize(transition)
@@ -910,7 +912,7 @@ impl<'database> CrawlerRepository<'database> {
                         .filter(|id| *id != transition_id)
                         .collect(),
                 )
-                .map_err(|_| CrawlerRepositoryError::PublishedVersionImmutable)?;
+                .map_err(|error| map_semantic_error(error.code))?;
             let version_configuration =
                 serialize(&updated).map_err(CrawlerRepositoryError::database)?;
             let deleted = transaction
@@ -994,7 +996,7 @@ impl<'database> CrawlerRepository<'database> {
             ids.push(page_type_id);
             updated
                 .set_page_type_ids(ids)
-                .map_err(|_| CrawlerRepositoryError::PublishedVersionImmutable)?;
+                .map_err(|error| map_semantic_error(error.code))?;
             let configuration =
                 serialize(&updated).map_err(CrawlerRepositoryError::database)?;
             transaction
@@ -1108,7 +1110,13 @@ impl<'database> CrawlerRepository<'database> {
                         .filter(|id| *id != page_type_id)
                         .collect(),
                 )
-                .map_err(|_| CrawlerRepositoryError::PublishedVersionImmutable)?;
+                .map_err(|error| {
+                    if error.code == erabi_domain::ErrorCode::InvalidPageTypeBudget {
+                        CrawlerRepositoryError::PageTypeInUse
+                    } else {
+                        map_semantic_error(error.code)
+                    }
+                })?;
             let configuration = serialize(&updated).map_err(CrawlerRepositoryError::database)?;
             transaction
                 .execute(
@@ -1816,13 +1824,21 @@ async fn load_mutation_version(
     }
     // A mutation must not compound an existing mismatch between the declared
     // version projection and typed child rows.
-    validate_seed_hint_projection(connection, &version).await?;
     load_page_type_records(connection, &version).await?;
     load_transition_records(connection, &version).await?;
     Ok(version)
 }
 
-async fn validate_seed_hint_projection(
+#[derive(Debug, Eq, PartialEq)]
+struct SeedProjection {
+    original_url: String,
+    canonical_url: String,
+    enabled: bool,
+    label: Option<String>,
+    entry_page_type_hint: Option<String>,
+}
+
+async fn validate_seed_projection(
     connection: &Connection,
     version: &CrawlerVersion,
 ) -> Result<(), CrawlerRepositoryError> {
@@ -1832,7 +1848,13 @@ async fn validate_seed_hint_projection(
         .map(|seed| {
             (
                 seed.id.to_string(),
-                seed.entry_page_type_hint.map(|id| id.to_string()),
+                SeedProjection {
+                    original_url: seed.original_url.as_str().to_owned(),
+                    canonical_url: seed.canonical_url.as_str().to_owned(),
+                    enabled: seed.enabled,
+                    label: seed.label.clone(),
+                    entry_page_type_hint: seed.entry_page_type_hint.map(|id| id.to_string()),
+                },
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -1847,7 +1869,7 @@ async fn validate_seed_hint_projection(
 
     let mut rows = connection
         .query(
-            "SELECT id, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1",
+            "SELECT id, original_url, canonical_url, enabled, label, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1",
             [version.id().to_string()],
         )
         .await
@@ -1859,14 +1881,38 @@ async fn validate_seed_hint_projection(
         .map_err(CrawlerRepositoryError::database)?
     {
         let id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
+        let original_url: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
+        let canonical_url: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
+        let enabled = match row
+            .get::<i64>(3)
+            .map_err(CrawlerRepositoryError::database)?
+        {
+            0 => false,
+            1 => true,
+            _ => return Err(CrawlerRepositoryError::CorruptState),
+        };
+        let label = row
+            .get::<Option<String>>(4)
+            .map_err(CrawlerRepositoryError::database)?;
         let hint = row
-            .get::<Option<String>>(1)
+            .get::<Option<String>>(5)
             .map_err(CrawlerRepositoryError::database)?;
         if Uuid::parse_str(&id).map_or(true, |value| value.get_version_num() != 7)
             || hint
                 .as_deref()
                 .is_some_and(|value| parse_page_type_id(value).is_err())
-            || actual.insert(id, hint).is_some()
+            || actual
+                .insert(
+                    id,
+                    SeedProjection {
+                        original_url,
+                        canonical_url,
+                        enabled,
+                        label,
+                        entry_page_type_hint: hint,
+                    },
+                )
+                .is_some()
         {
             return Err(CrawlerRepositoryError::CorruptState);
         }
@@ -2198,6 +2244,14 @@ async fn page_type_is_in_use(
     version: &CrawlerVersion,
     page_type_id: PageTypeId,
 ) -> Result<bool, CrawlerRepositoryError> {
+    if version
+        .guardrails()
+        .page_types
+        .iter()
+        .any(|guardrail| guardrail.page_type_id == page_type_id)
+    {
+        return Ok(true);
+    }
     let page_type_id = page_type_id.to_string();
     let mut seeds = connection
         .query(
@@ -2312,7 +2366,9 @@ async fn load_version(
     else {
         return Err(CrawlerRepositoryError::CrawlerVersionNotFound);
     };
-    version_from_row(&row)
+    let version = version_from_row(&row)?;
+    validate_seed_projection(connection, &version).await?;
+    Ok(version)
 }
 
 fn crawler_from_row(row: &Row) -> Result<Crawler, CrawlerRepositoryError> {

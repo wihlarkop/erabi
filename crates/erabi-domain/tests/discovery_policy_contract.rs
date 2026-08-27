@@ -115,6 +115,26 @@ fn canonicalization_is_safe_deterministic_and_explainable() {
 }
 
 #[test]
+fn bare_origin_root_path_normalization_is_explainable_and_idempotent() {
+    let policy = canonical_policy(&[], &[]);
+    let first = policy.canonicalize("https://example.test").unwrap();
+    assert_eq!(first.canonical_url.as_str(), "https://example.test/");
+    assert!(
+        first
+            .decisions
+            .contains(&CanonicalizationDecision::PathNormalized)
+    );
+
+    let second = policy.canonicalize(first.canonical_url.as_str()).unwrap();
+    assert_eq!(second.canonical_url, first.canonical_url);
+    assert!(
+        !second
+            .decisions
+            .contains(&CanonicalizationDecision::PathNormalized)
+    );
+}
+
+#[test]
 fn canonicalization_preserves_unknown_query_semantics_and_raw_encoding() {
     let policy = canonical_policy(&[], &[]);
     let result = policy
@@ -374,7 +394,47 @@ fn discovery_budgets_enforce_limits_and_operational_baseline_is_separate() {
     assert_eq!(
         evaluator.evaluate(DiscoveryBudgetCandidate {
             current_depth: 2,
-            depth_contribution: 1,
+            ..DiscoveryBudgetCandidate::default()
+        }),
+        Ok(DiscoveryBudgetDecision::Excluded(
+            DiscoveryBudgetExclusion::MaxDepth
+        ))
+    );
+    assert_eq!(
+        evaluator.evaluate(DiscoveryBudgetCandidate {
+            current_depth: 1,
+            ..DiscoveryBudgetCandidate::default()
+        }),
+        Ok(DiscoveryBudgetDecision::Allowed)
+    );
+    let zero_depth_transition = TransitionBudget {
+        depth_contribution: 0,
+        ..transition_budget.clone()
+    };
+    let zero_depth_evaluator =
+        DiscoveryBudgetEvaluator::new(&guardrails, Some(&page_type), Some(&zero_depth_transition));
+    assert_eq!(
+        zero_depth_evaluator.evaluate(DiscoveryBudgetCandidate {
+            current_depth: 2,
+            ..DiscoveryBudgetCandidate::default()
+        }),
+        Ok(DiscoveryBudgetDecision::Allowed)
+    );
+    let mut caller_bypass_guardrails = CrawlerVersionGuardrails::default();
+    caller_bypass_guardrails.max_depth = 4;
+    let configured_transition = TransitionBudget {
+        max_links_per_source_page: 1,
+        total_budget: None,
+        depth_contribution: 3,
+    };
+    let caller_bypass_evaluator = DiscoveryBudgetEvaluator::new(
+        &caller_bypass_guardrails,
+        None,
+        Some(&configured_transition),
+    );
+    assert_eq!(
+        caller_bypass_evaluator.evaluate(DiscoveryBudgetCandidate {
+            current_depth: 3,
             ..DiscoveryBudgetCandidate::default()
         }),
         Ok(DiscoveryBudgetDecision::Excluded(
@@ -463,11 +523,16 @@ fn discovery_budget_overflow_and_cycle_bounds_are_deterministic() {
     let mut depth_guardrails = CrawlerVersionGuardrails::default();
     depth_guardrails.max_pages = u64::MAX;
     depth_guardrails.max_depth = u32::MAX;
-    let depth_evaluator = DiscoveryBudgetEvaluator::new(&depth_guardrails, None, None);
+    let depth_transition = TransitionBudget {
+        max_links_per_source_page: 1,
+        total_budget: None,
+        depth_contribution: 1,
+    };
+    let depth_evaluator =
+        DiscoveryBudgetEvaluator::new(&depth_guardrails, None, Some(&depth_transition));
     assert_eq!(
         depth_evaluator.evaluate(DiscoveryBudgetCandidate {
             current_depth: u32::MAX,
-            depth_contribution: 1,
             ..DiscoveryBudgetCandidate::default()
         }),
         Err(DiscoveryBudgetError::Overflow)
@@ -488,20 +553,14 @@ fn discovery_budget_overflow_and_cycle_bounds_are_deterministic() {
 
     let first = erabi_domain::PageTypeId::new();
     let second = erabi_domain::PageTypeId::new();
-    let graph = TransitionGraph::new(
-        &[first, second],
-        vec![transition(first, second), transition(second, first)],
-    )
-    .unwrap();
+    let forward = transition(first, second);
+    let transition_budget = forward.budget.clone();
+    let graph =
+        TransitionGraph::new(&[first, second], vec![forward, transition(second, first)]).unwrap();
     let guardrails = CrawlerVersionGuardrails {
         max_pages: 3,
         max_depth: 10,
         ..CrawlerVersionGuardrails::default()
-    };
-    let transition_budget = TransitionBudget {
-        max_links_per_source_page: 10,
-        total_budget: Some(10),
-        depth_contribution: 1,
     };
     let evaluator = DiscoveryBudgetEvaluator::new(&guardrails, None, Some(&transition_budget));
     let mut excluded = None;

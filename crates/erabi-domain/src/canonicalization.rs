@@ -146,13 +146,7 @@ impl CanonicalizationPolicy {
             decisions.push(CanonicalizationDecision::FragmentRemoved);
         }
 
-        if url.path().is_empty() {
-            // The MVP rule is intentionally conservative: only an empty path
-            // is rewritten. Repeated and non-root trailing slashes remain
-            // content-significant and are preserved.
-            url.set_path("/");
-            decisions.push(CanonicalizationDecision::PathNormalized);
-        }
+        normalize_root_path(&mut url, original_url, &mut decisions);
 
         let had_query = url.query().is_some();
         let raw_query = url.query().unwrap_or_default();
@@ -237,6 +231,32 @@ fn original_authority(original_url: &str) -> Option<&str> {
     let authority = original_url.split_once("://")?.1;
     let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     Some(&authority[..end])
+}
+
+fn original_path_is_empty(original_url: &str) -> bool {
+    let Some((_, authority_and_path)) = original_url.split_once("://") else {
+        return false;
+    };
+    let Some(path_start) = authority_and_path.find(['/', '?', '#']) else {
+        return true;
+    };
+    !authority_and_path[path_start..].starts_with('/')
+}
+
+fn normalize_root_path(
+    url: &mut url::Url,
+    original_url: &str,
+    decisions: &mut Vec<CanonicalizationDecision>,
+) {
+    // The MVP rule is intentionally conservative: only an empty path is
+    // rewritten. Repeated and non-root trailing slashes remain
+    // content-significant and are preserved.
+    if url.path().is_empty() || original_path_is_empty(original_url) {
+        if url.path().is_empty() {
+            url.set_path("/");
+        }
+        decisions.push(CanonicalizationDecision::PathNormalized);
+    }
 }
 
 fn original_host(original_url: &str) -> Option<&str> {
