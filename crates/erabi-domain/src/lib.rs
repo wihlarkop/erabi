@@ -1,10 +1,14 @@
 //! Core, dependency-light Crawler Studio domain contracts.
 
+mod budget;
+mod canonicalization;
 mod collection;
 mod crawl_snapshot;
 mod crawler;
 mod crawler_version;
+mod domain_scope;
 mod error;
+mod guardrails;
 mod id;
 mod matching;
 mod naming;
@@ -18,6 +22,14 @@ mod test_evidence;
 mod transition;
 mod url_matcher;
 
+pub use budget::{
+    DiscoveryBudgetCandidate, DiscoveryBudgetDecision, DiscoveryBudgetError,
+    DiscoveryBudgetEvaluator, DiscoveryBudgetExclusion,
+};
+pub use canonicalization::{
+    CANONICALIZATION_POLICY_VERSION, CanonicalizationDecision, CanonicalizationPolicy,
+    CanonicalizationResult,
+};
 pub use collection::Collection;
 pub use crawl_snapshot::{
     CrawlRunSnapshot, CrawlRunSnapshotDraft, MAX_ROBOTS_OVERRIDE_REASON_CHARS, RobotsAudit,
@@ -25,7 +37,15 @@ pub use crawl_snapshot::{
 };
 pub use crawler::Crawler;
 pub use crawler_version::{CrawlerVersion, CrawlerVersionState};
+pub use domain_scope::{
+    DOMAIN_SCOPE_POLICY_VERSION, DomainScopeClassification, DomainScopeHostRule, DomainScopeKind,
+    DomainScopePolicy, DomainScopeRationale,
+};
 pub use error::{ErrorCode, ProductError, SuggestedAction};
+pub use guardrails::{
+    CrawlerVersionGuardrails, DeferredPageTypeHealth, GUARDRAIL_POLICY_VERSION,
+    PageTypeDiscoveryGuardrails, ResolvedOperationalLimits,
+};
 pub use id::{
     ArtifactId, CanonicalizationPolicyId, CollectionId, CrawlRunId, CrawlerId, CrawlerVersionId,
     DiscoveryTransitionId, DomainScopeId, PageTypeId, RunProfileId, SeedId, SourceId,
@@ -40,5 +60,5 @@ pub use settings::{LayerValue, ResolvedValue, SettingLayers, SettingSource};
 pub use source::Source;
 pub use status::{CrawlRunStatus, CrawlRunType, SourceStatus, SourceTargetType};
 pub use test_evidence::TestEvidence;
-pub use transition::{DiscoveryTransition, TransitionBudget};
+pub use transition::{DiscoveryTransition, TransitionBudget, TransitionGraph};
 pub use url_matcher::{SpecificityKey, UrlMatcher, UrlMatcherDefinition, UrlMatcherKind};

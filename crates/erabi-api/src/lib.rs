@@ -6,6 +6,7 @@
 
 mod app;
 mod crawler_authoring;
+mod discovery_policy;
 mod error;
 mod job_actions;
 mod page_type_authoring;

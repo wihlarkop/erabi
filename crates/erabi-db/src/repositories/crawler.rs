@@ -4,8 +4,9 @@ use std::{
 };
 
 use erabi_domain::{
-    Crawler, CrawlerId, CrawlerVersion, CrawlerVersionId, CrawlerVersionState,
-    OperationalOverrides, PageType, PageTypeId, UrlMatcher, canonical_sha256,
+    CanonicalizationPolicy, Crawler, CrawlerId, CrawlerVersion, CrawlerVersionGuardrails,
+    CrawlerVersionId, CrawlerVersionState, DiscoveryTransition, DiscoveryTransitionId,
+    DomainScopePolicy, OperationalOverrides, PageType, PageTypeId, UrlMatcher, canonical_sha256,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -66,6 +67,26 @@ pub enum CrawlerRepositoryError {
     UrlMatcherNotOwnedByPageType,
     #[error("URLMatcher definition is invalid")]
     InvalidUrlMatcherDefinition,
+    #[error("DiscoveryTransition was not found")]
+    DiscoveryTransitionNotFound,
+    #[error("DiscoveryTransition does not belong to the requested CrawlerVersion")]
+    TransitionNotOwnedByVersion,
+    #[error("DiscoveryTransition source PageType was not found")]
+    TransitionSourcePageTypeNotFound,
+    #[error("DiscoveryTransition target PageType was not found")]
+    TransitionTargetPageTypeNotFound,
+    #[error("DiscoveryTransition is invalid")]
+    InvalidDiscoveryTransition,
+    #[error("canonicalization policy is invalid")]
+    InvalidCanonicalizationPolicy,
+    #[error("Domain Scope policy is invalid")]
+    InvalidDomainScope,
+    #[error("crawler guardrails are invalid")]
+    InvalidCrawlGuardrails,
+    #[error("PageType budget is invalid")]
+    InvalidPageTypeBudget,
+    #[error("transition budget is invalid")]
+    InvalidTransitionBudget,
     #[error("CrawlerVersion lifecycle transition is invalid")]
     InvalidLifecycleTransition,
     #[error("CrawlerVersion lifecycle transition conflicted with another request")]
@@ -130,6 +151,13 @@ pub struct UrlMatcherRecord {
     pub page_type_id: PageTypeId,
     pub ordinal: i64,
     pub matcher: UrlMatcher,
+}
+
+/// A durable typed `DiscoveryTransition` projection.
+#[derive(Clone, Debug)]
+pub struct DiscoveryTransitionRecord {
+    pub crawler_version_id: CrawlerVersionId,
+    pub transition: DiscoveryTransition,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,6 +247,7 @@ impl<'database> CrawlerRepository<'database> {
         let mut versions = Vec::new();
         while let Some(row) = rows.next().await.map_err(Self::database)? {
             let version = version_from_row(&row)?;
+            load_transition_records(&connection, &version).await?;
             let audit = audit_metadata(&connection, version.id()).await?;
             versions.push(CrawlerVersionRecord { version, audit });
         }
@@ -247,6 +276,7 @@ impl<'database> CrawlerRepository<'database> {
         if version.crawler_id() != crawler_id {
             return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
         }
+        load_transition_records(&connection, &version).await?;
         let audit = audit_metadata(&connection, version.id()).await?;
         Ok(CrawlerVersionRecord { version, audit })
     }
@@ -366,6 +396,9 @@ impl<'database> CrawlerRepository<'database> {
         if version.state() != CrawlerVersionState::Draft {
             return Err(CrawlerRepositoryError::PublishedVersionImmutable);
         }
+        version
+            .validate_semantic_contract()
+            .map_err(|error| map_semantic_error(error.code))?;
         let configuration = serialize(version).map_err(CrawlerRepositoryError::database)?;
         let mut connection = self.database.connection().await.map_err(Self::database)?;
         let transaction = connection
@@ -488,6 +521,423 @@ impl<'database> CrawlerRepository<'database> {
         let connection = self.database.connection().await.map_err(Self::database)?;
         let record = self.version(crawler_id, version_id).await?;
         semantic_hash(&connection, &record.version).await
+    }
+
+    /// Reads the selected version's typed canonicalization policy.
+    pub async fn canonicalization_policy(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+    ) -> Result<CanonicalizationPolicy, CrawlerRepositoryError> {
+        Ok(self
+            .version(crawler_id, version_id)
+            .await?
+            .version
+            .canonicalization_policy()
+            .clone())
+    }
+
+    /// Updates canonicalization semantics in the active Draft transactionally.
+    pub async fn update_canonicalization_policy(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        policy: &CanonicalizationPolicy,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<CanonicalizationPolicy, CrawlerRepositoryError> {
+        policy
+            .validate()
+            .map_err(|_| CrawlerRepositoryError::InvalidCanonicalizationPolicy)?;
+        let updated = self
+            .update_semantic_version(
+                crawler_id,
+                version_id,
+                actor,
+                occurred_at,
+                "CANONICALIZATION_POLICY_UPDATED",
+                "canonicalization",
+                |version| {
+                    version
+                        .set_canonicalization_policy(policy.clone())
+                        .map_err(|error| map_semantic_error(error.code))
+                },
+            )
+            .await?;
+        Ok(updated.canonicalization_policy().clone())
+    }
+
+    /// Reads the selected version's typed Domain Scope policy.
+    pub async fn domain_scope_policy(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+    ) -> Result<DomainScopePolicy, CrawlerRepositoryError> {
+        Ok(self
+            .version(crawler_id, version_id)
+            .await?
+            .version
+            .domain_scope()
+            .clone())
+    }
+
+    /// Updates Domain Scope semantics in the active Draft transactionally.
+    pub async fn update_domain_scope_policy(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        policy: &DomainScopePolicy,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<DomainScopePolicy, CrawlerRepositoryError> {
+        policy
+            .validate()
+            .map_err(|_| CrawlerRepositoryError::InvalidDomainScope)?;
+        let updated = self
+            .update_semantic_version(
+                crawler_id,
+                version_id,
+                actor,
+                occurred_at,
+                "DOMAIN_SCOPE_UPDATED",
+                "domain_scope",
+                |version| {
+                    version
+                        .set_domain_scope(policy.clone())
+                        .map_err(|error| map_semantic_error(error.code))
+                },
+            )
+            .await?;
+        Ok(updated.domain_scope().clone())
+    }
+
+    /// Reads the selected version's mandatory semantic guardrail baseline.
+    pub async fn crawler_version_guardrails(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+    ) -> Result<CrawlerVersionGuardrails, CrawlerRepositoryError> {
+        Ok(self
+            .version(crawler_id, version_id)
+            .await?
+            .version
+            .guardrails()
+            .clone())
+    }
+
+    /// Updates crawler and `PageType` guardrails in the active Draft transactionally.
+    pub async fn update_crawler_version_guardrails(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        guardrails: &CrawlerVersionGuardrails,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<CrawlerVersionGuardrails, CrawlerRepositoryError> {
+        guardrails
+            .validate()
+            .map_err(|error| map_semantic_error(error.code))?;
+        let updated = self
+            .update_semantic_version(
+                crawler_id,
+                version_id,
+                actor,
+                occurred_at,
+                "CRAWLER_GUARDRAILS_UPDATED",
+                "guardrails",
+                |version| {
+                    version
+                        .set_guardrails(guardrails.clone())
+                        .map_err(|error| map_semantic_error(error.code))
+                },
+            )
+            .await?;
+        Ok(updated.guardrails().clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_semantic_version<F>(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        actor: &str,
+        occurred_at: &str,
+        event_type: &str,
+        entity_id: &str,
+        update: F,
+    ) -> Result<CrawlerVersion, CrawlerRepositoryError>
+    where
+        F: FnOnce(&mut CrawlerVersion) -> Result<(), CrawlerRepositoryError>,
+    {
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(Self::database)?;
+        let result = async {
+            let mut version = load_mutation_version(&transaction, crawler_id, version_id).await?;
+            update(&mut version)?;
+            version
+                .validate_semantic_contract()
+                .map_err(|error| map_semantic_error(error.code))?;
+            let configuration = serialize(&version).map_err(CrawlerRepositoryError::database)?;
+            update_version_configuration(&transaction, &version, &configuration).await?;
+            let hash = semantic_hash(&transaction, &version).await?;
+            insert_semantic_mutation_audit(
+                &transaction,
+                event_type,
+                actor,
+                occurred_at,
+                version_id,
+                entity_id,
+                hash.as_str(),
+            )
+            .await?;
+            Ok::<CrawlerVersion, CrawlerRepositoryError>(version)
+        }
+        .await;
+        finish_transaction!(transaction, result)
+    }
+
+    /// Lists typed transitions in deterministic presentation order.
+    pub async fn list_discovery_transitions(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+    ) -> Result<Vec<DiscoveryTransitionRecord>, CrawlerRepositoryError> {
+        let version = self.version(crawler_id, version_id).await?;
+        let connection = self.database.connection().await.map_err(Self::database)?;
+        load_transition_records(&connection, &version.version).await
+    }
+
+    /// Reads one typed transition while validating version ownership.
+    pub async fn discovery_transition(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        transition_id: DiscoveryTransitionId,
+    ) -> Result<DiscoveryTransitionRecord, CrawlerRepositoryError> {
+        let transitions = self
+            .list_discovery_transitions(crawler_id, version_id)
+            .await?;
+        if let Some(record) = transitions
+            .into_iter()
+            .find(|record| record.transition.id == transition_id)
+        {
+            return Ok(record);
+        }
+        let connection = self.database.connection().await.map_err(Self::database)?;
+        ensure_transition_belongs_to_version(&connection, version_id, transition_id).await?;
+        Err(CrawlerRepositoryError::CorruptState)
+    }
+
+    /// Creates a directed transition and declares it in the same Draft transaction.
+    pub async fn create_discovery_transition(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        transition: &DiscoveryTransition,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<DiscoveryTransitionRecord, CrawlerRepositoryError> {
+        transition
+            .validate()
+            .map_err(|_| CrawlerRepositoryError::InvalidDiscoveryTransition)?;
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(Self::database)?;
+        let result = async {
+            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
+            ensure_transition_page_type(
+                &transaction,
+                version_id,
+                transition.source_page_type_id,
+                true,
+            )
+            .await?;
+            ensure_transition_page_type(
+                &transaction,
+                version_id,
+                transition.target_page_type_id,
+                false,
+            )
+            .await?;
+            if transition_row_exists(&transaction, transition.id).await? {
+                return Err(CrawlerRepositoryError::CorruptState);
+            }
+            let mut updated = version.clone();
+            let mut ids = updated.transition_ids().to_vec();
+            if ids.contains(&transition.id) {
+                return Err(CrawlerRepositoryError::CorruptState);
+            }
+            ids.push(transition.id);
+            updated
+                .set_transition_ids(ids)
+                .map_err(|_| CrawlerRepositoryError::PublishedVersionImmutable)?;
+            let version_configuration =
+                serialize(&updated).map_err(CrawlerRepositoryError::database)?;
+            let transition_configuration = serialize(transition)
+                .map_err(CrawlerRepositoryError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                    (
+                        transition.id.to_string(),
+                        version_id.to_string(),
+                        transition_configuration,
+                    ),
+                )
+                .await
+                .map_err(CrawlerRepositoryError::database)?;
+            update_version_configuration(&transaction, &updated, &version_configuration).await?;
+            let hash = semantic_hash(&transaction, &updated).await?;
+            insert_semantic_mutation_audit(
+                &transaction,
+                "DISCOVERY_TRANSITION_CREATED",
+                actor,
+                occurred_at,
+                version_id,
+                transition.id.to_string().as_str(),
+                hash.as_str(),
+            )
+            .await?;
+            Ok::<(), CrawlerRepositoryError>(())
+        }
+        .await;
+        finish_transaction!(transaction, result)?;
+        self.discovery_transition(crawler_id, version_id, transition.id)
+            .await
+    }
+
+    /// Replaces one typed transition without changing its identity.
+    pub async fn update_discovery_transition(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        transition_id: DiscoveryTransitionId,
+        transition: &DiscoveryTransition,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<DiscoveryTransitionRecord, CrawlerRepositoryError> {
+        if transition.id != transition_id {
+            return Err(CrawlerRepositoryError::InvalidDiscoveryTransition);
+        }
+        transition
+            .validate()
+            .map_err(|_| CrawlerRepositoryError::InvalidDiscoveryTransition)?;
+        let transition_configuration =
+            serialize(transition).map_err(CrawlerRepositoryError::database)?;
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(Self::database)?;
+        let result = async {
+            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
+            ensure_transition_belongs_to_version(&transaction, version_id, transition_id).await?;
+            ensure_transition_page_type(
+                &transaction,
+                version_id,
+                transition.source_page_type_id,
+                true,
+            )
+            .await?;
+            ensure_transition_page_type(
+                &transaction,
+                version_id,
+                transition.target_page_type_id,
+                false,
+            )
+            .await?;
+            let updated = transaction
+                .execute(
+                    "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2 AND crawler_version_id = ?3",
+                    (
+                        transition_configuration.as_str(),
+                        transition_id.to_string(),
+                        version_id.to_string(),
+                    ),
+                )
+                .await
+                .map_err(CrawlerRepositoryError::database)?;
+            if updated != 1 {
+                return Err(CrawlerRepositoryError::CorruptState);
+            }
+            let hash = semantic_hash(&transaction, &version).await?;
+            insert_semantic_mutation_audit(
+                &transaction,
+                "DISCOVERY_TRANSITION_UPDATED",
+                actor,
+                occurred_at,
+                version_id,
+                transition_id.to_string().as_str(),
+                hash.as_str(),
+            )
+            .await
+        }
+        .await;
+        finish_transaction!(transaction, result)?;
+        self.discovery_transition(crawler_id, version_id, transition_id)
+            .await
+    }
+
+    /// Deletes a transition row and its declared ID atomically.
+    pub async fn delete_discovery_transition(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+        transition_id: DiscoveryTransitionId,
+        actor: &str,
+        occurred_at: &str,
+    ) -> Result<(), CrawlerRepositoryError> {
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(Self::database)?;
+        let result = async {
+            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
+            ensure_transition_belongs_to_version(&transaction, version_id, transition_id).await?;
+            let mut updated = version.clone();
+            updated
+                .set_transition_ids(
+                    updated
+                        .transition_ids()
+                        .iter()
+                        .copied()
+                        .filter(|id| *id != transition_id)
+                        .collect(),
+                )
+                .map_err(|_| CrawlerRepositoryError::PublishedVersionImmutable)?;
+            let version_configuration =
+                serialize(&updated).map_err(CrawlerRepositoryError::database)?;
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM discovery_transitions WHERE id = ?1 AND crawler_version_id = ?2",
+                    (transition_id.to_string(), version_id.to_string()),
+                )
+                .await
+                .map_err(CrawlerRepositoryError::database)?;
+            if deleted != 1 {
+                return Err(CrawlerRepositoryError::CorruptState);
+            }
+            update_version_configuration(&transaction, &updated, &version_configuration).await?;
+            let hash = semantic_hash(&transaction, &updated).await?;
+            insert_semantic_mutation_audit(
+                &transaction,
+                "DISCOVERY_TRANSITION_DELETED",
+                actor,
+                occurred_at,
+                version_id,
+                transition_id.to_string().as_str(),
+                hash.as_str(),
+            )
+            .await
+        }
+        .await;
+        finish_transaction!(transaction, result)
     }
 
     /// Lists Page Types in deterministic presentation order for a selected
@@ -954,6 +1404,9 @@ async fn insert_draft_in_transaction(
     actor: &str,
     occurred_at: &str,
 ) -> Result<(), CrawlerRepositoryError> {
+    version
+        .validate_semantic_contract()
+        .map_err(|error| map_semantic_error(error.code))?;
     let crawler_id = version.crawler_id().to_string();
     let mut pointers = connection
         .query(
@@ -1365,6 +1818,7 @@ async fn load_mutation_version(
     // version projection and typed child rows.
     validate_seed_hint_projection(connection, &version).await?;
     load_page_type_records(connection, &version).await?;
+    load_transition_records(connection, &version).await?;
     Ok(version)
 }
 
@@ -1487,6 +1941,89 @@ async fn load_page_type_records(
     Ok(records)
 }
 
+async fn load_transition_records(
+    connection: &Connection,
+    version: &CrawlerVersion,
+) -> Result<Vec<DiscoveryTransitionRecord>, CrawlerRepositoryError> {
+    let declared = version
+        .transition_ids()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    if declared.len() != version.transition_ids().len() {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+
+    let mut rows = connection
+        .query(
+            "SELECT id, crawler_version_id, configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1 ORDER BY id",
+            [version.id().to_string()],
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    let mut records = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+    {
+        let id = parse_transition_id(
+            &row.get::<String>(0)
+                .map_err(CrawlerRepositoryError::database)?,
+        )?;
+        let owner = parse_version_id(
+            &row.get::<String>(1)
+                .map_err(CrawlerRepositoryError::database)?,
+        )?;
+        if owner != version.id() || !declared.contains(&id.to_string()) {
+            return Err(CrawlerRepositoryError::CorruptState);
+        }
+        let configuration: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
+        let transition: DiscoveryTransition = serde_json::from_str(&configuration)
+            .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+        if transition.id != id
+            || !version
+                .page_type_ids()
+                .contains(&transition.source_page_type_id)
+            || !version
+                .page_type_ids()
+                .contains(&transition.target_page_type_id)
+        {
+            return Err(CrawlerRepositoryError::CorruptState);
+        }
+        ensure_page_type_belongs_to_version(
+            connection,
+            version.id(),
+            transition.source_page_type_id,
+        )
+        .await
+        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+        ensure_page_type_belongs_to_version(
+            connection,
+            version.id(),
+            transition.target_page_type_id,
+        )
+        .await
+        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+        transition
+            .validate()
+            .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+        records.push(DiscoveryTransitionRecord {
+            crawler_version_id: owner,
+            transition,
+        });
+    }
+    if records
+        .iter()
+        .map(|record| record.transition.id.to_string())
+        .collect::<BTreeSet<_>>()
+        != declared
+    {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+    Ok(records)
+}
+
 async fn load_matchers_for_page_type(
     connection: &Connection,
     page_type_id: PageTypeId,
@@ -1555,6 +2092,76 @@ async fn ensure_page_type_belongs_to_version(
         return Err(CrawlerRepositoryError::PageTypeNotOwnedByVersion);
     }
     Ok(())
+}
+
+async fn ensure_transition_belongs_to_version(
+    connection: &Connection,
+    version_id: CrawlerVersionId,
+    transition_id: DiscoveryTransitionId,
+) -> Result<(), CrawlerRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT crawler_version_id FROM discovery_transitions WHERE id = ?1",
+            [transition_id.to_string()],
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+    else {
+        return Err(CrawlerRepositoryError::DiscoveryTransitionNotFound);
+    };
+    let owner = parse_version_id(
+        &row.get::<String>(0)
+            .map_err(CrawlerRepositoryError::database)?,
+    )?;
+    if owner != version_id {
+        return Err(CrawlerRepositoryError::TransitionNotOwnedByVersion);
+    }
+    Ok(())
+}
+
+async fn ensure_transition_page_type(
+    connection: &Connection,
+    version_id: CrawlerVersionId,
+    page_type_id: PageTypeId,
+    source: bool,
+) -> Result<(), CrawlerRepositoryError> {
+    ensure_page_type_belongs_to_version(connection, version_id, page_type_id)
+        .await
+        .map_err(|error| match error {
+            CrawlerRepositoryError::PageTypeNotFound => {
+                if source {
+                    CrawlerRepositoryError::TransitionSourcePageTypeNotFound
+                } else {
+                    CrawlerRepositoryError::TransitionTargetPageTypeNotFound
+                }
+            }
+            CrawlerRepositoryError::PageTypeNotOwnedByVersion => {
+                CrawlerRepositoryError::TransitionNotOwnedByVersion
+            }
+            other => other,
+        })
+}
+
+async fn transition_row_exists(
+    connection: &Connection,
+    transition_id: DiscoveryTransitionId,
+) -> Result<bool, CrawlerRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM discovery_transitions WHERE id = ?1",
+            [transition_id.to_string()],
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+        .is_some())
 }
 
 async fn ensure_matcher_belongs_to_page_type(
@@ -1751,6 +2358,9 @@ fn version_from_row(row: &Row) -> Result<CrawlerVersion, CrawlerRepositoryError>
     if version.id() != id || version.crawler_id() != owner || version.state() != expected_state {
         return Err(CrawlerRepositoryError::CorruptState);
     }
+    version
+        .validate_semantic_contract()
+        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
     Ok(version)
 }
 
@@ -2066,6 +2676,10 @@ async fn semantic_hash(
     connection: &Connection,
     version: &CrawlerVersion,
 ) -> Result<String, CrawlerRepositoryError> {
+    version
+        .validate_semantic_contract()
+        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+    load_transition_records(connection, version).await?;
     let mut version_json = serde_json::to_value(version).map_err(|error| {
         CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
     })?;
@@ -2173,12 +2787,19 @@ async fn semantic_hash(
         "SELECT id, configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1",
         version.id(),
         |row| {
+            let id = parse_transition_id(
+                &row.get::<String>(0)
+                    .map_err(CrawlerRepositoryError::database)?,
+            )?;
             let configuration: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
-            let configuration: Value = serde_json::from_str(&configuration)
+            let transition: DiscoveryTransition = serde_json::from_str(&configuration)
                 .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+            if transition.id != id {
+                return Err(CrawlerRepositoryError::CorruptState);
+            }
             Ok(serde_json::json!({
-                "id": row.get::<String>(0).map_err(CrawlerRepositoryError::database)?,
-                "configuration": configuration,
+                "id": id.to_string(),
+                "configuration": transition_semantic_value(&transition)?,
             }))
         },
     )
@@ -2196,6 +2817,20 @@ async fn semantic_hash(
     canonical_sha256(&payload).map_err(|error| {
         CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
     })
+}
+
+fn transition_semantic_value(
+    transition: &DiscoveryTransition,
+) -> Result<Value, CrawlerRepositoryError> {
+    let mut value = serde_json::to_value(transition).map_err(|error| {
+        CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
+    })?;
+    if let Value::Object(object) = &mut value {
+        // Test Evidence is confidence metadata owned by the later Test Lab;
+        // attaching the latest evidence must not change crawler semantics.
+        object.remove("latest_test_evidence_id");
+    }
+    Ok(value)
 }
 
 struct SemanticHashTemplate {
@@ -2577,6 +3212,11 @@ fn sort_version_collections(value: &mut Value) {
             values.sort_by_key(canonical_sort_key);
         }
     }
+    if let Some(Value::Object(guardrails)) = object.get_mut("guardrails")
+        && let Some(Value::Array(page_types)) = guardrails.get_mut("page_types")
+    {
+        page_types.sort_by_key(canonical_sort_key);
+    }
 }
 
 async fn child_values<F>(
@@ -2730,6 +3370,33 @@ fn repository_error_as_db(error: CrawlerRepositoryError) -> DbError {
     }
 }
 
+fn map_semantic_error(code: erabi_domain::ErrorCode) -> CrawlerRepositoryError {
+    match code {
+        erabi_domain::ErrorCode::InvalidCanonicalizationPolicy => {
+            CrawlerRepositoryError::InvalidCanonicalizationPolicy
+        }
+        erabi_domain::ErrorCode::InvalidDomainScope
+        | erabi_domain::ErrorCode::InvalidDomainScopeRule
+        | erabi_domain::ErrorCode::RegistrableDomainUnavailable => {
+            CrawlerRepositoryError::InvalidDomainScope
+        }
+        erabi_domain::ErrorCode::InvalidCrawlGuardrails => {
+            CrawlerRepositoryError::InvalidCrawlGuardrails
+        }
+        erabi_domain::ErrorCode::InvalidPageTypeBudget => {
+            CrawlerRepositoryError::InvalidPageTypeBudget
+        }
+        erabi_domain::ErrorCode::InvalidTransitionBudget => {
+            CrawlerRepositoryError::InvalidTransitionBudget
+        }
+        erabi_domain::ErrorCode::InvalidDiscoveryTransition => {
+            CrawlerRepositoryError::InvalidDiscoveryTransition
+        }
+        erabi_domain::ErrorCode::Conflict => CrawlerRepositoryError::PublishedVersionImmutable,
+        _ => CrawlerRepositoryError::CorruptState,
+    }
+}
+
 fn new_opaque_id() -> String {
     Uuid::now_v7().to_string()
 }
@@ -2755,6 +3422,13 @@ fn parse_page_type_id(value: &str) -> Result<PageTypeId, CrawlerRepositoryError>
         .ok_or(CrawlerRepositoryError::CorruptState)
 }
 
+fn parse_transition_id(value: &str) -> Result<DiscoveryTransitionId, CrawlerRepositoryError> {
+    Uuid::parse_str(value)
+        .ok()
+        .and_then(DiscoveryTransitionId::from_uuid)
+        .ok_or(CrawlerRepositoryError::CorruptState)
+}
+
 fn parse_collection_id(value: &str) -> Result<erabi_domain::CollectionId, CrawlerRepositoryError> {
     Uuid::parse_str(value)
         .ok()
@@ -2771,8 +3445,8 @@ mod tests {
     use super::*;
     use crate::MigrationRunner;
     use erabi_domain::{
-        CanonicalizationPolicyId, CrawlerVersion, DiscoveryTransitionId, DomainScopeId, PageTypeId,
-        Seed, UrlMatcher, resolve_page_type,
+        CanonicalizationPolicyId, CrawlerVersion, DiscoveryTransition, DiscoveryTransitionId,
+        DomainScopeId, PageTypeId, Seed, TransitionBudget, UrlMatcher, resolve_page_type,
     };
 
     async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -2852,6 +3526,31 @@ mod tests {
         }
     }
 
+    fn persisted_transition(
+        id: DiscoveryTransitionId,
+        source_page_type_id: PageTypeId,
+        target_page_type_id: PageTypeId,
+        name: &str,
+    ) -> DiscoveryTransition {
+        DiscoveryTransition {
+            id,
+            source_page_type_id,
+            target_page_type_id,
+            name: name.to_owned(),
+            enabled: true,
+            link_selector: "a[href]".to_owned(),
+            url_constraints: None,
+            priority: 10,
+            budget: TransitionBudget {
+                max_links_per_source_page: 10,
+                total_budget: Some(100),
+                depth_contribution: 1,
+            },
+            deduplicate: true,
+            latest_test_evidence_id: None,
+        }
+    }
+
     async fn graph_version(
         database: &ErabiDatabase,
         name: &str,
@@ -2911,15 +3610,16 @@ mod tests {
                 (
                     transition.to_string(),
                     version.id().to_string(),
-                    serde_json::json!({
-                        "source_page_type_id": source_page.to_string(),
-                        "target_page_type_id": if shape.transition_target == TransitionTarget::Source {
-                            source_page.to_string()
+                    serde_json::to_string(&persisted_transition(
+                        transition,
+                        source_page,
+                        if shape.transition_target == TransitionTarget::Source {
+                            source_page
                         } else {
-                            target_page.to_string()
+                            target_page
                         },
-                    })
-                    .to_string(),
+                        "graph transition",
+                    ))?,
                 ),
             )
             .await?;
@@ -2997,11 +3697,12 @@ mod tests {
                         (
                             transition_id.to_string(),
                             version.id().to_string(),
-                            serde_json::json!({
-                                "source_page_type_id": source_page.to_string(),
-                                "target_page_type_id": target.to_string(),
-                            })
-                            .to_string(),
+                            serde_json::to_string(&persisted_transition(
+                                transition_id,
+                                source_page,
+                                target,
+                                "symmetric transition",
+                            ))?,
                         ),
                     )
                     .await?;
@@ -3376,8 +4077,17 @@ mod tests {
             .await?;
         connection
             .execute(
-                "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, '{\"target\":\"catalog\"}')",
-                (transition_id.to_string(), initial.id().to_string()),
+                "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                (
+                    transition_id.to_string(),
+                    initial.id().to_string(),
+                    serde_json::to_string(&persisted_transition(
+                        transition_id,
+                        page_type_id,
+                        page_type_id,
+                        "catalog links",
+                    ))?,
+                ),
             )
             .await?;
 
@@ -3650,10 +4360,22 @@ mod tests {
                         transition_id.to_string(),
                         version.id().to_string(),
                         serde_json::json!({
+                            "id": transition_id.to_string(),
                             "source_page_type_id": page_ids[index].to_string(),
                             "target_page_type_id": page_ids[(index + 1) % page_ids.len()].to_string(),
-                        })
-                        .to_string(),
+                            "name": format!("transition {index}"),
+                            "enabled": true,
+                            "link_selector": "a[href]",
+                            "url_constraints": null,
+                            "priority": 10,
+                            "budget": {
+                                "max_links_per_source_page": 10,
+                                "total_budget": 100,
+                                "depth_contribution": 1
+                            },
+                            "deduplicate": true,
+                            "latest_test_evidence_id": null
+                        }).to_string(),
                     ),
                 )
                 .await?;
@@ -4530,6 +5252,128 @@ mod tests {
                 .configuration_hash(crawler.id(), draft.id())
                 .await?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::expect_used)]
+    async fn discovery_policy_persistence_is_immutable_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let repository = CrawlerRepository::new(&database);
+        let crawler = Crawler::new("Discovery policy integrity");
+        repository.create(&crawler).await?;
+        let draft = repository
+            .create_draft(crawler.id(), "operator", "now")
+            .await?;
+        let page = repository
+            .create_page_type(crawler.id(), draft.id(), "Cycle", 1, "operator", "now")
+            .await?;
+        let transition_id = DiscoveryTransitionId::new();
+        repository
+            .create_discovery_transition(
+                crawler.id(),
+                draft.id(),
+                &persisted_transition(transition_id, page.id, page.id, "cycle"),
+                "operator",
+                "now",
+            )
+            .await?;
+        let _published = repository
+            .publish(crawler.id(), draft.id(), "operator", "now")
+            .await?;
+        let connection = database.connection().await?;
+        assert!(
+            connection
+                .execute(
+                    "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2",
+                    (
+                        serde_json::to_string(&persisted_transition(
+                            transition_id,
+                            page.id,
+                            page.id,
+                            "changed"
+                        ))?,
+                        transition_id.to_string(),
+                    ),
+                )
+                .await
+                .is_err()
+        );
+
+        let corrupted_draft = repository
+            .create_draft(crawler.id(), "operator", "now")
+            .await?;
+        let corrupt_page = repository
+            .create_page_type(
+                crawler.id(),
+                corrupted_draft.id(),
+                "Corrupt transition source",
+                1,
+                "operator",
+                "now",
+            )
+            .await?;
+        let corrupt_transition_id = DiscoveryTransitionId::new();
+        let corrupt_transition = persisted_transition(
+            corrupt_transition_id,
+            corrupt_page.id,
+            corrupt_page.id,
+            "corruptible",
+        );
+        repository
+            .create_discovery_transition(
+                crawler.id(),
+                corrupted_draft.id(),
+                &corrupt_transition,
+                "operator",
+                "now",
+            )
+            .await?;
+        connection
+            .execute(
+                "UPDATE discovery_transitions SET configuration_json = '{}' WHERE id = ?1",
+                [corrupt_transition_id.to_string()],
+            )
+            .await?;
+        assert!(matches!(
+            repository
+                .list_discovery_transitions(crawler.id(), corrupted_draft.id())
+                .await,
+            Err(CrawlerRepositoryError::CorruptState)
+        ));
+        connection
+            .execute(
+                "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2",
+                (
+                    serde_json::to_string(&corrupt_transition)?,
+                    corrupt_transition_id.to_string(),
+                ),
+            )
+            .await?;
+        let mut corrupted_configuration = serde_json::to_value(
+            &repository
+                .version(crawler.id(), corrupted_draft.id())
+                .await?
+                .version,
+        )?;
+        corrupted_configuration["guardrails"]["version"] = serde_json::json!(999);
+        connection
+            .execute(
+                "UPDATE crawler_versions SET semantic_configuration_json = ?1 WHERE id = ?2",
+                (
+                    corrupted_configuration.to_string(),
+                    corrupted_draft.id().to_string(),
+                ),
+            )
+            .await?;
+        assert!(matches!(
+            repository
+                .crawler_version_guardrails(crawler.id(), corrupted_draft.id())
+                .await,
+            Err(CrawlerRepositoryError::CorruptState)
+        ));
+
         Ok(())
     }
 }

@@ -13,6 +13,17 @@ pub enum ErrorCode {
     NotFound,
     AccessDenied,
     CrawlerTimeout,
+    InvalidCanonicalizationPolicy,
+    InvalidUrl,
+    UnsupportedUrlScheme,
+    InvalidDomainScope,
+    InvalidDomainScopeRule,
+    RegistrableDomainUnavailable,
+    InvalidDiscoveryTransition,
+    InvalidCrawlGuardrails,
+    InvalidPageTypeBudget,
+    InvalidTransitionBudget,
+    BudgetOverflow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -32,6 +43,18 @@ pub struct ProductError {
 }
 
 impl ProductError {
+    #[must_use]
+    pub fn with_code(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            safe_message: message.into(),
+            details: Value::Null,
+            recoverable: false,
+            suggested_actions: Vec::new(),
+            trace_id: String::new(),
+        }
+    }
+
     #[must_use]
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {

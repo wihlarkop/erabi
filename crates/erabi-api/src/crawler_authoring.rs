@@ -378,7 +378,7 @@ fn version_dto(crawler: &Crawler, record: &CrawlerVersionRecord) -> CrawlerVersi
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
     let (status, code, message) = match error {
         CrawlerRepositoryError::CrawlerNotFound => (
@@ -450,6 +450,56 @@ fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
             StatusCode::BAD_REQUEST,
             "INVALID_URL_MATCHER",
             "The URLMatcher definition is invalid.",
+        ),
+        CrawlerRepositoryError::DiscoveryTransitionNotFound => (
+            StatusCode::NOT_FOUND,
+            "DISCOVERY_TRANSITION_NOT_FOUND",
+            "The requested DiscoveryTransition does not exist.",
+        ),
+        CrawlerRepositoryError::TransitionNotOwnedByVersion => (
+            StatusCode::CONFLICT,
+            "TRANSITION_NOT_OWNED_BY_VERSION",
+            "The DiscoveryTransition does not belong to this CrawlerVersion.",
+        ),
+        CrawlerRepositoryError::TransitionSourcePageTypeNotFound => (
+            StatusCode::NOT_FOUND,
+            "TRANSITION_SOURCE_PAGE_TYPE_NOT_FOUND",
+            "The transition source PageType does not exist.",
+        ),
+        CrawlerRepositoryError::TransitionTargetPageTypeNotFound => (
+            StatusCode::NOT_FOUND,
+            "TRANSITION_TARGET_PAGE_TYPE_NOT_FOUND",
+            "The transition target PageType does not exist.",
+        ),
+        CrawlerRepositoryError::InvalidDiscoveryTransition => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_DISCOVERY_TRANSITION",
+            "The DiscoveryTransition is invalid.",
+        ),
+        CrawlerRepositoryError::InvalidCanonicalizationPolicy => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_CANONICALIZATION_POLICY",
+            "The canonicalization policy is invalid.",
+        ),
+        CrawlerRepositoryError::InvalidDomainScope => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_DOMAIN_SCOPE",
+            "The Domain Scope policy is invalid.",
+        ),
+        CrawlerRepositoryError::InvalidCrawlGuardrails => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_CRAWL_GUARDRAILS",
+            "The crawler guardrails are invalid.",
+        ),
+        CrawlerRepositoryError::InvalidPageTypeBudget => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_PAGE_TYPE_BUDGET",
+            "The PageType budget is invalid.",
+        ),
+        CrawlerRepositoryError::InvalidTransitionBudget => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSITION_BUDGET",
+            "The transition budget is invalid.",
         ),
         CrawlerRepositoryError::InvalidLifecycleTransition => (
             StatusCode::CONFLICT,

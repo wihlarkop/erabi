@@ -20,6 +20,13 @@ use crate::{
         create_crawler, create_draft, list_crawlers, list_versions, publish_version,
         reactivate_version, read_crawler, read_version,
     },
+    discovery_policy::{
+        canonicalize_url, classify_domain_scope, create_discovery_transition,
+        delete_discovery_transition, list_discovery_transitions, read_canonicalization,
+        read_crawler_version_guardrails, read_discovery_transition, read_domain_scope,
+        update_canonicalization, update_crawler_version_guardrails, update_discovery_transition,
+        update_domain_scope,
+    },
     error::{ApiErrorEnvelope, error_response},
     job_actions::{
         cancel as cancel_job, remove as remove_job, reprioritize as reprioritize_job,
@@ -69,6 +76,7 @@ impl TraceId {
 /// reads its session-stored bearer token. Later API modules attach only below
 /// the protected boundary.
 #[allow(clippy::needless_pass_by_value)] // Public contract intentionally owns the shared router state.
+#[allow(clippy::too_many_lines)]
 pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
     let liveness = Router::new().route("/api/v1/health", get(liveness));
     let documentation = if security.openapi_enabled() {
@@ -116,6 +124,36 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/match-page-type",
             post(match_page_type),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalization",
+            get(read_canonicalization).put(update_canonicalization),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalize-url",
+            post(canonicalize_url),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/domain-scope",
+            get(read_domain_scope).put(update_domain_scope),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/classify-domain-scope",
+            post(classify_domain_scope),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/guardrails",
+            get(read_crawler_version_guardrails).put(update_crawler_version_guardrails),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions",
+            get(list_discovery_transitions).post(create_discovery_transition),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions/{transition_id}",
+            get(read_discovery_transition)
+                .put(update_discovery_transition)
+                .delete(delete_discovery_transition),
         )
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
         .route(
@@ -362,6 +400,7 @@ struct OpenApiComponents {
 }
 
 impl OpenApiDocument {
+    #[allow(clippy::too_many_lines)]
     fn generated() -> Self {
         let mut paths = BTreeMap::new();
         paths.insert("/api/v1/health", OpenApiPath::get("Liveness"));
@@ -419,6 +458,34 @@ impl OpenApiDocument {
             OpenApiPath::post("Explain deterministic PageType matching"),
         );
         paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalization",
+            OpenApiPath::get_put("Read or update canonicalization policy"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalize-url",
+            OpenApiPath::post("Explain URL canonicalization"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/domain-scope",
+            OpenApiPath::get_put("Read or update Domain Scope policy"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/classify-domain-scope",
+            OpenApiPath::post("Classify URL Domain Scope"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/guardrails",
+            OpenApiPath::get_put("Read or update crawler guardrails"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions",
+            OpenApiPath::get_post("List or create DiscoveryTransitions"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions/{transition_id}",
+            OpenApiPath::get_put_delete("Read, update, or delete a DiscoveryTransition"),
+        );
+        paths.insert(
             "/api/v1/events/jobs/{job_id}/progress",
             OpenApiPath::get("Replayable job progress stream"),
         );
@@ -452,7 +519,11 @@ impl OpenApiDocument {
             },
             paths,
             components: OpenApiComponents {
-                schemas: task2_openapi_schemas(),
+                schemas: {
+                    let mut schemas = task2_openapi_schemas();
+                    schemas.extend(crawler_discovery_openapi_schemas());
+                    schemas
+                },
             },
         }
     }
@@ -500,6 +571,15 @@ impl OpenApiPath {
             get: Some(OpenApiOperation { summary }),
             post: Some(OpenApiOperation { summary }),
             put: None,
+            delete: None,
+        }
+    }
+
+    const fn get_put(summary: &'static str) -> Self {
+        Self {
+            get: Some(OpenApiOperation { summary }),
+            post: None,
+            put: Some(OpenApiOperation { summary }),
             delete: None,
         }
     }
@@ -634,6 +714,196 @@ fn task2_openapi_schemas() -> BTreeMap<&'static str, Value> {
                 {"type": "object", "required": ["decision", "candidate", "candidates"], "properties": {"decision": {"const": "AMBIGUOUS_PAGE_TYPE"}, "candidate": {"type": "null"}, "candidates": {"type": "array", "minItems": 2, "items": {"$ref": "#/components/schemas/MatchCandidate"}}}},
                 {"type": "object", "required": ["decision", "candidate", "candidates"], "properties": {"decision": {"const": "UNMATCHED"}, "candidate": {"type": "null"}, "candidates": {"type": "array", "maxItems": 0}}}
             ]
+        }),
+    );
+    schemas
+}
+
+#[allow(clippy::too_many_lines)]
+fn crawler_discovery_openapi_schemas() -> BTreeMap<&'static str, Value> {
+    let mut schemas = BTreeMap::new();
+    schemas.insert(
+        "CanonicalizeUrlRequest",
+        serde_json::json!({
+            "type": "object",
+            "required": ["url"],
+            "properties": {"url": {"type": "string", "format": "uri"}}
+        }),
+    );
+    schemas.insert(
+        "ClassifyDomainScopeRequest",
+        serde_json::json!({
+            "type": "object",
+            "required": ["url"],
+            "properties": {"url": {"type": "string", "format": "uri"}}
+        }),
+    );
+    schemas.insert(
+        "CanonicalizationPolicy",
+        serde_json::json!({
+            "type": "object",
+            "required": ["version", "explicit_keep_parameters", "explicit_drop_parameters"],
+            "properties": {
+                "version": {"type": "integer", "const": 1},
+                "explicit_keep_parameters": {"type": "array", "items": {"type": "string"}},
+                "explicit_drop_parameters": {"type": "array", "items": {"type": "string"}}
+            }
+        }),
+    );
+    schemas.insert(
+        "CanonicalizationExplanation",
+        serde_json::json!({
+            "type": "object",
+            "required": ["original_url", "canonical_url", "decisions"],
+            "properties": {
+                "original_url": {"type": "string", "format": "uri"},
+                "canonical_url": {"type": "string", "format": "uri"},
+                "decisions": {"type": "array", "items": {"$ref": "#/components/schemas/CanonicalizationDecision"}}
+            }
+        }),
+    );
+    schemas.insert(
+        "CanonicalizationDecision",
+        serde_json::json!({
+            "oneOf": [
+                {"type": "object", "required": ["code"], "properties": {"code": {"const": "SCHEME_NORMALIZED"}}},
+                {"type": "object", "required": ["code"], "properties": {"code": {"const": "HOST_NORMALIZED"}}},
+                {"type": "object", "required": ["code"], "properties": {"code": {"const": "DEFAULT_PORT_REMOVED"}}},
+                {"type": "object", "required": ["code"], "properties": {"code": {"const": "FRAGMENT_REMOVED"}}},
+                {"type": "object", "required": ["code"], "properties": {"code": {"const": "PATH_NORMALIZED"}}},
+                {"type": "object", "required": ["code"], "properties": {"code": {"const": "QUERY_SORTED"}}},
+                {"type": "object", "required": ["code", "parameter"], "properties": {"code": {"const": "TRACKING_PARAMETER_REMOVED"}, "parameter": {"type": "string"}}},
+                {"type": "object", "required": ["code", "parameter"], "properties": {"code": {"const": "CUSTOM_PARAMETER_DROPPED"}, "parameter": {"type": "string"}}},
+                {"type": "object", "required": ["code", "parameter"], "properties": {"code": {"const": "EXPLICIT_PARAMETER_KEPT"}, "parameter": {"type": "string"}}}
+            ]
+        }),
+    );
+    schemas.insert(
+        "DomainScopePolicy",
+        serde_json::json!({
+            "type": "object",
+            "required": ["version", "policy"],
+            "properties": {
+                "version": {"type": "integer", "const": 1},
+                "policy": {
+                    "oneOf": [
+                        {"type": "object", "required": ["kind"], "properties": {"kind": {"const": "SEED_DOMAINS_ONLY"}}},
+                        {"type": "object", "required": ["kind", "explicit_subdomains"], "properties": {"kind": {"const": "SAME_REGISTRABLE_DOMAIN"}, "explicit_subdomains": {"type": "array", "items": {"type": "string"}}}},
+                        {"type": "object", "required": ["kind", "hosts"], "properties": {"kind": {"const": "EXPLICIT_ALLOWLIST"}, "hosts": {"type": "array", "items": {"type": "string"}}}},
+                        {"type": "object", "required": ["kind", "allow", "block"], "properties": {"kind": {"const": "CUSTOM"}, "allow": {"type": "array", "items": {"$ref": "#/components/schemas/DomainScopeHostRule"}}, "block": {"type": "array", "items": {"$ref": "#/components/schemas/DomainScopeHostRule"}}}}
+                    ]
+                }
+            }
+        }),
+    );
+    schemas.insert(
+        "DomainScopeHostRule",
+        serde_json::json!({
+            "oneOf": [
+                {"type": "object", "required": ["kind", "host"], "properties": {"kind": {"const": "EXACT"}, "host": {"type": "string"}}},
+                {"type": "object", "required": ["kind", "host"], "properties": {"kind": {"const": "SUBDOMAINS"}, "host": {"type": "string"}}}
+            ]
+        }),
+    );
+    schemas.insert(
+        "DomainScopeClassification",
+        serde_json::json!({
+            "oneOf": [
+                {"type": "object", "required": ["classification", "host", "rationale"], "properties": {"classification": {"const": "IN_SCOPE"}, "host": {"type": "string"}, "rationale": {"$ref": "#/components/schemas/DomainScopeRationale"}}},
+                {"type": "object", "required": ["classification", "host", "rationale"], "properties": {"classification": {"const": "EXTERNAL"}, "host": {"type": "string"}, "rationale": {"$ref": "#/components/schemas/DomainScopeRationale"}}},
+                {"type": "object", "required": ["classification", "host", "rationale"], "properties": {"classification": {"const": "BLOCKED"}, "host": {"type": "string"}, "rationale": {"$ref": "#/components/schemas/DomainScopeRationale"}}}
+            ]
+        }),
+    );
+    schemas.insert(
+        "DomainScopeRationale",
+        serde_json::json!({
+            "type": "string",
+            "enum": ["SEED_HOST", "REGISTRABLE_DOMAIN", "EXPLICIT_SUBDOMAIN", "UNSELECTED_SUBDOMAIN", "EXPLICIT_ALLOWLIST", "OUTSIDE_SEED_DOMAINS", "OUTSIDE_ALLOWLIST", "EXPLICIT_BLOCK", "CUSTOM_ALLOW", "OUTSIDE_CUSTOM_ALLOW"]
+        }),
+    );
+    schemas.insert(
+        "CrawlerVersionGuardrails",
+        serde_json::json!({
+            "type": "object",
+            "required": ["version", "max_pages", "max_depth", "max_duration_seconds", "max_downloaded_bytes", "max_concurrent_requests_per_domain", "min_request_delay_ms", "page_types"],
+            "properties": {
+                "version": {"type": "integer", "const": 1},
+                "max_pages": {"type": "integer", "minimum": 1},
+                "max_depth": {"type": "integer", "minimum": 1},
+                "max_duration_seconds": {"type": "integer", "minimum": 1},
+                "max_downloaded_bytes": {"type": "integer", "minimum": 1},
+                "max_concurrent_requests_per_domain": {"type": "integer", "minimum": 1},
+                "min_request_delay_ms": {"type": "integer", "minimum": 0},
+                "page_types": {"type": "array", "items": {"$ref": "#/components/schemas/PageTypeDiscoveryGuardrails"}}
+            }
+        }),
+    );
+    schemas.insert(
+        "PageTypeDiscoveryGuardrails",
+        serde_json::json!({
+            "type": "object",
+            "required": ["page_type_id", "page_budget", "health_threshold"],
+            "properties": {"page_type_id": {"type": "string", "format": "uuid"}, "page_budget": {"type": ["integer", "null"], "minimum": 1}, "health_threshold": {"anyOf": [{"$ref": "#/components/schemas/DeferredPageTypeHealth"}, {"type": "null"}]}}
+        }),
+    );
+    schemas.insert(
+        "DeferredPageTypeHealth",
+        serde_json::json!({
+            "type": "object",
+            "required": ["kind", "version"],
+            "properties": {"kind": {"const": "DEFERRED_EXTRACTION_HEALTH"}, "version": {"type": "integer", "const": 1}},
+            "description": "Versioned placeholder only; extraction and validation health metrics belong to a later extraction contract."
+        }),
+    );
+    schemas.insert(
+        "DiscoveryTransition",
+        serde_json::json!({
+            "type": "object",
+            "required": ["id", "source_page_type_id", "target_page_type_id", "name", "enabled", "link_selector", "url_constraints", "priority", "max_links_per_source_page", "total_transition_budget", "depth_contribution", "deduplicate", "latest_test_evidence_id"],
+            "properties": {
+                "id": {"type": "string", "format": "uuid"},
+                "source_page_type_id": {"type": "string", "format": "uuid"},
+                "target_page_type_id": {"type": "string", "format": "uuid"},
+                "name": {"type": "string", "maxLength": 256},
+                "enabled": {"type": "boolean"},
+                "link_selector": {"type": "string", "maxLength": 1024},
+                "url_constraints": {"type": ["string", "null"], "maxLength": 2048},
+                "priority": {"type": "integer"},
+                "max_links_per_source_page": {"type": "integer", "minimum": 1},
+                "total_transition_budget": {"type": ["integer", "null"], "minimum": 1},
+                "depth_contribution": {"type": "integer", "minimum": 0},
+                "deduplicate": {"type": "boolean"},
+                "latest_test_evidence_id": {"type": ["string", "null"], "format": "uuid"}
+            }
+        }),
+    );
+    schemas.insert(
+        "DiscoveryTransitionRequest",
+        serde_json::json!({
+            "type": "object",
+            "required": ["source_page_type_id", "target_page_type_id", "name", "enabled", "link_selector", "url_constraints", "priority", "max_links_per_source_page", "total_transition_budget", "depth_contribution", "deduplicate"],
+            "properties": {
+                "source_page_type_id": {"type": "string", "format": "uuid"},
+                "target_page_type_id": {"type": "string", "format": "uuid"},
+                "name": {"type": "string", "maxLength": 256},
+                "enabled": {"type": "boolean"},
+                "link_selector": {"type": "string", "maxLength": 1024},
+                "url_constraints": {"type": ["string", "null"], "maxLength": 2048},
+                "priority": {"type": "integer"},
+                "max_links_per_source_page": {"type": "integer", "minimum": 1},
+                "total_transition_budget": {"type": ["integer", "null"], "minimum": 1},
+                "depth_contribution": {"type": "integer", "minimum": 0},
+                "deduplicate": {"type": "boolean"}
+            }
+        }),
+    );
+    schemas.insert(
+        "CanonicalizedDomainScopeResult",
+        serde_json::json!({
+            "type": "object",
+            "required": ["canonicalization", "classification"],
+            "properties": {"canonicalization": {"$ref": "#/components/schemas/CanonicalizationExplanation"}, "classification": {"$ref": "#/components/schemas/DomainScopeClassification"}}
         }),
     );
     schemas
