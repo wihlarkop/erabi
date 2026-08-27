@@ -118,6 +118,23 @@ pub struct CrawlerVersionRecord {
     pub audit: CrawlerAuditMetadata,
 }
 
+/// Immutable semantic input captured for one Test Lab evaluation.
+#[derive(Clone, Debug)]
+pub struct CrawlerSemanticSnapshot {
+    pub version: CrawlerVersion,
+    pub page_types: Vec<PageTypeRecord>,
+    pub transitions: Vec<DiscoveryTransitionRecord>,
+    pub config_hash: String,
+}
+
+/// Draft and optional Published semantics captured from one database snapshot.
+#[derive(Clone, Debug)]
+pub struct CrawlerEvaluationSnapshot {
+    pub draft: CrawlerSemanticSnapshot,
+    pub active_published_version_id: Option<CrawlerVersionId>,
+    pub published: Option<CrawlerSemanticSnapshot>,
+}
+
 /// A durable Page Type projection with validated URL matchers.
 #[derive(Clone, Debug)]
 pub struct PageTypeRecord {
@@ -523,6 +540,40 @@ impl<'database> CrawlerRepository<'database> {
         let connection = self.database.connection().await.map_err(Self::database)?;
         let record = self.version(crawler_id, version_id).await?;
         semantic_hash(&connection, &record.version).await
+    }
+
+    /// Captures all mutable semantic inputs needed by Test Lab from one
+    /// database read transaction. The returned values are safe to freeze in
+    /// an application-layer evaluation snapshot.
+    pub async fn evaluation_snapshot(
+        &self,
+        crawler_id: CrawlerId,
+        draft_version_id: CrawlerVersionId,
+        include_published: bool,
+    ) -> Result<CrawlerEvaluationSnapshot, CrawlerRepositoryError> {
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .await
+            .map_err(Self::database)?;
+        let result = evaluation_snapshot_in_transaction(
+            &transaction,
+            crawler_id,
+            draft_version_id,
+            include_published,
+        )
+        .await;
+        match result {
+            Ok(snapshot) => transaction
+                .commit()
+                .await
+                .map_err(Self::database)
+                .map(|()| snapshot),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// Reads the selected version's typed canonicalization policy.
@@ -1804,6 +1855,77 @@ async fn active_draft_for(
     row.get(0).map_err(CrawlerRepositoryError::database)
 }
 
+async fn evaluation_snapshot_in_transaction(
+    connection: &Connection,
+    crawler_id: CrawlerId,
+    draft_version_id: CrawlerVersionId,
+    include_published: bool,
+) -> Result<CrawlerEvaluationSnapshot, CrawlerRepositoryError> {
+    ensure_crawler_exists(connection, crawler_id).await?;
+    ensure_pointer_consistency(connection, crawler_id).await?;
+
+    let pointers = connection
+        .prepare(
+            "SELECT active_published_version_id, active_draft_version_id FROM crawlers WHERE id = ?1",
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+        .query_row([crawler_id.to_string()])
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    let active_published_version_id = pointers
+        .get::<Option<String>>(0)
+        .map_err(CrawlerRepositoryError::database)?
+        .map(|value| parse_version_id(&value))
+        .transpose()?;
+    let draft = load_semantic_snapshot(connection, crawler_id, draft_version_id).await?;
+    if draft.version.state() != CrawlerVersionState::Draft {
+        return Err(CrawlerRepositoryError::VersionNotDraft);
+    }
+    let active_draft_version = pointers
+        .get::<Option<String>>(1)
+        .map_err(CrawlerRepositoryError::database)?;
+    if active_draft_version.as_deref() != Some(draft_version_id.to_string().as_str()) {
+        return Err(CrawlerRepositoryError::VersionNotActiveDraft);
+    }
+
+    let published = if include_published {
+        if let Some(version_id) = active_published_version_id {
+            Some(load_semantic_snapshot(connection, crawler_id, version_id).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(CrawlerEvaluationSnapshot {
+        draft,
+        active_published_version_id,
+        published,
+    })
+}
+
+async fn load_semantic_snapshot(
+    connection: &Connection,
+    crawler_id: CrawlerId,
+    version_id: CrawlerVersionId,
+) -> Result<CrawlerSemanticSnapshot, CrawlerRepositoryError> {
+    let version = load_version(connection, version_id).await?;
+    if version.crawler_id() != crawler_id {
+        return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
+    }
+    validate_seed_projection(connection, &version).await?;
+    let page_types = load_page_type_records(connection, &version).await?;
+    let transitions = load_transition_records(connection, &version).await?;
+    let config_hash = semantic_hash(connection, &version).await?;
+    Ok(CrawlerSemanticSnapshot {
+        version,
+        page_types,
+        transitions,
+        config_hash,
+    })
+}
+
 async fn load_mutation_version(
     connection: &Connection,
     crawler_id: CrawlerId,
@@ -2712,6 +2834,10 @@ async fn clone_child_rows(
         let configuration: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
         let configuration =
             remap_json_references(&configuration, &[seed_map, page_map, transition_map])?;
+        let mut transition: DiscoveryTransition = serde_json::from_str(&configuration)
+            .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+        transition.latest_test_evidence_id = None;
+        let configuration = serialize(&transition).map_err(CrawlerRepositoryError::database)?;
         let new_id = transition_map
             .get(&old_id)
             .cloned()
@@ -2725,6 +2851,40 @@ async fn clone_child_rows(
             .map_err(CrawlerRepositoryError::database)?;
     }
     Ok(())
+}
+
+/// Revalidates the active Draft's complete semantic projection using the
+/// caller's transaction. This is intentionally crate-visible so evidence
+/// persistence can close its hash-check/insert TOCTOU window.
+pub(crate) async fn current_draft_semantic_hash_in_transaction(
+    connection: &Connection,
+    crawler_id: CrawlerId,
+    version_id: CrawlerVersionId,
+) -> Result<String, CrawlerRepositoryError> {
+    ensure_crawler_exists(connection, crawler_id).await?;
+    ensure_pointer_consistency(connection, crawler_id).await?;
+    if active_draft_for(connection, crawler_id).await?.as_deref()
+        != Some(version_id.to_string().as_str())
+    {
+        return Err(CrawlerRepositoryError::VersionNotActiveDraft);
+    }
+    let snapshot = load_semantic_snapshot(connection, crawler_id, version_id).await?;
+    if snapshot.version.state() != CrawlerVersionState::Draft {
+        return Err(CrawlerRepositoryError::VersionNotDraft);
+    }
+    Ok(snapshot.config_hash)
+}
+
+pub(crate) async fn semantic_hash_for_version_in_connection(
+    connection: &Connection,
+    crawler_id: CrawlerId,
+    version_id: CrawlerVersionId,
+) -> Result<String, CrawlerRepositoryError> {
+    ensure_crawler_exists(connection, crawler_id).await?;
+    ensure_pointer_consistency(connection, crawler_id).await?;
+    Ok(load_semantic_snapshot(connection, crawler_id, version_id)
+        .await?
+        .config_hash)
 }
 
 #[allow(clippy::too_many_lines)]

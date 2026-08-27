@@ -14,6 +14,7 @@ mod progress;
 mod redaction;
 mod run_safety;
 mod state;
+mod test_lab;
 
 pub mod security;
 

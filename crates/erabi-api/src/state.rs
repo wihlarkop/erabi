@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use erabi_crawler::{ExtractionTestHook, TestLabProvider, TestLabService};
 use erabi_db::ErabiDatabase;
 use erabi_jobs::{
     CancellationController, JobActionService, ProgressLiveHub, StoragePressureController,
@@ -93,6 +94,7 @@ pub struct AppState {
     progress: Option<Arc<ProgressRuntimeState>>,
     job_actions: Option<Arc<JobActionRuntimeState>>,
     crawler_authoring: Option<Arc<CrawlerAuthoringService>>,
+    test_lab: Option<Arc<TestLabService>>,
     storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
@@ -116,6 +118,7 @@ impl AppState {
             progress: None,
             job_actions: None,
             crawler_authoring: None,
+            test_lab: None,
             storage_pressure: None,
         }
     }
@@ -153,7 +156,27 @@ impl AppState {
     /// Attaches the protected Crawler/Draft/Published authoring service.
     #[must_use]
     pub fn with_crawler_authoring_runtime(mut self, database: ErabiDatabase) -> Self {
-        self.crawler_authoring = Some(Arc::new(CrawlerAuthoringService::new(database)));
+        self.crawler_authoring = Some(Arc::new(CrawlerAuthoringService::new(database.clone())));
+        if self.test_lab.is_none() {
+            self.test_lab = Some(Arc::new(TestLabService::new(database, None, None)));
+        }
+        self
+    }
+
+    /// Attaches the synchronous bounded Test Lab and its optional deterministic
+    /// observation/extraction ports.
+    #[must_use]
+    pub fn with_test_lab_runtime(
+        mut self,
+        database: ErabiDatabase,
+        provider: Option<Arc<dyn TestLabProvider>>,
+        extraction_hook: Option<Arc<dyn ExtractionTestHook>>,
+    ) -> Self {
+        self.test_lab = Some(Arc::new(TestLabService::new(
+            database,
+            provider,
+            extraction_hook,
+        )));
         self
     }
 
@@ -164,6 +187,10 @@ impl AppState {
 
     pub(crate) fn crawler_authoring_runtime(&self) -> Option<Arc<CrawlerAuthoringService>> {
         self.crawler_authoring.clone()
+    }
+
+    pub(crate) fn test_lab_runtime(&self) -> Option<Arc<TestLabService>> {
+        self.test_lab.clone()
     }
 
     /// Attaches the typed storage-pressure state shared with worker admission.

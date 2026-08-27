@@ -40,6 +40,7 @@ use crate::{
     },
     progress::job_progress_sse,
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
+    test_lab::{list_test_evidence, read_test_evidence, run_test_lab, test_lab_openapi_schemas},
 };
 
 const TRACE_HEADER: HeaderName = HeaderName::from_static("x-erabi-trace-id");
@@ -154,6 +155,18 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
             get(read_discovery_transition)
                 .put(update_discovery_transition)
                 .delete(delete_discovery_transition),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-lab/tests",
+            post(run_test_lab),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence",
+            get(list_test_evidence),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence/{evidence_id}",
+            get(read_test_evidence),
         )
         .route("/api/v1/diagnostics/{*path}", any(unavailable))
         .route(
@@ -486,6 +499,18 @@ impl OpenApiDocument {
             OpenApiPath::get_put_delete("Read, update, or delete a DiscoveryTransition"),
         );
         paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-lab/tests",
+            OpenApiPath::post("Execute a bounded deterministic Test Lab test"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence",
+            OpenApiPath::get("List durable TestEvidence"),
+        );
+        paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence/{evidence_id}",
+            OpenApiPath::get("Read durable TestEvidence"),
+        );
+        paths.insert(
             "/api/v1/events/jobs/{job_id}/progress",
             OpenApiPath::get("Replayable job progress stream"),
         );
@@ -522,6 +547,7 @@ impl OpenApiDocument {
                 schemas: {
                     let mut schemas = task2_openapi_schemas();
                     schemas.extend(crawler_discovery_openapi_schemas());
+                    schemas.extend(test_lab_openapi_schemas());
                     schemas
                 },
             },

@@ -711,6 +711,7 @@ name = "erabi-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "erabi-crawler",
  "erabi-db",
  "erabi-domain",
  "erabi-jobs",
@@ -736,6 +737,13 @@ version = "0.1.0"
 [[package]]
 name = "erabi-crawler"
 version = "0.1.0"
+dependencies = [
+ "erabi-db",
+ "erabi-domain",
+ "thiserror",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "erabi-db"

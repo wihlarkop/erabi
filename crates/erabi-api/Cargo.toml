@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 axum = "0.8.9"
+erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }

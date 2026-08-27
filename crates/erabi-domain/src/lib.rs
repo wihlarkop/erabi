@@ -59,6 +59,17 @@ pub use seed::Seed;
 pub use settings::{LayerValue, ResolvedValue, SettingLayers, SettingSource};
 pub use source::Source;
 pub use status::{CrawlRunStatus, CrawlRunType, SourceStatus, SourceTargetType};
-pub use test_evidence::TestEvidence;
+pub use test_evidence::{
+    CanonicalizationDecisionCode, CanonicalizationDecisionEvidence, CanonicalizationEvidence,
+    CanonicalizationOutcome, DiscoveredUrlEvidence, DiscoveryTransitionEvidence,
+    DomainScopeEvidence, DomainScopeRationaleEvidence, DomainScopeStatus, ExtractionFieldEvidence,
+    ExtractionObservation, MAX_TEST_EVIDENCE_ARTIFACTS, MAX_TEST_EVIDENCE_DIAGNOSTICS,
+    MAX_TEST_EVIDENCE_DISCOVERED_URLS, MAX_TEST_EVIDENCE_INPUT_URLS, MAX_TEST_EVIDENCE_URL_CHARS,
+    MatcherKindEvidence, MatcherSpecificityEvidence, PageTypeCandidateEvidence,
+    PageTypeMatchEvidence, PageTypeMatchStatus, PaginationEvidence, PaginationKind,
+    PublishedComparisonStatus, SelectorCoverageEvidence, SelectorCoverageStatus,
+    TEST_EVIDENCE_SCHEMA_VERSION, TestDiagnostic, TestEvidence, TestKind, TestLabComparison,
+    TransitionBudgetEvidence, TransitionBudgetExclusionEvidence,
+};
 pub use transition::{DiscoveryTransition, TransitionBudget, TransitionGraph};
 pub use url_matcher::{SpecificityKey, UrlMatcher, UrlMatcherDefinition, UrlMatcherKind};
