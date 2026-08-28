@@ -106,15 +106,25 @@ pub enum DiscoveryPreviewLimitError {
 
 /// Limits after tightening the request against the immutable semantic
 /// `CrawlerVersion` baseline. Downloaded bytes are always the semantic budget;
-/// Preview has no widening byte override.
+/// Preview has no widening byte override. Transition totals are resolved for
+/// every version-local transition so the response never implies that one
+/// Preview default is the effective cap for a transition with a lower semantic
+/// `total_budget`.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct EffectiveDiscoveryPreviewLimits {
     pub max_pages: u64,
     pub max_depth: u32,
     pub max_duration_ms: u64,
     pub max_downloaded_bytes: u64,
-    pub default_transition_total_limit: u64,
-    pub transition_total_limits: Vec<TransitionPreviewTotalLimit>,
+    pub transition_total_limits: Vec<EffectiveTransitionPreviewTotalLimit>,
+}
+
+/// One authoritative Preview total cap after applying both the Preview and
+/// configured transition budgets.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct EffectiveTransitionPreviewTotalLimit {
+    pub transition_id: DiscoveryTransitionId,
+    pub effective_total_limit: u64,
 }
 
 /// The Preview result is categorically advisory and never a complete

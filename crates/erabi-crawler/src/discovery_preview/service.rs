@@ -91,6 +91,8 @@ pub enum DiscoveryPreviewError {
     ProviderObservationInvalid,
     #[error("durable Crawler state is invalid")]
     PersistedStateInvalid,
+    #[error("Discovery Preview queue entry is missing Seed provenance")]
+    QueueEntryMissingSeedProvenance,
     #[error("Discovery Preview budget arithmetic overflowed")]
     BudgetOverflow,
 }
@@ -252,7 +254,7 @@ impl PreviewContext {
             .max_duration_seconds
             .checked_mul(1_000)
             .ok_or(DiscoveryPreviewError::BudgetOverflow)?;
-        let transition_total_limits = limits
+        let preview_transition_total_limits = limits
             .transition_total_limits
             .iter()
             .map(|override_limit| {
@@ -262,14 +264,35 @@ impl PreviewContext {
                 {
                     return Err(DiscoveryPreviewError::TransitionNotOwnedByVersion);
                 }
-                Ok(erabi_domain::TransitionPreviewTotalLimit {
-                    transition_id: override_limit.transition_id,
-                    max_total_links: override_limit
-                        .max_total_links
-                        .min(limits.default_transition_total_limit),
-                })
+                Ok((
+                    override_limit.transition_id.to_string(),
+                    override_limit.max_total_links,
+                ))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut transition_total_limits = transitions
+            .iter()
+            .map(|transition| {
+                let preview_cap = preview_transition_total_limits
+                    .get(&transition.id.to_string())
+                    .copied()
+                    .unwrap_or(limits.default_transition_total_limit);
+                erabi_domain::EffectiveTransitionPreviewTotalLimit {
+                    transition_id: transition.id,
+                    effective_total_limit: transition
+                        .budget
+                        .total_budget
+                        .map_or(preview_cap, |configured_cap| {
+                            preview_cap.min(configured_cap)
+                        }),
+                }
+            })
+            .collect::<Vec<_>>();
+        transition_total_limits.sort_by(|left, right| {
+            left.transition_id
+                .to_string()
+                .cmp(&right.transition_id.to_string())
+        });
         let effective = erabi_domain::EffectiveDiscoveryPreviewLimits {
             max_pages: limits
                 .max_pages
@@ -279,7 +302,6 @@ impl PreviewContext {
                 .min(snapshot.version.guardrails().max_depth),
             max_duration_ms: limits.max_duration_ms.min(semantic_duration_ms),
             max_downloaded_bytes: snapshot.version.guardrails().max_downloaded_bytes,
-            default_transition_total_limit: limits.default_transition_total_limit,
             transition_total_limits,
         };
         Ok(Self {
@@ -291,16 +313,12 @@ impl PreviewContext {
         })
     }
 
-    fn transition_total_limit(&self, id: DiscoveryTransitionId) -> u64 {
+    fn transition_total_limit(&self, id: DiscoveryTransitionId) -> Option<u64> {
         self.limits
             .transition_total_limits
             .iter()
             .find(|limit| limit.transition_id == id)
-            .map_or(self.limits.default_transition_total_limit, |limit| {
-                limit
-                    .max_total_links
-                    .min(self.limits.default_transition_total_limit)
-            })
+            .map(|limit| limit.effective_total_limit)
     }
 
     fn seed(&self, id: SeedId) -> Option<&Seed> {
@@ -353,6 +371,30 @@ struct QueueEntry {
     /// depth zero and therefore never need a duplicate depth reduction.
     target_page_type_id: Option<erabi_domain::PageTypeId>,
     order: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum QueueEntryProvenanceError {
+    #[error("queue entry is missing required Seed provenance")]
+    MissingSeedProvenance,
+}
+
+impl QueueEntry {
+    fn primary_seed_id(&self) -> Result<SeedId, QueueEntryProvenanceError> {
+        self.seed_ids
+            .first()
+            .copied()
+            .ok_or(QueueEntryProvenanceError::MissingSeedProvenance)
+    }
+}
+
+/// The one observed source identity used consistently for href resolution,
+/// `PageType` semantics, counters, and persisted edge provenance.
+#[derive(Clone, Copy)]
+struct ObservedSource<'a> {
+    requested: &'a str,
+    final_url: Option<&'a str>,
+    canonical: &'a str,
 }
 
 struct PreviewRun {
@@ -601,14 +643,7 @@ impl PreviewRun {
                 .await
                 .map_err(map_provider_error)?;
             if self.elapsed_millis() >= self.context.limits.max_duration_ms {
-                self.time_budget_hit = true;
-                self.record_budget(PreviewBudgetHit {
-                    kind: PreviewBudgetKind::MaxDuration,
-                    transition_id: None,
-                    page_type_id: None,
-                    observed: self.elapsed_millis(),
-                    limit: self.context.limits.max_duration_ms,
-                });
+                self.hit_time_budget();
             }
             self.process_outcome(entry, outcome)?;
         }
@@ -740,7 +775,10 @@ impl PreviewRun {
             let decision =
                 resolve_page_type(&final_canonical.canonical_url, &self.context.page_types);
             let evidence = PageTypeMatchEvidence::from_decision(&decision);
-            self.register_match(&canonical_url, &evidence);
+            // Observed roots and redirect aliases reach matching for growth
+            // denominators, but only href-originated identities belong in the
+            // discovered PageType distribution.
+            self.register_match(&canonical_url, &evidence, false);
             Some(evidence)
         } else {
             None
@@ -751,43 +789,11 @@ impl PreviewRun {
         {
             if let Some(page_type_id) = page_match.winner.as_ref().map(|winner| winner.page_type_id)
             {
-                let count = self
-                    .page_type_sampled
-                    .get(&page_type_id.to_string())
-                    .copied()
-                    .unwrap_or(0);
-                if self
-                    .context
-                    .snapshot
-                    .version
-                    .guardrails()
-                    .page_type(page_type_id)
-                    .and_then(|budget| budget.page_budget)
-                    .is_some_and(|limit| count >= limit)
-                {
-                    let hit = PreviewBudgetHit {
-                        kind: PreviewBudgetKind::PageTypePageBudget,
-                        transition_id: None,
-                        page_type_id: Some(page_type_id),
-                        observed: count,
-                        limit: self
-                            .context
-                            .snapshot
-                            .version
-                            .guardrails()
-                            .page_type(page_type_id)
-                            .and_then(|budget| budget.page_budget)
-                            .unwrap_or(count),
-                    };
-                    self.record_budget(hit.clone());
+                if let Some(hit) = self.actual_final_page_type_budget_hit(&entry, page_type_id) {
                     page_budget_hits.push(hit);
                 }
                 *self
                     .page_type_sampled
-                    .entry(page_type_id.to_string())
-                    .or_default() += 1;
-                *self
-                    .page_type_scheduled
                     .entry(page_type_id.to_string())
                     .or_default() += 1;
             }
@@ -844,7 +850,12 @@ impl PreviewRun {
             && !self.expanded.contains(&canonical_url)
         {
             if let Some(source_match) = page_match.as_ref() {
-                self.expand_page(&entry, &observation, &canonical_url, source_match)?;
+                let source = ObservedSource {
+                    requested: &entry.requested_url,
+                    final_url: observation.final_url.as_deref(),
+                    canonical: &canonical_url,
+                };
+                self.expand_page(&entry, &observation, source, source_match)?;
             }
         }
         Ok(())
@@ -854,10 +865,10 @@ impl PreviewRun {
         &mut self,
         entry: &QueueEntry,
         observation: &PageObservation,
-        source_canonical_url: &str,
+        source: ObservedSource<'_>,
         source_match: &PageTypeMatchEvidence,
     ) -> Result<(), DiscoveryPreviewError> {
-        if !self.expanded.insert(source_canonical_url.to_owned()) {
+        if !self.expanded.insert(source.canonical.to_owned()) {
             return Ok(());
         }
         let Some(source_page_type_id) = source_match
@@ -867,10 +878,7 @@ impl PreviewRun {
         else {
             return Ok(());
         };
-        let base = observation
-            .final_url
-            .as_deref()
-            .unwrap_or(observation.requested_url.as_str());
+        let base = source.final_url.unwrap_or(source.requested);
         let base_url =
             url::Url::parse(base).map_err(|_| DiscoveryPreviewError::ProviderObservationInvalid)?;
         let mut links = observation.discovered_links.clone();
@@ -904,21 +912,13 @@ impl PreviewRun {
             }
             let resolved = base_url.join(&link.raw_href).ok();
             let Some(resolved_url) = resolved else {
-                self.paths.push(self.invalid_path(
-                    entry,
-                    source_match,
-                    &link,
-                    observation.final_url.as_deref(),
-                ));
+                self.paths
+                    .push(self.invalid_path(entry, source, source_match, &link)?);
                 continue;
             };
             if resolved_url.to_string().chars().count() > MAX_PREVIEW_URL_CHARS {
-                self.paths.push(self.invalid_path(
-                    entry,
-                    source_match,
-                    &link,
-                    observation.final_url.as_deref(),
-                ));
+                self.paths
+                    .push(self.invalid_path(entry, source, source_match, &link)?);
                 continue;
             }
             let canonicalization = self
@@ -929,12 +929,8 @@ impl PreviewRun {
                 .canonicalize(resolved_url.as_str())
                 .ok();
             let Some(canonicalization_result) = canonicalization else {
-                self.paths.push(self.invalid_path(
-                    entry,
-                    source_match,
-                    &link,
-                    observation.final_url.as_deref(),
-                ));
+                self.paths
+                    .push(self.invalid_path(entry, source, source_match, &link)?);
                 continue;
             };
             let canonical_url = canonicalization_result.canonical_url.to_string();
@@ -952,8 +948,9 @@ impl PreviewRun {
                 if unique {
                     self.count_scope(state);
                 }
-                let mut path = self.path_base(
+                let path = self.path_base(
                     entry,
+                    source,
                     source_match,
                     &link,
                     Some(resolved_url.to_string()),
@@ -965,8 +962,7 @@ impl PreviewRun {
                     None,
                     Vec::new(),
                     Vec::new(),
-                );
-                path.source_final_url = observation.final_url.clone();
+                )?;
                 self.paths.push(path);
                 continue;
             }
@@ -986,6 +982,7 @@ impl PreviewRun {
                 };
                 let mut path = self.path_base(
                     entry,
+                    source,
                     source_match,
                     &link,
                     Some(resolved_url.to_string()),
@@ -997,8 +994,7 @@ impl PreviewRun {
                     Some(canonical_url),
                     Vec::new(),
                     Vec::new(),
-                );
-                path.source_final_url = observation.final_url.clone();
+                )?;
                 path.prospective_depth = prospective_depth;
                 self.paths.push(path);
                 continue;
@@ -1007,7 +1003,7 @@ impl PreviewRun {
                 &canonicalization_result.canonical_url,
                 &self.context.page_types,
             ));
-            self.register_match(&canonical_url, &target_match);
+            self.register_match(&canonical_url, &target_match, true);
             let mut evaluations = Vec::new();
             let mut eligible = Vec::new();
             for transition in self.sorted_transitions_for(source_page_type_id) {
@@ -1037,7 +1033,7 @@ impl PreviewRun {
                 if semantic_eligible {
                     if let Some(hit) = self.check_transition_budget(
                         entry,
-                        source_canonical_url,
+                        source.canonical,
                         &transition,
                         &target_match,
                     )? {
@@ -1064,7 +1060,7 @@ impl PreviewRun {
                     }
                 }
                 if is_eligible {
-                    self.consume_transition(&transition, source_canonical_url);
+                    self.consume_transition(&transition, source.canonical);
                     eligible.push((
                         transition.clone(),
                         entry
@@ -1103,6 +1099,7 @@ impl PreviewRun {
             let prospective_depth = eligible.iter().map(|(_, depth)| *depth).min();
             let mut path = self.path_base(
                 entry,
+                source,
                 source_match,
                 &link,
                 Some(resolved_url.to_string()),
@@ -1114,8 +1111,7 @@ impl PreviewRun {
                 None,
                 evaluations,
                 Vec::new(),
-            );
-            path.source_final_url = observation.final_url.clone();
+            )?;
             path.prospective_depth = prospective_depth;
             self.paths.push(path);
             if let Some((_, depth)) = eligible.iter().min_by(|left, right| left.1.cmp(&right.1)) {
@@ -1341,16 +1337,56 @@ impl PreviewRun {
                 self.budget_hit_from_exclusion(exclusion, transition, candidate),
             ));
         }
-        if total >= self.context.transition_total_limit(transition.id) {
+        let effective_total_limit = self
+            .context
+            .transition_total_limit(transition.id)
+            .ok_or(DiscoveryPreviewError::PersistedStateInvalid)?;
+        if total >= effective_total_limit {
             return Ok(Some(self.budget_hit(
                 PreviewBudgetKind::TransitionTotal,
                 Some(transition.id),
                 None,
                 total,
-                self.context.transition_total_limit(transition.id),
+                effective_total_limit,
             )));
         }
         Ok(None)
+    }
+
+    /// A discovered target retains the reservation made under its admission
+    /// `PageType`. A root has no `PageType` reservation, and a redirect whose
+    /// final `PageType` differs must not transfer or create one. Such completed
+    /// observations remain visible, but cannot expand once the actual final
+    /// `PageType` is already fully reserved by other queued work.
+    fn actual_final_page_type_budget_hit(
+        &mut self,
+        entry: &QueueEntry,
+        actual_page_type_id: erabi_domain::PageTypeId,
+    ) -> Option<PreviewBudgetHit> {
+        if entry.target_page_type_id == Some(actual_page_type_id) {
+            return None;
+        }
+        let limit = self
+            .context
+            .snapshot
+            .version
+            .guardrails()
+            .page_type(actual_page_type_id)
+            .and_then(|budget| budget.page_budget)?;
+        let scheduled = self
+            .page_type_scheduled
+            .get(&actual_page_type_id.to_string())
+            .copied()
+            .unwrap_or(0);
+        (scheduled >= limit).then(|| {
+            self.budget_hit(
+                PreviewBudgetKind::PageTypePageBudget,
+                None,
+                Some(actual_page_type_id),
+                scheduled,
+                limit,
+            )
+        })
     }
 
     fn consume_transition(&mut self, transition: &DiscoveryTransition, source: &str) {
@@ -1363,12 +1399,17 @@ impl PreviewRun {
         }
     }
 
-    fn register_match(&mut self, url: &str, evidence: &PageTypeMatchEvidence) {
+    fn register_match(
+        &mut self,
+        url: &str,
+        evidence: &PageTypeMatchEvidence,
+        discovered_from_href: bool,
+    ) {
         if self.in_scope_urls.insert(url.to_owned()) {
             match evidence.decision {
                 PageTypeMatchStatus::Matched => {
                     self.matching_urls.insert(url.to_owned());
-                    if let Some(winner) = evidence.winner.as_ref() {
+                    if discovered_from_href && let Some(winner) = evidence.winner.as_ref() {
                         *self
                             .page_type_discovered
                             .entry(winner.page_type_id.to_string())
@@ -1416,12 +1457,13 @@ impl PreviewRun {
     fn invalid_path(
         &self,
         entry: &QueueEntry,
+        source: ObservedSource<'_>,
         source_match: &PageTypeMatchEvidence,
         link: &ObservedLink,
-        source_final_url: Option<&str>,
-    ) -> DiscoveryPath {
-        let mut path = self.path_base(
+    ) -> Result<DiscoveryPath, DiscoveryPreviewError> {
+        self.path_base(
             entry,
+            source,
             source_match,
             link,
             None,
@@ -1433,15 +1475,14 @@ impl PreviewRun {
             None,
             Vec::new(),
             Vec::new(),
-        );
-        path.source_final_url = source_final_url.map(ToOwned::to_owned);
-        path
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn path_base(
         &self,
         entry: &QueueEntry,
+        source: ObservedSource<'_>,
         source_match: &PageTypeMatchEvidence,
         link: &ObservedLink,
         resolved: Option<String>,
@@ -1453,13 +1494,17 @@ impl PreviewRun {
         duplicate: Option<String>,
         evaluations: Vec<PreviewTransitionEvaluation>,
         budget_hits: Vec<PreviewBudgetHit>,
-    ) -> DiscoveryPath {
-        DiscoveryPath {
-            seed_id: entry.seed_ids.first().copied().unwrap_or_else(SeedId::new),
+    ) -> Result<DiscoveryPath, DiscoveryPreviewError> {
+        Ok(DiscoveryPath {
+            seed_id: entry.primary_seed_id().map_err(|error| match error {
+                QueueEntryProvenanceError::MissingSeedProvenance => {
+                    DiscoveryPreviewError::QueueEntryMissingSeedProvenance
+                }
+            })?,
             seed_ids: entry.seed_ids.clone(),
-            source_requested_url: entry.requested_url.clone(),
-            source_final_url: None,
-            source_canonical_url: entry.canonical_url.clone(),
+            source_requested_url: source.requested.to_owned(),
+            source_final_url: source.final_url.map(ToOwned::to_owned),
+            source_canonical_url: source.canonical.to_owned(),
             source_page_type_match: source_match.clone(),
             selector: link.selector.clone(),
             raw_href: link.raw_href.clone(),
@@ -1474,7 +1519,7 @@ impl PreviewRun {
             prospective_depth: None,
             transition_evaluations: evaluations,
             budget_hits,
-        }
+        })
     }
 
     fn budget_hit(
@@ -1579,6 +1624,9 @@ impl PreviewRun {
     }
 
     fn hit_time_budget(&mut self) {
+        if self.time_budget_hit {
+            return;
+        }
         self.time_budget_hit = true;
         self.record_budget(PreviewBudgetHit {
             kind: PreviewBudgetKind::MaxDuration,
@@ -1827,23 +1875,41 @@ fn map_crawler_error(error: CrawlerRepositoryError) -> DiscoveryPreviewError {
     }
 }
 
-fn is_cycle(
+/// An edge belongs to a directed cycle only when its target can reach its
+/// source through enabled transitions. This intentionally ignores transition
+/// identifiers, persistence order, and presentation priority.
+fn transition_participates_in_cycle(
     graph: &TransitionGraph,
-    source: erabi_domain::PageTypeId,
+    transition: &DiscoveryTransition,
+) -> bool {
+    if transition.source_page_type_id == transition.target_page_type_id {
+        return true;
+    }
+    page_type_reaches(
+        graph,
+        transition.target_page_type_id,
+        transition.source_page_type_id,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn page_type_reaches(
+    graph: &TransitionGraph,
+    from: erabi_domain::PageTypeId,
     target: erabi_domain::PageTypeId,
     visited: &mut BTreeSet<String>,
 ) -> bool {
-    if source == target {
+    if from == target {
         return true;
     }
-    if !visited.insert(source.to_string()) {
+    if !visited.insert(from.to_string()) {
         return false;
     }
     graph
         .transitions()
         .iter()
-        .filter(|transition| transition.enabled && transition.source_page_type_id == source)
-        .any(|transition| is_cycle(graph, transition.target_page_type_id, target, visited))
+        .filter(|transition| transition.enabled && transition.source_page_type_id == from)
+        .any(|transition| page_type_reaches(graph, transition.target_page_type_id, target, visited))
 }
 
 /// A transition is dominant only when the observed edge counts identify one
@@ -1919,12 +1985,7 @@ fn growth_warnings(
             .iter()
             .find(|transition| transition.id == dominant.transition_id);
         if transition.is_some_and(|transition| {
-            is_cycle(
-                &run.context.graph,
-                transition.source_page_type_id,
-                transition.target_page_type_id,
-                &mut BTreeSet::new(),
-            )
+            transition_participates_in_cycle(&run.context.graph, transition)
         }) && dominant.eligible_edges >= erabi_domain::DOMINANT_TRANSITION_MIN_EDGES
             && share >= erabi_domain::DOMINANT_TRANSITION_SHARE_PERCENT
         {
@@ -2029,21 +2090,16 @@ fn has_budget_pressure_utilization(
         return true;
     }
     if run.context.page_types.iter().any(|page_type| {
-        run.context
-            .snapshot
-            .version
-            .guardrails()
-            .page_type(page_type.id)
-            .and_then(|budget| budget.page_budget)
-            .is_some_and(|limit| {
-                reaches_budget_pressure(
-                    run.page_type_scheduled
-                        .get(&page_type.id.to_string())
-                        .copied()
-                        .unwrap_or(0),
-                    limit,
-                )
-            })
+        page_type_budget_under_pressure(
+            &run.page_type_scheduled,
+            page_type.id,
+            run.context
+                .snapshot
+                .version
+                .guardrails()
+                .page_type(page_type.id)
+                .and_then(|budget| budget.page_budget),
+        )
     }) {
         return true;
     }
@@ -2061,13 +2117,38 @@ fn has_budget_pressure_utilization(
     }) {
         return true;
     }
-    total > 0
-        && counts.iter().any(|count| {
-            reaches_budget_pressure(
-                count.eligible_edges,
-                run.context.transition_total_limit(count.transition_id),
-            )
-        })
+    total > 0 && has_transition_total_budget_pressure(counts, &run.context.limits)
+}
+
+fn page_type_budget_under_pressure(
+    scheduled: &BTreeMap<String, u64>,
+    page_type_id: erabi_domain::PageTypeId,
+    configured_limit: Option<u64>,
+) -> bool {
+    configured_limit.is_some_and(|limit| {
+        reaches_budget_pressure(
+            scheduled
+                .get(&page_type_id.to_string())
+                .copied()
+                .unwrap_or(0),
+            limit,
+        )
+    })
+}
+
+fn has_transition_total_budget_pressure(
+    counts: &[PreviewTransitionCount],
+    limits: &erabi_domain::EffectiveDiscoveryPreviewLimits,
+) -> bool {
+    counts.iter().any(|count| {
+        limits
+            .transition_total_limits
+            .iter()
+            .find(|limit| limit.transition_id == count.transition_id)
+            .is_some_and(|limit| {
+                reaches_budget_pressure(count.eligible_edges, limit.effective_total_limit)
+            })
+    })
 }
 
 impl PreviewRun {
@@ -2129,5 +2210,122 @@ mod tests {
         }
         let retention_only = BTreeMap::from([(PreviewBudgetKind::ProvenanceRetention, 1)]);
         assert!(!has_relevant_budget_hit(&retention_only));
+    }
+
+    fn graph_transition(
+        source_page_type_id: erabi_domain::PageTypeId,
+        target_page_type_id: erabi_domain::PageTypeId,
+    ) -> DiscoveryTransition {
+        DiscoveryTransition {
+            id: DiscoveryTransitionId::new(),
+            source_page_type_id,
+            target_page_type_id,
+            name: "transition".to_owned(),
+            enabled: true,
+            link_selector: "a.link".to_owned(),
+            url_constraints: None,
+            priority: 0,
+            budget: erabi_domain::TransitionBudget {
+                max_links_per_source_page: 1,
+                total_budget: Some(1),
+                depth_contribution: 1,
+            },
+            deduplicate: true,
+            latest_test_evidence_id: None,
+        }
+    }
+
+    #[test]
+    fn cycle_membership_requires_a_return_path_from_target_to_source()
+    -> Result<(), erabi_domain::ProductError> {
+        let a = erabi_domain::PageTypeId::new();
+        let b = erabi_domain::PageTypeId::new();
+        let c = erabi_domain::PageTypeId::new();
+        let d = erabi_domain::PageTypeId::new();
+        let self_transition = graph_transition(a, a);
+        let a_to_b = graph_transition(a, b);
+        let b_to_a = graph_transition(b, a);
+        let c_to_d = graph_transition(c, d);
+        let d_to_c = graph_transition(d, c);
+        let cyclic = TransitionGraph::new(
+            &[a, b, c, d],
+            vec![
+                self_transition.clone(),
+                a_to_b.clone(),
+                b_to_a,
+                c_to_d.clone(),
+                d_to_c,
+            ],
+        )?;
+        assert!(transition_participates_in_cycle(&cyclic, &self_transition));
+        assert!(transition_participates_in_cycle(&cyclic, &a_to_b));
+
+        let acyclic_with_unrelated_cycle = TransitionGraph::new(
+            &[a, b, c, d],
+            vec![a_to_b.clone(), c_to_d, graph_transition(d, c)],
+        )?;
+        assert!(!transition_participates_in_cycle(
+            &acyclic_with_unrelated_cycle,
+            &a_to_b
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn queue_entries_require_explicit_seed_provenance() {
+        let entry = QueueEntry {
+            requested_url: "https://example.test/root".to_owned(),
+            canonical_url: "https://example.test/root".to_owned(),
+            depth: 0,
+            seed_ids: Vec::new(),
+            target_page_type_id: None,
+            order: 0,
+        };
+        assert_eq!(
+            entry.primary_seed_id(),
+            Err(QueueEntryProvenanceError::MissingSeedProvenance)
+        );
+    }
+
+    #[test]
+    fn budget_pressure_uses_single_page_type_reservations_and_effective_totals() {
+        let page_type_id = erabi_domain::PageTypeId::new();
+        let mut scheduled = BTreeMap::from([(page_type_id.to_string(), 1)]);
+        assert!(!page_type_budget_under_pressure(
+            &scheduled,
+            page_type_id,
+            Some(2)
+        ));
+        scheduled.insert(page_type_id.to_string(), 2);
+        assert!(page_type_budget_under_pressure(
+            &scheduled,
+            page_type_id,
+            Some(2)
+        ));
+
+        let transition_id = DiscoveryTransitionId::new();
+        let counts = [count(transition_id, 4)];
+        let effective = erabi_domain::EffectiveDiscoveryPreviewLimits {
+            max_pages: 20,
+            max_depth: 8,
+            max_duration_ms: 10_000,
+            max_downloaded_bytes: 1_000,
+            transition_total_limits: vec![erabi_domain::EffectiveTransitionPreviewTotalLimit {
+                transition_id,
+                effective_total_limit: 5,
+            }],
+        };
+        assert!(has_transition_total_budget_pressure(&counts, &effective));
+        let higher_preview_cap = erabi_domain::EffectiveDiscoveryPreviewLimits {
+            transition_total_limits: vec![erabi_domain::EffectiveTransitionPreviewTotalLimit {
+                transition_id,
+                effective_total_limit: 20,
+            }],
+            ..effective
+        };
+        assert!(!has_transition_total_budget_pressure(
+            &counts,
+            &higher_preview_cap
+        ));
     }
 }

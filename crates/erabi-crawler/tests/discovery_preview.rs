@@ -10,8 +10,9 @@ use erabi_crawler::{
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
 use erabi_domain::{
     Crawler, CrawlerVersion, DiscoveryPreviewLimits, DiscoveryPreviewRequest,
-    DiscoveryPreviewResultSemantics, DiscoveryTransition, DiscoveryTransitionId, Seed,
-    TestDiagnostic, TransitionBudget, TransitionPreviewTotalLimit, UrlMatcher,
+    DiscoveryPreviewResultSemantics, DiscoveryTransition, DiscoveryTransitionId,
+    PageTypeDiscoveryGuardrails, Seed, TestDiagnostic, TransitionBudget,
+    TransitionPreviewTotalLimit, UrlMatcher,
 };
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -569,7 +570,13 @@ async fn preview_limits_and_time_clock_are_explicit_and_safe()
         graph_fixture(&database).await?;
     let clock = Arc::new(ManualPreviewClock::new());
     let provider = FixtureDiscoveryPreviewProvider::observed(
-        [page(seed_a.original_url.as_str(), Vec::new())],
+        [page(
+            seed_a.original_url.as_str(),
+            vec![ObservedLink {
+                raw_href: "/product/not-enqueued-after-time-cap".to_owned(),
+                selector: Some("a.product".to_owned()),
+            }],
+        )],
         1,
     );
     let service = DiscoveryPreviewService::with_clock(
@@ -584,11 +591,19 @@ async fn preview_limits_and_time_clock_are_explicit_and_safe()
     request.limits.max_duration_ms = 50;
     let result = service.execute(crawler.id(), version.id(), request).await?;
     assert_eq!(result.summary.pages_sampled, 1);
-    assert!(
+    assert_eq!(
         result
             .summary
             .budget_hit_counts
-            .contains_key(&erabi_domain::PreviewBudgetKind::MaxDuration)
+            .get(&erabi_domain::PreviewBudgetKind::MaxDuration),
+        Some(&1)
+    );
+    assert_eq!(result.summary.frontier_remaining, 0);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "PREVIEW_TIME_BUDGET_LINKS_NOT_EXPANDED" })
     );
     Ok(())
 }
@@ -597,7 +612,7 @@ async fn preview_limits_and_time_clock_are_explicit_and_safe()
 async fn semantic_guardrails_tighten_preview_and_provider_receives_remaining_bytes()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
-    let (crawler, version, seed_a, _seed_b, _listing, _product, transition, _cycle) =
+    let (crawler, version, seed_a, _seed_b, listing, _product, transition, _cycle) =
         graph_fixture(&database).await?;
     let repository = CrawlerRepository::new(&database);
     let mut guardrails = repository
@@ -636,9 +651,22 @@ async fn semantic_guardrails_tighten_preview_and_provider_receives_remaining_byt
     assert_eq!(result.effective_limits.max_duration_ms, 1_000);
     assert_eq!(result.effective_limits.max_downloaded_bytes, 5);
     assert_eq!(
-        result.effective_limits.transition_total_limits[0].max_total_links,
-        10
+        result
+            .effective_limits
+            .transition_total_limits
+            .iter()
+            .find(|limit| limit.transition_id == transition)
+            .map(|limit| limit.effective_total_limit),
+        Some(20)
     );
+    let listing_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == listing)
+        .ok_or("missing Listing distribution")?;
+    assert_eq!(listing_distribution.sampled_pages, 1);
+    assert_eq!(listing_distribution.discovered_unique_urls, 0);
     let mut foreign_request = preview_request(vec![seed_a.id]);
     foreign_request.limits.transition_total_limits = vec![TransitionPreviewTotalLimit {
         transition_id: DiscoveryTransitionId::new(),
@@ -758,6 +786,497 @@ async fn redirect_final_url_is_the_source_of_truth_and_aliases_do_not_expand_twi
         Some(product.id)
     );
     assert!(result.summary.duplicates_prevented >= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovered_page_type_reservations_are_counted_once_at_the_budget_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    let product_to_product = transition(product, product, "related products", "a.related", 1);
+    repository
+        .create_discovery_transition(
+            crawler.id(),
+            version.id(),
+            &product_to_product,
+            "operator",
+            "unix:14",
+        )
+        .await?;
+    let mut guardrails = repository
+        .crawler_version_guardrails(crawler.id(), version.id())
+        .await?;
+    guardrails.page_types = vec![PageTypeDiscoveryGuardrails {
+        page_type_id: product,
+        page_budget: Some(2),
+        health_threshold: None,
+    }];
+    repository
+        .update_crawler_version_guardrails(
+            crawler.id(),
+            version.id(),
+            &guardrails,
+            "operator",
+            "unix:15",
+        )
+        .await?;
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [
+            page(
+                seed_a.original_url.as_str(),
+                vec![ObservedLink {
+                    raw_href: "/product/1".to_owned(),
+                    selector: Some("a.product".to_owned()),
+                }],
+            ),
+            page(
+                "https://example.test/product/1",
+                vec![ObservedLink {
+                    raw_href: "/product/2".to_owned(),
+                    selector: Some("a.related".to_owned()),
+                }],
+            ),
+            page(
+                "https://example.test/product/2",
+                vec![ObservedLink {
+                    raw_href: "/product/3".to_owned(),
+                    selector: Some("a.related".to_owned()),
+                }],
+            ),
+        ],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+
+    assert_eq!(result.summary.pages_sampled, 3);
+    let product_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == product)
+        .ok_or("missing Product distribution")?;
+    assert_eq!(product_distribution.discovered_unique_urls, 3);
+    assert_eq!(product_distribution.sampled_pages, 2);
+    assert!(result.discovery_paths.iter().any(|path| {
+        path.canonical_url.as_deref() == Some("https://example.test/product/2")
+            && path.state == erabi_domain::PreviewUrlState::InScopeMatched
+    }));
+    assert!(result.discovery_paths.iter().any(|path| {
+        path.canonical_url.as_deref() == Some("https://example.test/product/3")
+            && path.state == erabi_domain::PreviewUrlState::BudgetExcluded
+    }));
+    assert_eq!(
+        result
+            .summary
+            .budget_hit_counts
+            .get(&erabi_domain::PreviewBudgetKind::PageTypePageBudget),
+        Some(&1)
+    );
+    assert_eq!(
+        listing,
+        result.pages[0]
+            .page_type_match
+            .as_ref()
+            .and_then(|matched| { matched.winner.as_ref().map(|winner| winner.page_type_id) })
+            .ok_or("root has no Listing match")?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_roots_are_sampled_not_discovered_and_do_not_reserve_their_hint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, _seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    let mut hinted_root = Seed::new(
+        "https://example.test/listing/hinted-root".parse()?,
+        "https://example.test/listing/hinted-root".parse()?,
+    );
+    hinted_root.entry_page_type_hint = Some(product);
+    let mut current = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    current.add_seed(hinted_root.clone())?;
+    repository
+        .save_draft(&current, "operator", "unix:16")
+        .await?;
+    let version = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    let mut guardrails = repository
+        .crawler_version_guardrails(crawler.id(), version.id())
+        .await?;
+    guardrails.page_types = vec![PageTypeDiscoveryGuardrails {
+        page_type_id: product,
+        page_budget: Some(1),
+        health_threshold: None,
+    }];
+    repository
+        .update_crawler_version_guardrails(
+            crawler.id(),
+            version.id(),
+            &guardrails,
+            "operator",
+            "unix:17",
+        )
+        .await?;
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [
+            page(
+                hinted_root.original_url.as_str(),
+                vec![ObservedLink {
+                    raw_href: "/product/from-root".to_owned(),
+                    selector: Some("a.product".to_owned()),
+                }],
+            ),
+            page("https://example.test/product/from-root", Vec::new()),
+        ],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(
+            crawler.id(),
+            version.id(),
+            preview_request(vec![hinted_root.id]),
+        )
+        .await?;
+
+    assert_eq!(result.summary.pages_sampled, 2);
+    let listing_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == listing)
+        .ok_or("missing Listing distribution")?;
+    assert_eq!(listing_distribution.sampled_pages, 1);
+    assert_eq!(listing_distribution.discovered_unique_urls, 0);
+    let product_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == product)
+        .ok_or("missing Product distribution")?;
+    assert_eq!(product_distribution.discovered_unique_urls, 1);
+    assert_eq!(product_distribution.sampled_pages, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovered_page_type_distribution_tracks_unique_hrefs_separately_from_samples()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [
+            page(
+                seed_a.original_url.as_str(),
+                vec![
+                    ObservedLink {
+                        raw_href: "/product/one".to_owned(),
+                        selector: Some("a.product".to_owned()),
+                    },
+                    ObservedLink {
+                        raw_href: "/product/two".to_owned(),
+                        selector: Some("a.product".to_owned()),
+                    },
+                    ObservedLink {
+                        raw_href: "/product/two#canonical-duplicate".to_owned(),
+                        selector: Some("a.product".to_owned()),
+                    },
+                ],
+            ),
+            page("https://example.test/product/one", Vec::new()),
+            page("https://example.test/product/two", Vec::new()),
+        ],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+
+    let listing_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == listing)
+        .ok_or("missing Listing distribution")?;
+    assert_eq!(listing_distribution.sampled_pages, 1);
+    assert_eq!(listing_distribution.discovered_unique_urls, 0);
+    let product_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == product)
+        .ok_or("missing Product distribution")?;
+    assert_eq!(product_distribution.discovered_unique_urls, 2);
+    assert_eq!(product_distribution.sampled_pages, 2);
+    assert_eq!(result.summary.duplicates_prevented, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn redirect_final_page_type_samples_without_transferring_the_admission_reservation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    let mut guardrails = repository
+        .crawler_version_guardrails(crawler.id(), version.id())
+        .await?;
+    guardrails.page_types = vec![PageTypeDiscoveryGuardrails {
+        page_type_id: listing,
+        page_budget: Some(1),
+        health_threshold: None,
+    }];
+    repository
+        .update_crawler_version_guardrails(
+            crawler.id(),
+            version.id(),
+            &guardrails,
+            "operator",
+            "unix:18",
+        )
+        .await?;
+    let redirected_product = PageObservation {
+        requested_url: "https://example.test/product/redirected".to_owned(),
+        final_url: Some("https://example.test/listing/final".to_owned()),
+        artifact_ids: Vec::new(),
+        discovered_links: vec![ObservedLink {
+            raw_href: "/listing/child".to_owned(),
+            selector: Some("a.next".to_owned()),
+        }],
+        selector_observations: Vec::new(),
+        pagination_observations: Vec::new(),
+    };
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [
+            page(
+                seed_a.original_url.as_str(),
+                vec![ObservedLink {
+                    raw_href: "/product/redirected".to_owned(),
+                    selector: Some("a.product".to_owned()),
+                }],
+            ),
+            redirected_product,
+            page("https://example.test/listing/child", Vec::new()),
+        ],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+
+    assert_eq!(result.summary.pages_sampled, 3);
+    assert!(result.pages.iter().any(|page| {
+        page.canonical_url.as_deref() == Some("https://example.test/listing/child")
+            && page.state == erabi_domain::PreviewUrlState::Sampled
+    }));
+    assert!(
+        !result
+            .summary
+            .budget_hit_counts
+            .contains_key(&erabi_domain::PreviewBudgetKind::PageTypePageBudget)
+    );
+    let product_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == product)
+        .ok_or("missing Product distribution")?;
+    assert_eq!(product_distribution.discovered_unique_urls, 1);
+    assert_eq!(product_distribution.sampled_pages, 0);
+    let listing_distribution = result
+        .summary
+        .page_type_distribution
+        .iter()
+        .find(|distribution| distribution.page_type_id == listing)
+        .ok_or("missing Listing distribution")?;
+    assert_eq!(listing_distribution.discovered_unique_urls, 1);
+    assert_eq!(listing_distribution.sampled_pages, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn redirected_paths_retain_the_observed_source_identity_everywhere()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, _seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    let redirect_url: url::Url = "https://example.test/redirect".parse()?;
+    let redirect_seed = Seed::new(redirect_url.clone(), redirect_url.clone());
+    let mut current = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    current.add_seed(redirect_seed.clone())?;
+    repository
+        .save_draft(&current, "operator", "unix:19")
+        .await?;
+    let version = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    let product_to_listing = transition(product, listing, "product listings", "a.listing", 1);
+    repository
+        .create_discovery_transition(
+            crawler.id(),
+            version.id(),
+            &product_to_listing,
+            "operator",
+            "unix:20",
+        )
+        .await?;
+    let root = PageObservation {
+        requested_url: redirect_seed.original_url.to_string(),
+        final_url: Some("https://example.test/product/final".to_owned()),
+        artifact_ids: Vec::new(),
+        discovered_links: vec![
+            ObservedLink {
+                raw_href: "/listing/1".to_owned(),
+                selector: Some("a.listing".to_owned()),
+            },
+            ObservedLink {
+                raw_href: "/listing/1#duplicate".to_owned(),
+                selector: Some("a.listing".to_owned()),
+            },
+            ObservedLink {
+                raw_href: "https://[::1".to_owned(),
+                selector: Some("a.listing".to_owned()),
+            },
+        ],
+        selector_observations: Vec::new(),
+        pagination_observations: Vec::new(),
+    };
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [root, page("https://example.test/listing/1", Vec::new())],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(
+            crawler.id(),
+            version.id(),
+            preview_request(vec![redirect_seed.id]),
+        )
+        .await?;
+
+    let redirected_paths = result
+        .discovery_paths
+        .iter()
+        .filter(|path| path.source_requested_url == "https://example.test/redirect")
+        .collect::<Vec<_>>();
+    assert_eq!(redirected_paths.len(), 3);
+    for path in &redirected_paths {
+        assert_eq!(
+            path.source_final_url.as_deref(),
+            Some("https://example.test/product/final")
+        );
+        assert_eq!(
+            path.source_canonical_url,
+            "https://example.test/product/final"
+        );
+    }
+    assert!(redirected_paths.iter().any(|path| {
+        path.canonical_url.as_deref() == Some("https://example.test/listing/1")
+            && path.state == erabi_domain::PreviewUrlState::InScopeMatched
+    }));
+    assert!(
+        redirected_paths
+            .iter()
+            .any(|path| { path.state == erabi_domain::PreviewUrlState::CanonicalDuplicate })
+    );
+    assert!(
+        redirected_paths
+            .iter()
+            .any(|path| path.state == erabi_domain::PreviewUrlState::InvalidUrl)
+    );
+    Ok(())
+}
+
+async fn effective_transition_total_limit_case(
+    configured_total_budget: Option<u64>,
+    preview_default: u64,
+    preview_override: Option<u64>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    let mut configured = transition(
+        listing,
+        product,
+        "configured total limit",
+        "a.configured",
+        1,
+    );
+    configured.budget.total_budget = configured_total_budget;
+    repository
+        .create_discovery_transition(
+            crawler.id(),
+            version.id(),
+            &configured,
+            "operator",
+            "unix:21",
+        )
+        .await?;
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [page(seed_a.original_url.as_str(), Vec::new())],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let mut request = preview_request(vec![seed_a.id]);
+    request.limits.default_transition_total_limit = preview_default;
+    if let Some(max_total_links) = preview_override {
+        request.limits.transition_total_limits = vec![TransitionPreviewTotalLimit {
+            transition_id: configured.id,
+            max_total_links,
+        }];
+    }
+    let result = service.execute(crawler.id(), version.id(), request).await?;
+    result
+        .effective_limits
+        .transition_total_limits
+        .iter()
+        .find(|limit| limit.transition_id == configured.id)
+        .map(|limit| limit.effective_total_limit)
+        .ok_or_else(|| "missing configured transition effective limit".into())
+}
+
+#[tokio::test]
+async fn effective_transition_totals_include_configured_caps_and_preview_overrides()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        effective_transition_total_limit_case(Some(5), 20, None).await?,
+        5
+    );
+    assert_eq!(
+        effective_transition_total_limit_case(Some(5), 20, Some(3)).await?,
+        3
+    );
+    assert_eq!(
+        effective_transition_total_limit_case(Some(5), 20, Some(10)).await?,
+        5
+    );
+    assert_eq!(
+        effective_transition_total_limit_case(None, 7, None).await?,
+        7
+    );
     Ok(())
 }
 
@@ -1202,6 +1721,80 @@ async fn cyclic_dominance_requires_a_unique_observed_transition()
         regenerated_and_reversed.growth_warnings,
         tied.growth_warnings
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_node_cycle_dominance_warns_but_acyclic_dominance_does_not()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cycle_database = database().await?;
+    let (crawler, version, seed_a, _seed_b, listing, product, to_product, _to_listing) =
+        graph_fixture(&cycle_database).await?;
+    let repository = CrawlerRepository::new(&cycle_database);
+    let product_to_listing = transition(product, listing, "product return", "a.return", 1);
+    repository
+        .create_discovery_transition(
+            crawler.id(),
+            version.id(),
+            &product_to_listing,
+            "operator",
+            "unix:22",
+        )
+        .await?;
+    let two_node_provider = FixtureDiscoveryPreviewProvider::observed(
+        [page(
+            seed_a.original_url.as_str(),
+            (0..8)
+                .map(|index| ObservedLink {
+                    raw_href: format!("/product/cycle-{index}"),
+                    selector: Some("a.product".to_owned()),
+                })
+                .collect::<Vec<_>>(),
+        )],
+        1,
+    );
+    let two_node = DiscoveryPreviewService::new(cycle_database, Some(Arc::new(two_node_provider)))
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+    assert_eq!(
+        two_node.growth_indicators.dominant_transition_id,
+        Some(to_product)
+    );
+    assert!(has_growth_warning(
+        &two_node,
+        erabi_domain::PreviewGrowthWarningCode::CyclicTransitionDominance
+    ));
+
+    let acyclic_database = database().await?;
+    let (crawler, version, seed_a, _seed_b, _listing, _product, to_product, _to_listing) =
+        graph_fixture(&acyclic_database).await?;
+    let acyclic_provider = FixtureDiscoveryPreviewProvider::observed(
+        [page(
+            seed_a.original_url.as_str(),
+            (0..8)
+                .map(|index| ObservedLink {
+                    raw_href: format!("/product/acyclic-{index}"),
+                    selector: Some("a.product".to_owned()),
+                })
+                .collect::<Vec<_>>(),
+        )],
+        1,
+    );
+    let acyclic = DiscoveryPreviewService::new(acyclic_database, Some(Arc::new(acyclic_provider)))
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+    assert_eq!(
+        acyclic.growth_indicators.dominant_transition_id,
+        Some(to_product)
+    );
+    assert_eq!(
+        acyclic.growth_indicators.dominant_transition_share_percent,
+        Some(100)
+    );
+    assert!(!has_growth_warning(
+        &acyclic,
+        erabi_domain::PreviewGrowthWarningCode::CyclicTransitionDominance
+    ));
     Ok(())
 }
 

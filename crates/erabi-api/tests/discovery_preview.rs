@@ -109,6 +109,88 @@ async fn fixture_router(
     Ok((router, crawler, version, seed))
 }
 
+fn assert_typed_preview_openapi(openapi: &serde_json::Value) {
+    assert!(
+        openapi["paths"]["/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview"]
+            .is_object()
+    );
+    for schema in [
+        "DiscoveryPreviewRequest",
+        "PreviewLimits",
+        "TransitionPreviewTotalLimit",
+        "DiscoveryPreviewResult",
+        "DiscoveryPreviewSummary",
+        "DiscoveryPreviewPage",
+        "DiscoveryPath",
+        "PreviewGrowthIndicators",
+        "PreviewQueryVariantGroup",
+        "PreviewGrowthWarning",
+        "EffectiveTransitionPreviewTotalLimit",
+        "PreviewPageTypeDistribution",
+        "PreviewTransitionCount",
+        "PreviewBudgetHit",
+    ] {
+        assert!(
+            openapi["components"]["schemas"][schema].is_object(),
+            "missing {schema}"
+        );
+    }
+    assert_eq!(
+        openapi["components"]["schemas"]["PreviewGrowthIndicators"]["properties"]["query_variant_groups"]
+            ["items"]["$ref"],
+        "#/components/schemas/PreviewQueryVariantGroup"
+    );
+    assert!(
+        openapi["components"]["schemas"]["PreviewQueryVariantGroup"]["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&serde_json::json!("total_identities")))
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPath"]["properties"]["canonicalization"]["anyOf"]
+            [0]["$ref"],
+        "#/components/schemas/CanonicalizationEvidence"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPath"]["properties"]["scope"]["anyOf"][0]["$ref"],
+        "#/components/schemas/DomainScopeEvidence"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPath"]["properties"]["target_page_type_match"]["anyOf"]
+            [0]["$ref"],
+        "#/components/schemas/PageTypeMatchEvidence"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPreviewPage"]["properties"]["diagnostic"]["anyOf"]
+            [0]["$ref"],
+        "#/components/schemas/TestDiagnostic"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPreviewPage"]["properties"]["diagnostic"]["anyOf"]
+            [1]["type"],
+        "null"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPreviewSummary"]["properties"]["page_type_distribution"]
+            ["items"]["$ref"],
+        "#/components/schemas/PreviewPageTypeDistribution"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPreviewSummary"]["properties"]["transition_counts"]
+            ["items"]["$ref"],
+        "#/components/schemas/PreviewTransitionCount"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPreviewSeed"]["properties"]["scope"]["anyOf"][1]
+            ["type"],
+        "null"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["DiscoveryPreviewPage"]["properties"]["page_type_match"]["anyOf"]
+            [1]["type"],
+        "null"
+    );
+}
+
 #[tokio::test]
 async fn discovery_preview_route_returns_ephemeral_preview_and_typed_openapi()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -144,42 +226,18 @@ async fn discovery_preview_route_returns_ephemeral_preview_and_typed_openapi()
     assert_eq!(result["selected_seed_ids"][0], seed.id.to_string());
     assert_eq!(result["summary"]["pages_sampled"], 1);
     assert!(result.get("complete_snapshot_eligible").is_none());
+    assert!(result["pages"][0]["scope"].is_object());
+    assert!(result["pages"][0]["page_type_match"].is_object());
+    assert!(result["pages"][0]["diagnostic"].is_null());
+    assert!(result["discovery_paths"][0]["canonicalization"].is_object());
+    assert!(result["discovery_paths"][0]["scope"].is_object());
+    assert!(result["discovery_paths"][0]["target_page_type_match"].is_object());
 
     let openapi = router
         .oneshot(request("GET", "/api/v1/openapi.json", "")?)
         .await?;
     let openapi = json(openapi).await?;
-    assert!(
-        openapi["paths"]["/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview"]
-            .is_object()
-    );
-    for schema in [
-        "DiscoveryPreviewRequest",
-        "PreviewLimits",
-        "TransitionPreviewTotalLimit",
-        "DiscoveryPreviewResult",
-        "DiscoveryPreviewSummary",
-        "DiscoveryPreviewPage",
-        "DiscoveryPath",
-        "PreviewGrowthIndicators",
-        "PreviewQueryVariantGroup",
-        "PreviewGrowthWarning",
-    ] {
-        assert!(
-            openapi["components"]["schemas"][schema].is_object(),
-            "missing {schema}"
-        );
-    }
-    assert_eq!(
-        openapi["components"]["schemas"]["PreviewGrowthIndicators"]["properties"]["query_variant_groups"]
-            ["items"]["$ref"],
-        "#/components/schemas/PreviewQueryVariantGroup"
-    );
-    assert!(
-        openapi["components"]["schemas"]["PreviewQueryVariantGroup"]["required"]
-            .as_array()
-            .is_some_and(|required| required.contains(&serde_json::json!("total_identities")))
-    );
+    assert_typed_preview_openapi(&openapi);
     Ok(())
 }
 
