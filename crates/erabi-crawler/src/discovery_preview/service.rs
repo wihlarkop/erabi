@@ -349,6 +349,9 @@ struct QueueEntry {
     canonical_url: String,
     depth: u32,
     seed_ids: Vec<SeedId>,
+    /// Present only for a discovery-admitted target. Roots are already at
+    /// depth zero and therefore never need a duplicate depth reduction.
+    target_page_type_id: Option<erabi_domain::PageTypeId>,
     order: usize,
 }
 
@@ -378,7 +381,6 @@ struct PreviewRun {
     unmatched_urls: BTreeSet<String>,
     ambiguous_urls: BTreeSet<String>,
     in_scope_urls: BTreeSet<String>,
-    query_urls: BTreeSet<String>,
     consumed_bytes: u64,
     pages_sampled: u64,
     urls_discovered: u64,
@@ -448,7 +450,6 @@ impl PreviewRun {
             unmatched_urls: BTreeSet::new(),
             ambiguous_urls: BTreeSet::new(),
             in_scope_urls: BTreeSet::new(),
-            query_urls: BTreeSet::new(),
             consumed_bytes: 0,
             pages_sampled: 0,
             urls_discovered: 0,
@@ -517,6 +518,7 @@ impl PreviewRun {
                             canonical_url: canonical_url.clone(),
                             depth: 0,
                             seed_ids: vec![seed.id],
+                            target_page_type_id: None,
                             order,
                         },
                     );
@@ -558,14 +560,14 @@ impl PreviewRun {
                 canonical_url: entry.canonical_url.clone(),
                 depth: entry.depth,
                 seed_ids: entry.seed_ids.clone(),
+                target_page_type_id: entry.target_page_type_id,
                 order: entry.order,
             })
             .collect();
     }
 
     async fn traverse(&mut self) -> Result<(), DiscoveryPreviewError> {
-        while let Some(entry) = self.queue.pop_front() {
-            self.queued.remove(&entry.canonical_url);
+        while !self.queue.is_empty() {
             if self.elapsed_millis() >= self.context.limits.max_duration_ms {
                 self.hit_time_budget();
                 break;
@@ -580,6 +582,10 @@ impl PreviewRun {
                 });
                 break;
             }
+            let Some(entry) = self.queue.pop_front() else {
+                break;
+            };
+            self.queued.remove(&entry.canonical_url);
             let remaining = self
                 .context
                 .limits
@@ -964,11 +970,20 @@ impl PreviewRun {
                 self.paths.push(path);
                 continue;
             }
-            if canonicalization_result.canonical_url.query().is_some() {
-                self.query_urls.insert(canonical_url.clone());
-            }
             if !unique {
                 self.duplicates_prevented = self.duplicates_prevented.saturating_add(1);
+                let prospective_depth = if self.sampled.contains(&canonical_url) {
+                    None
+                } else {
+                    let depth = self.queued_duplicate_prospective_depth(
+                        entry,
+                        source_match,
+                        &link,
+                        &canonical_url,
+                    )?;
+                    self.merge_queued_duplicate_provenance(&canonical_url, &entry.seed_ids, depth);
+                    depth
+                };
                 let mut path = self.path_base(
                     entry,
                     source_match,
@@ -984,6 +999,7 @@ impl PreviewRun {
                     Vec::new(),
                 );
                 path.source_final_url = observation.final_url.clone();
+                path.prospective_depth = prospective_depth;
                 self.paths.push(path);
                 continue;
             }
@@ -1103,6 +1119,10 @@ impl PreviewRun {
             path.prospective_depth = prospective_depth;
             self.paths.push(path);
             if let Some((_, depth)) = eligible.iter().min_by(|left, right| left.1.cmp(&right.1)) {
+                let target_page_type_id = target_match
+                    .winner
+                    .as_ref()
+                    .map(|winner| winner.page_type_id);
                 if let Some(winner) = target_match.winner.as_ref() {
                     let page_count = self
                         .page_type_scheduled
@@ -1154,6 +1174,7 @@ impl PreviewRun {
                         canonical_url,
                         depth: *depth,
                         seed_ids: entry.seed_ids.clone(),
+                        target_page_type_id,
                         order,
                     },
                 );
@@ -1182,6 +1203,77 @@ impl PreviewRun {
                 .then(left.id.to_string().cmp(&right.id.to_string()))
         });
         transitions
+    }
+
+    /// Computes only the queue-placement depth for an already admitted
+    /// canonical identity. This deliberately does not resolve the target
+    /// again, evaluate a transition budget, or increment transition counters:
+    /// those actions belong exclusively to the first unique discovery event.
+    fn queued_duplicate_prospective_depth(
+        &self,
+        entry: &QueueEntry,
+        source_match: &PageTypeMatchEvidence,
+        link: &ObservedLink,
+        canonical_url: &str,
+    ) -> Result<Option<u32>, DiscoveryPreviewError> {
+        let Some(target_page_type_id) = self
+            .queued
+            .get(canonical_url)
+            .and_then(|queued| queued.target_page_type_id)
+        else {
+            return Ok(None);
+        };
+        let Some(source_page_type_id) = source_match
+            .winner
+            .as_ref()
+            .map(|winner| winner.page_type_id)
+        else {
+            return Ok(None);
+        };
+        let mut minimum = None;
+        for transition in self.context.transitions.iter().filter(|transition| {
+            transition.enabled
+                && transition.source_page_type_id == source_page_type_id
+                && transition.target_page_type_id == target_page_type_id
+                && transition.url_constraints.is_none()
+                && link.selector.as_deref() == Some(transition.link_selector.as_str())
+        }) {
+            let prospective = entry
+                .depth
+                .checked_add(transition.budget.depth_contribution)
+                .ok_or(DiscoveryPreviewError::BudgetOverflow)?;
+            minimum = Some(minimum.map_or(prospective, |current: u32| current.min(prospective)));
+        }
+        Ok(minimum)
+    }
+
+    /// Keeps every selected-root provenance link on the one queued identity
+    /// and applies the minimum known runtime depth without reserving another
+    /// provider-work slot.
+    fn merge_queued_duplicate_provenance(
+        &mut self,
+        canonical_url: &str,
+        seed_ids: &[SeedId],
+        prospective_depth: Option<u32>,
+    ) {
+        let mut changed = false;
+        if let Some(queued) = self.queued.get_mut(canonical_url) {
+            for seed_id in seed_ids {
+                if !queued.seed_ids.contains(seed_id) {
+                    queued.seed_ids.push(*seed_id);
+                    changed = true;
+                }
+            }
+            if let Some(depth) = prospective_depth
+                && depth < queued.depth
+            {
+                queued.depth = depth;
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_queue();
+        }
     }
 
     fn check_transition_budget(
@@ -1544,13 +1636,7 @@ impl PreviewRun {
             .iter()
             .map(|count| count.eligible_edges)
             .sum::<u64>();
-        let dominant = transition_counts.iter().max_by(|left, right| {
-            left.eligible_edges.cmp(&right.eligible_edges).then(
-                left.transition_id
-                    .to_string()
-                    .cmp(&right.transition_id.to_string()),
-            )
-        });
+        let dominant = unique_dominant_transition(&transition_counts);
         let dominant_share = if total_edges > 0 {
             dominant.map(|count| count.eligible_edges.saturating_mul(100) / total_edges)
         } else {
@@ -1760,31 +1846,58 @@ fn is_cycle(
         .any(|transition| is_cycle(graph, transition.target_page_type_id, target, visited))
 }
 
+/// A transition is dominant only when the observed edge counts identify one
+/// non-zero maximum. Ties intentionally remain advisory-ambiguous; no stable
+/// identifier or presentation order may fabricate a winner.
+fn unique_dominant_transition(
+    counts: &[PreviewTransitionCount],
+) -> Option<&PreviewTransitionCount> {
+    let maximum = counts.iter().map(|count| count.eligible_edges).max()?;
+    if maximum == 0 {
+        return None;
+    }
+    let mut tied = counts
+        .iter()
+        .filter(|count| count.eligible_edges == maximum);
+    let dominant = tied.next()?;
+    tied.next().is_none().then_some(dominant)
+}
+
 fn query_variant_groups(urls: &BTreeSet<String>) -> Vec<PreviewQueryVariantGroup> {
-    let mut groups: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    #[derive(Default)]
+    struct QueryGroupAccounting {
+        total_identities: u64,
+        query_bearing_identities: u64,
+        variants: BTreeSet<String>,
+    }
+
+    let mut groups: BTreeMap<(String, String), QueryGroupAccounting> = BTreeMap::new();
     for value in urls {
         if let Ok(url) = url::Url::parse(value) {
+            let group = groups
+                .entry((
+                    url.host_str().unwrap_or_default().to_ascii_lowercase(),
+                    url.path().to_owned(),
+                ))
+                .or_default();
+            group.total_identities = group.total_identities.saturating_add(1);
             if let Some(query) = url.query() {
-                groups
-                    .entry((
-                        url.host_str().unwrap_or_default().to_owned(),
-                        url.path().to_owned(),
-                    ))
-                    .or_default()
-                    .insert(query.to_owned());
+                group.query_bearing_identities = group.query_bearing_identities.saturating_add(1);
+                group.variants.insert(query.to_owned());
             }
         }
     }
     groups
         .into_iter()
-        .filter_map(|((host, path), variants)| {
-            (variants.len() >= erabi_domain::QUERY_EXPLOSION_MIN_VARIANTS as usize).then_some(
-                PreviewQueryVariantGroup {
+        .filter_map(|((host, path), accounting)| {
+            (accounting.variants.len() >= erabi_domain::QUERY_EXPLOSION_MIN_VARIANTS as usize)
+                .then_some(PreviewQueryVariantGroup {
                     host,
                     path,
-                    canonical_query_variants: variants.len() as u64,
-                },
-            )
+                    total_identities: accounting.total_identities,
+                    query_bearing_identities: accounting.query_bearing_identities,
+                    canonical_query_variants: accounting.variants.len() as u64,
+                })
         })
         .collect()
 }
@@ -1823,11 +1936,21 @@ fn growth_warnings(
             });
         }
     }
-    if !groups.is_empty() {
+    let exploding_query_groups = groups
+        .iter()
+        .filter(|group| {
+            group.canonical_query_variants >= erabi_domain::QUERY_EXPLOSION_MIN_VARIANTS
+                && group.query_bearing_identities.saturating_mul(100)
+                    >= group
+                        .total_identities
+                        .saturating_mul(erabi_domain::QUERY_EXPLOSION_QUERY_BEARING_PERCENT)
+        })
+        .collect::<Vec<_>>();
+    if !exploding_query_groups.is_empty() {
         warnings.push(PreviewGrowthWarning {
             code: PreviewGrowthWarningCode::QueryParameterExplosion,
             message: "A host/path has many canonical query variants.".to_owned(),
-            observed: groups
+            observed: exploding_query_groups
                 .iter()
                 .map(|group| group.canonical_query_variants)
                 .max()
@@ -1859,13 +1982,8 @@ fn growth_warnings(
         });
     }
     let pressure = frontier > 0
-        && (run.admitted.len() as u64 * 100
-            >= run.context.limits.max_pages * erabi_domain::BUDGET_PRESSURE_PERCENT
-            || total > 0
-                && counts.iter().any(|count| {
-                    let limit = run.context.transition_total_limit(count.transition_id);
-                    count.eligible_edges * 100 >= limit * erabi_domain::BUDGET_PRESSURE_PERCENT
-                }));
+        && (has_relevant_budget_hit(&run.budget_hits)
+            || has_budget_pressure_utilization(run, counts, total));
     if pressure {
         warnings.push(PreviewGrowthWarning {
             code: PreviewGrowthWarningCode::BudgetPressure,
@@ -1876,6 +1994,80 @@ fn growth_warnings(
         });
     }
     warnings
+}
+
+fn has_relevant_budget_hit(hits: &BTreeMap<PreviewBudgetKind, u64>) -> bool {
+    hits.keys().any(|kind| {
+        matches!(
+            kind,
+            PreviewBudgetKind::MaxPages
+                | PreviewBudgetKind::MaxDepth
+                | PreviewBudgetKind::MaxDuration
+                | PreviewBudgetKind::MaxDownloadedBytes
+                | PreviewBudgetKind::PageTypePageBudget
+                | PreviewBudgetKind::TransitionPerSourcePage
+                | PreviewBudgetKind::TransitionTotal
+        )
+    })
+}
+
+fn reaches_budget_pressure(observed: u64, limit: u64) -> bool {
+    limit > 0
+        && u128::from(observed) * 100
+            >= u128::from(limit) * u128::from(erabi_domain::BUDGET_PRESSURE_PERCENT)
+}
+
+fn has_budget_pressure_utilization(
+    run: &PreviewRun,
+    counts: &[PreviewTransitionCount],
+    total: u64,
+) -> bool {
+    if reaches_budget_pressure(run.admitted.len() as u64, run.context.limits.max_pages)
+        || reaches_budget_pressure(run.consumed_bytes, run.context.limits.max_downloaded_bytes)
+        || reaches_budget_pressure(run.elapsed_millis(), run.context.limits.max_duration_ms)
+    {
+        return true;
+    }
+    if run.context.page_types.iter().any(|page_type| {
+        run.context
+            .snapshot
+            .version
+            .guardrails()
+            .page_type(page_type.id)
+            .and_then(|budget| budget.page_budget)
+            .is_some_and(|limit| {
+                reaches_budget_pressure(
+                    run.page_type_scheduled
+                        .get(&page_type.id.to_string())
+                        .copied()
+                        .unwrap_or(0),
+                    limit,
+                )
+            })
+    }) {
+        return true;
+    }
+    if run.transition_page_counts.iter().any(|((id, _), count)| {
+        run.context
+            .transitions
+            .iter()
+            .find(|transition| transition.id.to_string() == *id)
+            .is_some_and(|transition| {
+                reaches_budget_pressure(
+                    u64::from(*count),
+                    u64::from(transition.budget.max_links_per_source_page),
+                )
+            })
+    }) {
+        return true;
+    }
+    total > 0
+        && counts.iter().any(|count| {
+            reaches_budget_pressure(
+                count.eligible_edges,
+                run.context.transition_total_limit(count.transition_id),
+            )
+        })
 }
 
 impl PreviewRun {
@@ -1889,5 +2081,53 @@ impl PreviewRun {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count(id: DiscoveryTransitionId, eligible_edges: u64) -> PreviewTransitionCount {
+        PreviewTransitionCount {
+            transition_id: id,
+            transition_name: "transition".to_owned(),
+            eligible_edges,
+            source_pages_with_eligible_edges: eligible_edges,
+        }
+    }
+
+    #[test]
+    fn dominant_transition_has_no_identifier_or_input_order_tiebreak() {
+        let first = DiscoveryTransitionId::new();
+        let second = DiscoveryTransitionId::new();
+        let tied = [count(first, 8), count(second, 8)];
+        assert!(unique_dominant_transition(&tied).is_none());
+        let reversed = [count(second, 8), count(first, 8)];
+        assert!(unique_dominant_transition(&reversed).is_none());
+
+        let unique = [count(first, 9), count(second, 8)];
+        assert_eq!(
+            unique_dominant_transition(&unique).map(|item| item.transition_id),
+            Some(first)
+        );
+        let no_observations = [count(first, 0)];
+        assert!(unique_dominant_transition(&no_observations).is_none());
+    }
+
+    #[test]
+    fn budget_pressure_recognizes_every_retained_work_budget_hit() {
+        for kind in [
+            PreviewBudgetKind::MaxPages,
+            PreviewBudgetKind::MaxDownloadedBytes,
+            PreviewBudgetKind::PageTypePageBudget,
+            PreviewBudgetKind::TransitionPerSourcePage,
+            PreviewBudgetKind::TransitionTotal,
+        ] {
+            let hits = BTreeMap::from([(kind, 1)]);
+            assert!(has_relevant_budget_hit(&hits), "{kind:?}");
+        }
+        let retention_only = BTreeMap::from([(PreviewBudgetKind::ProvenanceRetention, 1)]);
+        assert!(!has_relevant_budget_hit(&retention_only));
     }
 }

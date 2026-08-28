@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use erabi_crawler::{
     DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider, DiscoveryPreviewProviderError,
@@ -200,6 +200,73 @@ struct AdvancingProvider {
     clock: Arc<ManualPreviewClock>,
 }
 
+struct RecordingProvider {
+    inner: FixtureDiscoveryPreviewProvider,
+    requested_urls: Mutex<Vec<String>>,
+}
+
+impl RecordingProvider {
+    fn observed(pages: impl IntoIterator<Item = PageObservation>, downloaded_bytes: u64) -> Self {
+        Self {
+            inner: FixtureDiscoveryPreviewProvider::observed(pages, downloaded_bytes),
+            requested_urls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requested_urls(&self) -> Vec<String> {
+        match self.requested_urls.lock() {
+            Ok(requested_urls) => requested_urls.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+impl DiscoveryPreviewProvider for RecordingProvider {
+    fn observe(
+        &self,
+        request: DiscoveryPreviewObservationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<DiscoveryPreviewProviderOutcome, DiscoveryPreviewProviderError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        match self.requested_urls.lock() {
+            Ok(mut requested_urls) => requested_urls.push(request.requested_url.clone()),
+            Err(poisoned) => poisoned.into_inner().push(request.requested_url.clone()),
+        }
+        self.inner.observe(request)
+    }
+}
+
+fn transition(
+    source_page_type_id: erabi_domain::PageTypeId,
+    target_page_type_id: erabi_domain::PageTypeId,
+    name: &str,
+    selector: &str,
+    depth_contribution: u32,
+) -> DiscoveryTransition {
+    DiscoveryTransition {
+        id: DiscoveryTransitionId::new(),
+        source_page_type_id,
+        target_page_type_id,
+        name: name.to_owned(),
+        enabled: true,
+        link_selector: selector.to_owned(),
+        url_constraints: None,
+        priority: 0,
+        budget: TransitionBudget {
+            max_links_per_source_page: 20,
+            total_budget: Some(20),
+            depth_contribution,
+        },
+        deduplicate: true,
+        latest_test_evidence_id: None,
+    }
+}
+
 impl DiscoveryPreviewProvider for AdvancingProvider {
     fn observe(
         &self,
@@ -223,7 +290,7 @@ async fn multi_seed_bfs_is_bounded_and_cycles_do_not_resample()
     let database = database().await?;
     let (crawler, version, seed_a, seed_b, _listing, _product, _to_product, _to_listing) =
         graph_fixture(&database).await?;
-    let provider = FixtureDiscoveryPreviewProvider::observed(
+    let provider = Arc::new(RecordingProvider::observed(
         [
             page(
                 seed_a.original_url.as_str(),
@@ -248,8 +315,8 @@ async fn multi_seed_bfs_is_bounded_and_cycles_do_not_resample()
             page("https://example.test/product/1", vec![]),
         ],
         10,
-    );
-    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    ));
+    let service = DiscoveryPreviewService::new(database, Some(provider.clone()));
     let result = service
         .execute(
             crawler.id(),
@@ -271,6 +338,14 @@ async fn multi_seed_bfs_is_bounded_and_cycles_do_not_resample()
             .discovery_paths
             .iter()
             .any(|path| path.state == erabi_domain::PreviewUrlState::CanonicalDuplicate)
+    );
+    assert_eq!(
+        provider
+            .requested_urls()
+            .iter()
+            .filter(|url| url.as_str() == seed_a.original_url.as_str())
+            .count(),
+        1
     );
     Ok(())
 }
@@ -705,5 +780,475 @@ async fn page_failure_is_bounded_and_provider_contract_failure_is_rejected()
         .await?;
     assert_eq!(result.summary.provider_errors, 1);
     assert_eq!(result.summary.pages_sampled, 0);
+    Ok(())
+}
+
+async fn queued_duplicate_depth_case(
+    first_depth: u32,
+    later_depth: u32,
+    reverse_link_input: bool,
+    max_pages: u64,
+) -> Result<(erabi_domain::DiscoveryPreviewResult, Vec<String>), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    for item in [
+        transition(listing, product, "deep route", "a.deep", first_depth),
+        transition(
+            listing,
+            product,
+            "shallower route",
+            "a.shallow",
+            later_depth,
+        ),
+    ] {
+        repository
+            .create_discovery_transition(crawler.id(), version.id(), &item, "operator", "unix:20")
+            .await?;
+    }
+    let deep_link = ObservedLink {
+        raw_href: "/product/x?utm_source=first".to_owned(),
+        selector: Some("a.deep".to_owned()),
+    };
+    let shallow_link = ObservedLink {
+        raw_href: "/product/x?utm_source=later".to_owned(),
+        selector: Some("a.shallow".to_owned()),
+    };
+    let links = if reverse_link_input {
+        vec![shallow_link, deep_link]
+    } else {
+        vec![deep_link, shallow_link]
+    };
+    let mut pages = vec![
+        page(seed_a.original_url.as_str(), links),
+        page("https://example.test/product/x", Vec::new()),
+    ];
+    if reverse_link_input {
+        pages.reverse();
+    }
+    let provider = Arc::new(RecordingProvider::observed(pages, 1));
+    let service = DiscoveryPreviewService::new(database, Some(provider.clone()));
+    let mut request = preview_request(vec![seed_a.id]);
+    request.limits.max_pages = max_pages;
+    let result = service.execute(crawler.id(), version.id(), request).await?;
+    Ok((result, provider.requested_urls()))
+}
+
+type QueuedDuplicateSemantics = (
+    u32,
+    u64,
+    u64,
+    u64,
+    Vec<(erabi_domain::PreviewUrlState, Option<u32>)>,
+);
+
+fn queued_duplicate_semantics(
+    result: &erabi_domain::DiscoveryPreviewResult,
+) -> Option<QueuedDuplicateSemantics> {
+    let target = result
+        .pages
+        .iter()
+        .find(|page| page.canonical_url.as_deref() == Some("https://example.test/product/x"))?;
+    let paths = result
+        .discovery_paths
+        .iter()
+        .filter(|path| path.canonical_url.as_deref() == Some("https://example.test/product/x"))
+        .map(|path| (path.state, path.prospective_depth))
+        .collect();
+    Some((
+        target.depth,
+        result.summary.pages_sampled,
+        result.summary.duplicates_prevented,
+        result.summary.newly_enqueued_urls,
+        paths,
+    ))
+}
+
+#[tokio::test]
+async fn queued_duplicate_uses_minimum_known_depth_without_another_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (result, calls) = queued_duplicate_depth_case(3, 1, false, 2).await?;
+    let semantics = queued_duplicate_semantics(&result).ok_or("missing queued target page")?;
+    assert_eq!(
+        calls,
+        vec![
+            "https://example.test/listing/a".to_owned(),
+            "https://example.test/product/x".to_owned(),
+        ]
+    );
+    assert_eq!(semantics.0, 1);
+    assert_eq!(result.summary.pages_sampled, 2);
+    assert_eq!(result.summary.newly_enqueued_urls, 2);
+    assert_eq!(result.summary.duplicates_prevented, 1);
+    assert!(
+        !result
+            .summary
+            .budget_hit_counts
+            .contains_key(&erabi_domain::PreviewBudgetKind::MaxPages)
+    );
+    let paths = &semantics.4;
+    assert_eq!(
+        paths,
+        &vec![
+            (erabi_domain::PreviewUrlState::InScopeMatched, Some(3)),
+            (erabi_domain::PreviewUrlState::CanonicalDuplicate, Some(1)),
+        ]
+    );
+    assert!(
+        result
+            .discovery_paths
+            .iter()
+            .filter(|path| path.canonical_url.as_deref() == Some("https://example.test/product/x"))
+            .all(|path| path.seed_ids.len() == 1)
+    );
+
+    let (reversed, reversed_calls) = queued_duplicate_depth_case(3, 1, true, 2).await?;
+    assert_eq!(reversed_calls, calls);
+    let reversed_semantics =
+        queued_duplicate_semantics(&reversed).ok_or("missing reversed queued target page")?;
+    assert_eq!(reversed_semantics, semantics);
+    Ok(())
+}
+
+#[tokio::test]
+async fn equal_or_deeper_queued_duplicates_do_not_create_another_entry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (equal, equal_calls) = queued_duplicate_depth_case(3, 3, false, 2).await?;
+    assert_eq!(
+        queued_duplicate_semantics(&equal)
+            .ok_or("missing equal-depth queued target page")?
+            .0,
+        3
+    );
+    assert_eq!(equal_calls.len(), 2);
+    assert_eq!(equal.summary.newly_enqueued_urls, 2);
+
+    let (deeper, deeper_calls) = queued_duplicate_depth_case(3, 4, false, 2).await?;
+    assert_eq!(
+        queued_duplicate_semantics(&deeper)
+            .ok_or("missing deeper queued target page")?
+            .0,
+        3
+    );
+    assert_eq!(deeper_calls.len(), 2);
+    assert_eq!(deeper.summary.newly_enqueued_urls, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_duplicate_retains_each_seed_provenance_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, seed_b, listing, product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    for item in [
+        transition(listing, product, "deep route", "a.deep", 3),
+        transition(listing, product, "shallower route", "a.shallow", 1),
+    ] {
+        repository
+            .create_discovery_transition(crawler.id(), version.id(), &item, "operator", "unix:20b")
+            .await?;
+    }
+    let provider = Arc::new(RecordingProvider::observed(
+        [
+            page(
+                seed_a.original_url.as_str(),
+                vec![ObservedLink {
+                    raw_href: "/product/x?utm_source=first".to_owned(),
+                    selector: Some("a.deep".to_owned()),
+                }],
+            ),
+            page(
+                seed_b.original_url.as_str(),
+                vec![ObservedLink {
+                    raw_href: "/product/x?utm_source=later".to_owned(),
+                    selector: Some("a.shallow".to_owned()),
+                }],
+            ),
+            page("https://example.test/product/x", Vec::new()),
+        ],
+        1,
+    ));
+    let service = DiscoveryPreviewService::new(database, Some(provider.clone()));
+    let result = service
+        .execute(
+            crawler.id(),
+            version.id(),
+            preview_request(vec![seed_a.id, seed_b.id]),
+        )
+        .await?;
+    let target = result
+        .pages
+        .iter()
+        .find(|page| page.canonical_url.as_deref() == Some("https://example.test/product/x"))
+        .ok_or("missing queued target page")?;
+    assert_eq!(target.depth, 1);
+    assert_eq!(target.seed_ids, vec![seed_a.id, seed_b.id]);
+    assert_eq!(
+        provider
+            .requested_urls()
+            .iter()
+            .filter(|url| url.as_str() == "https://example.test/product/x")
+            .count(),
+        1
+    );
+    let source_seed_ids = result
+        .discovery_paths
+        .iter()
+        .filter(|path| path.canonical_url.as_deref() == Some("https://example.test/product/x"))
+        .map(|path| path.seed_ids.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(source_seed_ids, vec![vec![seed_a.id], vec![seed_b.id]]);
+    Ok(())
+}
+
+async fn query_explosion_case(
+    query_variants: u64,
+    queryless_identities: u64,
+    reverse_link_input: bool,
+) -> Result<erabi_domain::DiscoveryPreviewResult, Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, _listing, _product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let mut links = (0..query_variants)
+        .map(|index| ObservedLink {
+            raw_href: format!("/listing/query?variant={index}"),
+            selector: Some("a.next".to_owned()),
+        })
+        .collect::<Vec<_>>();
+    for index in 0..queryless_identities {
+        let raw_href = if index == 0 {
+            "/listing/query".to_owned()
+        } else {
+            format!("https://example.test:{}/listing/query", 4_430 + index)
+        };
+        links.push(ObservedLink {
+            raw_href,
+            selector: Some("a.next".to_owned()),
+        });
+    }
+    if reverse_link_input {
+        links.reverse();
+    }
+    let provider =
+        FixtureDiscoveryPreviewProvider::observed([page(seed_a.original_url.as_str(), links)], 1);
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    service
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await
+        .map_err(Into::into)
+}
+
+fn query_group(
+    result: &erabi_domain::DiscoveryPreviewResult,
+) -> Option<&erabi_domain::PreviewQueryVariantGroup> {
+    result
+        .growth_indicators
+        .query_variant_groups
+        .iter()
+        .find(|group| group.host == "example.test" && group.path == "/listing/query")
+}
+
+fn has_growth_warning(
+    result: &erabi_domain::DiscoveryPreviewResult,
+    code: erabi_domain::PreviewGrowthWarningCode,
+) -> bool {
+    result
+        .growth_warnings
+        .iter()
+        .any(|warning| warning.code == code)
+}
+
+#[tokio::test]
+async fn query_explosion_requires_variant_threshold_and_query_bearing_ratio()
+-> Result<(), Box<dyn std::error::Error>> {
+    let all_query_bearing = query_explosion_case(8, 0, false).await?;
+    assert!(has_growth_warning(
+        &all_query_bearing,
+        erabi_domain::PreviewGrowthWarningCode::QueryParameterExplosion
+    ));
+    let all_query_group = query_group(&all_query_bearing).ok_or("missing all-query group")?;
+    assert_eq!(all_query_group.canonical_query_variants, 8);
+    assert_eq!(all_query_group.query_bearing_identities, 8);
+    assert_eq!(all_query_group.total_identities, 8);
+
+    let below_ratio = query_explosion_case(8, 4, false).await?;
+    assert!(!has_growth_warning(
+        &below_ratio,
+        erabi_domain::PreviewGrowthWarningCode::QueryParameterExplosion
+    ));
+    let below_ratio_group = query_group(&below_ratio).ok_or("missing below-ratio group")?;
+    assert_eq!(below_ratio_group.canonical_query_variants, 8);
+    assert_eq!(below_ratio_group.query_bearing_identities, 8);
+    assert_eq!(below_ratio_group.total_identities, 12);
+
+    let threshold_ratio = query_explosion_case(9, 3, false).await?;
+    assert!(has_growth_warning(
+        &threshold_ratio,
+        erabi_domain::PreviewGrowthWarningCode::QueryParameterExplosion
+    ));
+    let threshold_ratio_group =
+        query_group(&threshold_ratio).ok_or("missing threshold-ratio group")?;
+    assert_eq!(threshold_ratio_group.canonical_query_variants, 9);
+    assert_eq!(threshold_ratio_group.query_bearing_identities, 9);
+    assert_eq!(threshold_ratio_group.total_identities, 12);
+
+    let reversed = query_explosion_case(9, 3, true).await?;
+    assert_eq!(
+        query_group(&reversed).ok_or("missing reversed query group")?,
+        threshold_ratio_group
+    );
+    assert_eq!(reversed.growth_warnings, threshold_ratio.growth_warnings,);
+    Ok(())
+}
+
+async fn dominance_case(
+    include_product_tie: bool,
+    reverse_link_input: bool,
+) -> Result<
+    (
+        erabi_domain::DiscoveryPreviewResult,
+        erabi_domain::DiscoveryTransitionId,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, _listing, _product, to_product, to_listing) =
+        graph_fixture(&database).await?;
+    let mut links = (0..8)
+        .map(|index| ObservedLink {
+            raw_href: format!("/listing/cycle-{index}"),
+            selector: Some("a.next".to_owned()),
+        })
+        .collect::<Vec<_>>();
+    if include_product_tie {
+        links.extend((0..8).map(|index| ObservedLink {
+            raw_href: format!("/product/tie-{index}"),
+            selector: Some("a.product".to_owned()),
+        }));
+    }
+    if reverse_link_input {
+        links.reverse();
+    }
+    let provider =
+        FixtureDiscoveryPreviewProvider::observed([page(seed_a.original_url.as_str(), links)], 1);
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+    if include_product_tie {
+        assert_eq!(
+            result
+                .summary
+                .transition_counts
+                .iter()
+                .find(|count| count.transition_id == to_product)
+                .map(|count| count.eligible_edges),
+            Some(8)
+        );
+    }
+    assert_eq!(
+        result
+            .summary
+            .transition_counts
+            .iter()
+            .find(|count| count.transition_id == to_listing)
+            .map(|count| count.eligible_edges),
+        Some(8)
+    );
+    Ok((result, to_listing))
+}
+
+#[tokio::test]
+async fn cyclic_dominance_requires_a_unique_observed_transition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (unique, cycle_id) = dominance_case(false, false).await?;
+    assert_eq!(
+        unique.growth_indicators.dominant_transition_id,
+        Some(cycle_id)
+    );
+    assert!(has_growth_warning(
+        &unique,
+        erabi_domain::PreviewGrowthWarningCode::CyclicTransitionDominance
+    ));
+
+    let (tied, _) = dominance_case(true, false).await?;
+    assert_eq!(tied.growth_indicators.dominant_transition_id, None);
+    assert_eq!(
+        tied.growth_indicators.dominant_transition_share_percent,
+        None
+    );
+    assert!(!has_growth_warning(
+        &tied,
+        erabi_domain::PreviewGrowthWarningCode::CyclicTransitionDominance
+    ));
+
+    let (regenerated_and_reversed, _) = dominance_case(true, true).await?;
+    assert_eq!(
+        regenerated_and_reversed
+            .growth_indicators
+            .dominant_transition_id,
+        None
+    );
+    assert_eq!(
+        regenerated_and_reversed
+            .growth_indicators
+            .dominant_transition_share_percent,
+        None
+    );
+    assert_eq!(
+        regenerated_and_reversed.growth_warnings,
+        tied.growth_warnings
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_frontier_with_download_budget_hit_reports_budget_pressure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version, seed_a, _seed_b, _listing, _product, _to_product, _to_listing) =
+        graph_fixture(&database).await?;
+    let repository = CrawlerRepository::new(&database);
+    let mut guardrails = repository
+        .crawler_version_guardrails(crawler.id(), version.id())
+        .await?;
+    guardrails.max_downloaded_bytes = 1;
+    repository
+        .update_crawler_version_guardrails(
+            crawler.id(),
+            version.id(),
+            &guardrails,
+            "operator",
+            "unix:21",
+        )
+        .await?;
+    let provider = FixtureDiscoveryPreviewProvider::observed(
+        [page(
+            seed_a.original_url.as_str(),
+            vec![ObservedLink {
+                raw_href: "/product/queued".to_owned(),
+                selector: Some("a.product".to_owned()),
+            }],
+        )],
+        1,
+    );
+    let service = DiscoveryPreviewService::new(database, Some(Arc::new(provider)));
+    let result = service
+        .execute(crawler.id(), version.id(), preview_request(vec![seed_a.id]))
+        .await?;
+    assert_eq!(result.summary.frontier_remaining, 1);
+    assert!(
+        result
+            .summary
+            .budget_hit_counts
+            .contains_key(&erabi_domain::PreviewBudgetKind::MaxDownloadedBytes)
+    );
+    assert!(has_growth_warning(
+        &result,
+        erabi_domain::PreviewGrowthWarningCode::BudgetPressure
+    ));
     Ok(())
 }

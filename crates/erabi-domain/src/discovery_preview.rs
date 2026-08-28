@@ -17,6 +17,7 @@ pub const MAX_PREVIEW_URL_CHARS: usize = 4_096;
 pub const DOMINANT_TRANSITION_MIN_EDGES: u64 = 8;
 pub const DOMINANT_TRANSITION_SHARE_PERCENT: u64 = 70;
 pub const QUERY_EXPLOSION_MIN_VARIANTS: u64 = 8;
+pub const QUERY_EXPLOSION_QUERY_BEARING_PERCENT: u64 = 75;
 pub const HIGH_UNMATCHED_MIN_DENOMINATOR: u64 = 8;
 pub const HIGH_UNMATCHED_SHARE_PERCENT: u64 = 50;
 pub const WIDESPREAD_AMBIGUITY_MIN_DENOMINATOR: u64 = 4;
@@ -319,6 +320,13 @@ pub struct PreviewGrowthIndicators {
 pub struct PreviewQueryVariantGroup {
     pub host: String,
     pub path: String,
+    /// Every unique in-scope canonical identity sharing this normalized
+    /// host/path, including identities without a query component.
+    pub total_identities: u64,
+    /// Unique identities in this group whose canonical URL has a query.
+    pub query_bearing_identities: u64,
+    /// Distinct canonical query strings observed among the query-bearing
+    /// identities. This is intentionally separate from the denominator.
     pub canonical_query_variants: u64,
 }
 

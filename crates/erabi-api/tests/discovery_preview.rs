@@ -162,6 +162,7 @@ async fn discovery_preview_route_returns_ephemeral_preview_and_typed_openapi()
         "DiscoveryPreviewPage",
         "DiscoveryPath",
         "PreviewGrowthIndicators",
+        "PreviewQueryVariantGroup",
         "PreviewGrowthWarning",
     ] {
         assert!(
@@ -169,6 +170,16 @@ async fn discovery_preview_route_returns_ephemeral_preview_and_typed_openapi()
             "missing {schema}"
         );
     }
+    assert_eq!(
+        openapi["components"]["schemas"]["PreviewGrowthIndicators"]["properties"]["query_variant_groups"]
+            ["items"]["$ref"],
+        "#/components/schemas/PreviewQueryVariantGroup"
+    );
+    assert!(
+        openapi["components"]["schemas"]["PreviewQueryVariantGroup"]["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&serde_json::json!("total_identities")))
+    );
     Ok(())
 }
 
