@@ -4,6 +4,8 @@ use std::{
     sync::Arc,
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     CrawlerVersion, CrawlerVersionId, DiscoveryTransition, ErrorCode, PageType,
     SelectorCoverageStatus, TestEvidence, TestKind, UrlMatcher, UrlMatcherDefinition,
@@ -618,14 +620,7 @@ impl VersionValidationContributor for CoreVersionValidationContributor {
         }
 
         for witness in design_time_ambiguity_witnesses(context) {
-            issues.push(
-                core_issue(
-                    "UNRESOLVED_PAGE_TYPE_AMBIGUITY",
-                    "The canonical PageType resolver has an unresolved ambiguity for a known URL.",
-                    Some(subject("CRAWLER_VERSION", Some(version.id().to_string()))),
-                )
-                .with_detail("witness_url", witness),
-            );
+            issues.push(core_ambiguity_issue(version.id(), &witness));
         }
 
         for page_type in context.page_types() {
@@ -754,6 +749,40 @@ fn core_guardrail_issue(code: ErrorCode) -> VersionValidationIssue {
     core_issue(code, message, None)
 }
 
+fn core_ambiguity_issue(
+    version_id: CrawlerVersionId,
+    canonical_witness: &str,
+) -> VersionValidationIssue {
+    let issue = core_issue(
+        "UNRESOLVED_PAGE_TYPE_AMBIGUITY",
+        "The canonical PageType resolver has an unresolved ambiguity for a known URL.",
+        Some(subject("CRAWLER_VERSION", Some(version_id.to_string()))),
+    );
+    if canonical_witness.chars().count() <= MAX_VALIDATION_DETAIL_CHARS {
+        return issue.with_detail("witness_url", canonical_witness);
+    }
+
+    let prefix = canonical_witness
+        .chars()
+        .take(MAX_VALIDATION_DETAIL_CHARS - 64)
+        .collect::<String>();
+    let hash = sha256_hex(canonical_witness);
+    issue
+        .with_detail("witness_url_prefix", prefix)
+        .with_detail("witness_url_sha256", hash)
+}
+
+fn sha256_hex(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(value.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 fn design_time_ambiguity_witnesses(context: &VersionValidationContext) -> BTreeSet<String> {
     let mut witnesses = BTreeSet::new();
     let page_types = context.page_types();
@@ -787,12 +816,16 @@ fn design_time_ambiguity_witnesses(context: &VersionValidationContext) -> BTreeS
                         continue;
                     }
                     if let Some(witness) = matcher_witness(left_matcher)
+                        && let Ok(canonical) = context
+                            .version()
+                            .canonicalization_policy()
+                            .canonicalize(witness.as_str())
                         && matches!(
-                            resolve_page_type(&witness, page_types),
+                            resolve_page_type(&canonical.canonical_url, page_types),
                             crate::PageTypeMatchDecision::Ambiguous { .. }
                         )
                     {
-                        witnesses.insert(witness.to_string());
+                        witnesses.insert(canonical.canonical_url.to_string());
                     }
                 }
             }

@@ -1841,14 +1841,18 @@ async fn publication_validation_context(
     let page_types = load_page_type_records(connection, &version).await?;
     let transitions = load_transition_records(connection, &version, false).await?;
     let config_hash = semantic_hash_with_semantic_validation(connection, &version, false).await?;
-    let evidence = super::test_evidence::load_for_version_in_transaction(connection, version_id)
-        .await
-        .map_err(|error| match error {
-            super::test_evidence::TestEvidenceRepositoryError::Database(error) => {
-                CrawlerRepositoryError::Database(error)
-            }
-            _ => CrawlerRepositoryError::CorruptState,
-        })?;
+    let evidence = super::test_evidence::load_for_version_in_transaction(
+        connection,
+        version_id,
+        config_hash.as_str(),
+    )
+    .await
+    .map_err(|error| match error {
+        super::test_evidence::TestEvidenceRepositoryError::Database(error) => {
+            CrawlerRepositoryError::Database(error)
+        }
+        _ => CrawlerRepositoryError::CorruptState,
+    })?;
     Ok(VersionValidationContext::new(
         version,
         page_types

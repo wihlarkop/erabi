@@ -179,11 +179,15 @@ struct StoredEvidence {
 }
 
 /// Loads all evidence for a publication snapshot without opening a second
-/// connection. Every row is validated, including its durable references, so
-/// publication never counts malformed or foreign evidence as confidence.
+/// connection. Historical row/payload and domain integrity is always
+/// validated. Current semantic references are revalidated only for evidence
+/// whose hash exactly matches the publication candidate; stale evidence is
+/// durable history and may name a `PageType` or `DiscoveryTransition` since
+/// deleted from the Draft.
 pub(crate) async fn load_for_version_in_transaction(
     connection: &Connection,
     version_id: CrawlerVersionId,
+    candidate_config_hash: &str,
 ) -> Result<Vec<TestEvidence>, TestEvidenceRepositoryError> {
     let mut rows = connection
         .query(
@@ -206,7 +210,10 @@ pub(crate) async fn load_for_version_in_transaction(
             .evidence
             .validate()
             .map_err(|_| TestEvidenceRepositoryError::CorruptState)?;
-        validate_references(connection, &stored.evidence).await?;
+        validate_artifact_references(connection, &stored.evidence).await?;
+        if stored.evidence.config_hash == candidate_config_hash {
+            validate_semantic_references(connection, &stored.evidence).await?;
+        }
         evidence.push(stored.evidence);
     }
     Ok(evidence)
@@ -295,6 +302,14 @@ async fn validate_references(
     connection: &Connection,
     evidence: &TestEvidence,
 ) -> Result<(), TestEvidenceRepositoryError> {
+    validate_semantic_references(connection, evidence).await?;
+    validate_artifact_references(connection, evidence).await
+}
+
+async fn validate_semantic_references(
+    connection: &Connection,
+    evidence: &TestEvidence,
+) -> Result<(), TestEvidenceRepositoryError> {
     let page_type_ids = evidence_page_type_ids(evidence);
     for page_type_id in page_type_ids {
         ensure_page_type(connection, evidence.crawler_version_id, page_type_id).await?;
@@ -302,6 +317,13 @@ async fn validate_references(
     if let Some(transition_id) = evidence.tested_transition_id {
         ensure_transition(connection, evidence.crawler_version_id, transition_id).await?;
     }
+    Ok(())
+}
+
+async fn validate_artifact_references(
+    connection: &Connection,
+    evidence: &TestEvidence,
+) -> Result<(), TestEvidenceRepositoryError> {
     for artifact_id in &evidence.artifact_ids {
         let mut rows = connection
             .query(

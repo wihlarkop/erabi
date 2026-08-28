@@ -7,11 +7,11 @@ use std::sync::{
 
 use erabi_domain::{
     CrawlerId, CrawlerVersion, DiscoveryTransition, DiscoveryTransitionEvidence,
-    DiscoveryTransitionId, PageType, Seed, SelectorCoverageEvidence, SelectorCoverageStatus,
-    TestEvidence, TestKind, TransitionBudget, UrlMatcher, ValidationIssueCode,
-    VersionValidationContext, VersionValidationContribution, VersionValidationContributor,
-    VersionValidationContributorError, VersionValidationError, VersionValidationRegistry,
-    VersionValidationSeverity, VersionValidationSubject,
+    DiscoveryTransitionId, MAX_VALIDATION_DETAIL_CHARS, PageType, Seed, SelectorCoverageEvidence,
+    SelectorCoverageStatus, TestEvidence, TestKind, TransitionBudget, UrlMatcher,
+    ValidationIssueCode, VersionValidationContext, VersionValidationContribution,
+    VersionValidationContributor, VersionValidationContributorError, VersionValidationError,
+    VersionValidationRegistry, VersionValidationSeverity, VersionValidationSubject,
 };
 
 fn url(value: &str) -> url::Url {
@@ -86,6 +86,155 @@ fn equal_priority_identical_exact_matchers_are_proven_ambiguous() {
     assert!(report.blockers.iter().any(|issue| {
         issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY"
             && issue.details.get("witness_url") == Some(&"https://example.test/".to_owned())
+    }));
+}
+
+#[test]
+fn matcher_witness_tracking_parameter_is_canonicalized_before_resolution() {
+    let mut version = version_with_seed();
+    let matcher = UrlMatcher::exact_url(url("https://example.test/item?utm_source=x"));
+    let left = PageType::new("left", 10, vec![matcher.clone()]);
+    let right = PageType::new("right", 10, vec![matcher]);
+    version.set_page_type_ids(vec![left.id, right.id]).unwrap();
+
+    let report = VersionValidationRegistry::new()
+        .validate(&context(version, vec![left, right], Vec::new(), Vec::new()))
+        .unwrap();
+
+    assert!(
+        !report
+            .blockers
+            .iter()
+            .any(|issue| issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY")
+    );
+}
+
+#[test]
+fn matcher_witness_fragment_is_canonicalized_before_resolution() {
+    let mut version = version_with_seed();
+    let matcher = UrlMatcher::exact_url(url("https://example.test/item#details"));
+    let left = PageType::new("left", 10, vec![matcher.clone()]);
+    let right = PageType::new("right", 10, vec![matcher]);
+    version.set_page_type_ids(vec![left.id, right.id]).unwrap();
+
+    let report = VersionValidationRegistry::new()
+        .validate(&context(version, vec![left, right], Vec::new(), Vec::new()))
+        .unwrap();
+
+    assert!(
+        !report
+            .blockers
+            .iter()
+            .any(|issue| issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY")
+    );
+}
+
+#[test]
+fn matcher_witness_that_remains_ambiguous_after_canonicalization_blocks() {
+    let mut version = version_with_seed();
+    let matcher = UrlMatcher::try_path_prefix(Some("example.test".into()), "/item").unwrap();
+    let left = PageType::new("left", 10, vec![matcher.clone()]);
+    let right = PageType::new("right", 10, vec![matcher]);
+    version.set_page_type_ids(vec![left.id, right.id]).unwrap();
+
+    let report = VersionValidationRegistry::new()
+        .validate(&context(version, vec![left, right], Vec::new(), Vec::new()))
+        .unwrap();
+
+    assert!(report.blockers.iter().any(|issue| {
+        issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY"
+            && issue.details.get("witness_url") == Some(&"https://example.test/item".to_owned())
+    }));
+}
+
+#[test]
+fn enabled_seed_ambiguity_still_uses_its_canonical_identity() {
+    let mut version = CrawlerVersion::draft(CrawlerId::new());
+    version
+        .add_seed(Seed::new(
+            url("https://example.test/item?utm_source=x"),
+            url("https://example.test/item"),
+        ))
+        .unwrap();
+    let matcher = UrlMatcher::regex(r"^https://example\.test/item$").unwrap();
+    let left = PageType::new("left", 10, vec![matcher.clone()]);
+    let right = PageType::new("right", 10, vec![matcher]);
+    version.set_page_type_ids(vec![left.id, right.id]).unwrap();
+
+    let report = VersionValidationRegistry::new()
+        .validate(&context(version, vec![left, right], Vec::new(), Vec::new()))
+        .unwrap();
+
+    assert!(report.blockers.iter().any(|issue| {
+        issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY"
+            && issue.details.get("witness_url") == Some(&"https://example.test/item".to_owned())
+    }));
+}
+
+#[test]
+fn canonical_matcher_ambiguity_is_order_and_id_independent() {
+    fn ambiguity_details(reverse: bool) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut version = version_with_seed();
+        let matcher = UrlMatcher::try_path_prefix(Some("example.test".into()), "/item").unwrap();
+        let left = PageType::new("left", 10, vec![matcher.clone()]);
+        let right = PageType::new("right", 10, vec![matcher]);
+        let mut page_types = vec![left, right];
+        if reverse {
+            page_types.reverse();
+        }
+        version
+            .set_page_type_ids(page_types.iter().map(|page_type| page_type.id).collect())
+            .unwrap();
+        VersionValidationRegistry::new()
+            .validate(&context(version, page_types, Vec::new(), Vec::new()))
+            .unwrap()
+            .blockers
+            .into_iter()
+            .filter(|issue| issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY")
+            .map(|issue| issue.details)
+            .collect()
+    }
+
+    assert_eq!(ambiguity_details(false), ambiguity_details(true));
+}
+
+#[test]
+fn long_canonical_ambiguity_witness_remains_a_bounded_core_blocker() {
+    let mut version = version_with_seed();
+    let witness = format!(
+        "https://example.test/item?query={}",
+        "x".repeat(MAX_VALIDATION_DETAIL_CHARS + 1)
+    );
+    let matcher = UrlMatcher::exact_url(url(&witness));
+    let left = PageType::new("left", 10, vec![matcher.clone()]);
+    let right = PageType::new("right", 10, vec![matcher]);
+    version.set_page_type_ids(vec![left.id, right.id]).unwrap();
+
+    let report = VersionValidationRegistry::new()
+        .validate(&context(version, vec![left, right], Vec::new(), Vec::new()))
+        .unwrap();
+    assert!(!report.is_publishable());
+    let issue = report
+        .blockers
+        .iter()
+        .find(|issue| issue.code.as_str() == "UNRESOLVED_PAGE_TYPE_AMBIGUITY")
+        .unwrap();
+    assert!(!issue.details.contains_key("witness_url"));
+    assert!(
+        witness.starts_with(
+            issue
+                .details
+                .get("witness_url_prefix")
+                .unwrap_or(&String::new())
+        )
+    );
+    assert_eq!(
+        issue.details.get("witness_url_sha256").map(String::len),
+        Some(64)
+    );
+    assert!(issue.details.iter().all(|(key, value)| {
+        key.chars().count() <= MAX_VALIDATION_DETAIL_CHARS
+            && value.chars().count() <= MAX_VALIDATION_DETAIL_CHARS
     }));
 }
 
