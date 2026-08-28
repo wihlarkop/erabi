@@ -24,6 +24,27 @@ impl Crawler {
             active_draft_version_id: None,
         }
     }
+
+    /// Rehydrates a Crawler after the repository has validated its durable
+    /// identity, settings, and pointer state.
+    #[must_use]
+    pub fn from_persisted(
+        id: CrawlerId,
+        name: String,
+        collection_id: Option<CollectionId>,
+        operational_defaults: OperationalOverrides,
+        active_published_version_id: Option<CrawlerVersionId>,
+        active_draft_version_id: Option<CrawlerVersionId>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            collection_id,
+            operational_defaults,
+            active_published_version_id,
+            active_draft_version_id,
+        }
+    }
     #[must_use]
     pub const fn id(&self) -> CrawlerId {
         self.id

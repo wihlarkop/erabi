@@ -31,6 +31,43 @@ pub struct SpecificityKey {
     pub literal_characters: u32,
     pub inverse_wildcards: Reverse<u32>,
 }
+
+impl SpecificityKey {
+    /// Returns the user-facing wildcard/capture count represented by the
+    /// inverse value used for lexicographic resolution.
+    #[must_use]
+    pub const fn wildcard_capture_count(self) -> u32 {
+        self.inverse_wildcards.0
+    }
+}
+
+/// A typed, non-serde view of a validated URL matcher definition.
+///
+/// The private serde representation remains an implementation detail of the
+/// durable domain contract. API layers can use this view to expose their own
+/// stable transport representation without leaking that serde layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UrlMatcherDefinition {
+    ExactUrl {
+        url: url::Url,
+    },
+    ExactHostPathTemplate {
+        host: String,
+        path_template: String,
+        query: BTreeMap<String, String>,
+    },
+    PathPrefix {
+        host: Option<String>,
+        prefix: String,
+    },
+    PathGlob {
+        host: Option<String>,
+        pattern: String,
+    },
+    Regex {
+        pattern: String,
+    },
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Definition {
     ExactUrl {
@@ -76,17 +113,9 @@ impl<'de> serde::Deserialize<'de> for UrlMatcher {
 }
 impl UrlMatcher {
     fn validated(definition: Definition) -> Result<Self, ProductError> {
-        match &definition {
-            Definition::PathGlob { pattern, .. } if pattern.is_empty() => {
-                Err(ProductError::conflict("URL glob cannot be empty"))
-            }
-            Definition::Regex { pattern } => {
-                regex::Regex::new(pattern)
-                    .map_err(|_| ProductError::conflict("invalid URL matcher regex"))?;
-                Ok(Self { definition })
-            }
-            _ => Ok(Self { definition }),
-        }
+        let matcher = Self { definition };
+        matcher.validate_definition()?;
+        Ok(matcher)
     }
     #[must_use]
     pub fn exact_url(url: url::Url) -> Self {
@@ -117,6 +146,20 @@ impl UrlMatcher {
             },
         }
     }
+    /// Creates a validated path-prefix matcher.
+    ///
+    /// # Errors
+    /// Returns a conflict when the optional host or prefix violates the
+    /// matcher-definition contract.
+    pub fn try_path_prefix(
+        host: Option<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, ProductError> {
+        Self::validated(Definition::PathPrefix {
+            host,
+            prefix: prefix.into(),
+        })
+    }
     /// Creates a validated, non-empty path glob matcher.
     ///
     /// # Errors
@@ -139,6 +182,49 @@ impl UrlMatcher {
             pattern: pattern.into(),
         })
     }
+    /// Validates the structural matcher-definition contract.
+    ///
+    /// This is the authoritative Task 2 validity boundary. It is used by
+    /// validated construction, serde deserialization, and repository writes
+    /// so a definition cannot be accepted by one layer and rejected by
+    /// another.
+    ///
+    /// # Errors
+    /// Returns a conflict when the matcher definition is malformed.
+    pub fn validate_definition(&self) -> Result<(), ProductError> {
+        match &self.definition {
+            Definition::ExactUrl { .. } => Ok(()),
+            Definition::ExactHostPathTemplate {
+                host,
+                path_template,
+                query,
+            } if valid_host(host) && valid_path_template(path_template) && valid_query(query) => {
+                Ok(())
+            }
+            Definition::ExactHostPathTemplate { .. } => Err(ProductError::conflict(
+                "invalid exact host/path template matcher",
+            )),
+            Definition::PathPrefix { host, prefix }
+                if valid_optional_host(host.as_deref()) && valid_path_prefix(prefix) =>
+            {
+                Ok(())
+            }
+            Definition::PathPrefix { .. } => {
+                Err(ProductError::conflict("invalid URL path prefix matcher"))
+            }
+            Definition::PathGlob { host, pattern }
+                if valid_optional_host(host.as_deref()) && valid_path_glob(pattern) =>
+            {
+                Ok(())
+            }
+            Definition::PathGlob { .. } => {
+                Err(ProductError::conflict("invalid URL path glob matcher"))
+            }
+            Definition::Regex { pattern } => regex::Regex::new(pattern)
+                .map(|_| ())
+                .map_err(|_| ProductError::conflict("invalid URL matcher regex")),
+        }
+    }
     #[must_use]
     pub const fn kind(&self) -> UrlMatcherKind {
         match self.definition {
@@ -149,6 +235,53 @@ impl UrlMatcher {
             }
             Definition::Regex { .. } => UrlMatcherKind::Regex,
         }
+    }
+    /// Returns a typed view of the matcher without exposing its serde shape.
+    #[must_use]
+    pub fn definition(&self) -> UrlMatcherDefinition {
+        match &self.definition {
+            Definition::ExactUrl { url } => UrlMatcherDefinition::ExactUrl { url: url.clone() },
+            Definition::ExactHostPathTemplate {
+                host,
+                path_template,
+                query,
+            } => UrlMatcherDefinition::ExactHostPathTemplate {
+                host: host.clone(),
+                path_template: path_template.clone(),
+                query: query.clone(),
+            },
+            Definition::PathPrefix { host, prefix } => UrlMatcherDefinition::PathPrefix {
+                host: host.clone(),
+                prefix: prefix.clone(),
+            },
+            Definition::PathGlob { host, pattern } => UrlMatcherDefinition::PathGlob {
+                host: host.clone(),
+                pattern: pattern.clone(),
+            },
+            Definition::Regex { pattern } => UrlMatcherDefinition::Regex {
+                pattern: pattern.clone(),
+            },
+        }
+    }
+    /// Creates a validated exact-host path-template matcher.
+    ///
+    /// This is the preferred constructor for new authoring code. The legacy
+    /// infallible constructor remains available for compatibility; repository
+    /// persistence and serde still validate every definition.
+    ///
+    /// # Errors
+    /// Returns a conflict when the host, path template, or query keys are
+    /// structurally invalid.
+    pub fn try_exact_host_path_template(
+        host: impl Into<String>,
+        path_template: impl Into<String>,
+        query: BTreeMap<String, String>,
+    ) -> Result<Self, ProductError> {
+        Self::validated(Definition::ExactHostPathTemplate {
+            host: host.into(),
+            path_template: path_template.into(),
+            query,
+        })
     }
     #[must_use]
     pub fn pattern(&self) -> String {
@@ -248,4 +381,52 @@ fn template_matches(template: &str, actual: &str) -> bool {
 fn glob_matches(pattern: &str, actual: &str) -> bool {
     let escaped = regex::escape(pattern).replace(r"\*", ".*");
     regex::Regex::new(&format!("^{escaped}$")).is_ok_and(|expression| expression.is_match(actual))
+}
+
+fn valid_host(host: &str) -> bool {
+    if host.trim().is_empty() || host.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(&format!("https://{host}/")) else {
+        return false;
+    };
+    parsed.port().is_none()
+        && parsed
+            .host_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(host))
+}
+
+fn valid_optional_host(host: Option<&str>) -> bool {
+    host.is_none_or(valid_host)
+}
+
+fn valid_path_template(path: &str) -> bool {
+    !path.is_empty()
+        && path.starts_with('/')
+        && path.split('/').skip(1).all(|segment| {
+            if segment.starts_with('{') || segment.ends_with('}') {
+                segment.len() > 2
+                    && segment.starts_with('{')
+                    && segment.ends_with('}')
+                    && !segment[1..segment.len() - 1]
+                        .chars()
+                        .any(|character| matches!(character, '{' | '}' | '/' | '*'))
+            } else {
+                !segment.contains(['{', '}', '*'])
+            }
+        })
+}
+
+fn valid_path_prefix(path: &str) -> bool {
+    !path.is_empty() && path.starts_with('/') && !path.contains(['*', '{', '}'])
+}
+
+fn valid_path_glob(path: &str) -> bool {
+    !path.is_empty() && path.starts_with('/')
+}
+
+fn valid_query(query: &BTreeMap<String, String>) -> bool {
+    query
+        .keys()
+        .all(|key| !key.is_empty() && !key.chars().any(char::is_whitespace))
 }

@@ -4,7 +4,7 @@ use erabi_db::{
 };
 use erabi_domain::{
     CrawlRunId, CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunStatus, CrawlRunType, Crawler,
-    CrawlerId, CrawlerVersion, ResolvedValue, RobotsAudit, RunConfiguration, SettingSource,
+    CrawlerId, CrawlerVersion, ResolvedValue, RobotsAudit, RunConfiguration, Seed, SettingSource,
     SnapshotOperationalSettings,
 };
 
@@ -57,6 +57,10 @@ async fn persisted_crawler_lifecycle_keeps_an_unrelated_draft_active()
     repository.create(&crawler).await?;
 
     let mut draft_a = CrawlerVersion::draft(crawler.id());
+    draft_a.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
     repository
         .save_draft(&draft_a, "operator", "2026-08-23T00:00:00Z")
         .await?;
@@ -109,6 +113,10 @@ async fn crawl_run_created_audit_preserves_exact_robots_override_context()
     let crawler = Crawler::new("Catalog");
     crawler_repository.create(&crawler).await?;
     let mut version = CrawlerVersion::draft(crawler.id());
+    version.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
     crawler_repository
         .save_draft(&version, "operator", "2026-08-23T00:00:00Z")
         .await?;

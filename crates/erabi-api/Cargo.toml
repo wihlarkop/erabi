@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 axum = "0.8.9"
+erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }
@@ -25,4 +26,6 @@ url = "2.5.8"
 uuid = { version = "1.25.0", features = ["v7"] }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+turso = "0.7.2"

@@ -8,6 +8,7 @@ mod identity;
 mod job;
 mod progress;
 mod run;
+mod test_evidence;
 
 pub use artifact::ArtifactRepository;
 pub use checkpoint::{
@@ -18,7 +19,11 @@ pub use checkpoint::{
     MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
 };
 pub use configuration::ConfigurationRepository;
-pub use crawler::{CrawlerPointers, CrawlerRepository};
+pub use crawler::{
+    CrawlerAuditMetadata, CrawlerEvaluationSnapshot, CrawlerPointers, CrawlerRepository,
+    CrawlerRepositoryError, CrawlerSemanticSnapshot, CrawlerVersionRecord,
+    DiscoveryTransitionRecord, PageTypeRecord, UrlMatcherRecord,
+};
 pub use identity::JobIdParseError;
 pub use job::{
     AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,
@@ -32,3 +37,4 @@ pub use progress::{
     ProgressSequence, ProgressTerminalState,
 };
 pub use run::{CrawlRunRepository, CrawlRunRepositoryError};
+pub use test_evidence::{TestEvidenceRecord, TestEvidenceRepository, TestEvidenceRepositoryError};

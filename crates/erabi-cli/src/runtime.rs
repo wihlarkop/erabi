@@ -179,6 +179,7 @@ impl RunningRuntime {
         let app_state = AppState::with_readiness(false)
             .with_progress_runtime(database.clone(), progress_live_hub.clone())
             .with_job_actions_runtime(database.clone(), cancellation.clone())
+            .with_crawler_authoring_runtime(database.clone())
             .with_storage_pressure_controller(storage_pressure.controller().clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
