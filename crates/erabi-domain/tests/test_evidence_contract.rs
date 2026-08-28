@@ -126,6 +126,14 @@ fn invalid_evidence_diagnostics_and_unsorted_artifacts_are_rejected()
 }
 
 #[test]
+fn unrelated_evidence_cannot_claim_a_tested_transition() {
+    let mut evidence = evidence();
+    evidence.test_kind = TestKind::UrlCanonicalization;
+    evidence.tested_transition_id = Some(erabi_domain::DiscoveryTransitionId::new());
+    assert!(evidence.validate().is_err());
+}
+
+#[test]
 fn page_type_comparison_ignores_regenerated_ids_and_ambiguity_order() {
     let published_first = candidate(erabi_domain::PageTypeId::new(), "Duplicate");
     let published_second = candidate(erabi_domain::PageTypeId::new(), "Duplicate");

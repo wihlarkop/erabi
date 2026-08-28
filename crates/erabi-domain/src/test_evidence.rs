@@ -626,17 +626,38 @@ impl TestEvidence {
         {
             return Err("TestEvidence artifact references are not deterministic".into());
         }
+        let page_type_is_required = matches!(
+            self.test_kind,
+            TestKind::Extraction | TestKind::SelectorCoverage
+        );
+        let page_type_is_allowed = matches!(
+            self.test_kind,
+            TestKind::PageTypeMatching
+                | TestKind::Extraction
+                | TestKind::SelectorCoverage
+                | TestKind::CombinedUrlEvaluation
+        );
+        if (page_type_is_required && self.evaluated_page_type_id.is_none())
+            || (!page_type_is_allowed && self.evaluated_page_type_id.is_some())
+        {
+            return Err(
+                "TestEvidence PageType reference is inconsistent with its test kind".into(),
+            );
+        }
+        let transition_is_required = self.test_kind == TestKind::DiscoveryTransition;
+        if transition_is_required != self.tested_transition_id.is_some() {
+            return Err(
+                "TestEvidence transition reference is inconsistent with its test kind".into(),
+            );
+        }
         match self.test_kind {
-            TestKind::Extraction
-                if self.evaluated_page_type_id.is_none() || self.extraction.is_none() =>
-            {
+            TestKind::Extraction if self.extraction.is_none() => {
                 return Err("extraction evidence is incomplete".into());
             }
             TestKind::DiscoveryTransition
-                if self.tested_transition_id.is_none()
-                    || self.discovery.as_ref().is_none_or(|discovery| {
-                        discovery.transition_id != self.tested_transition_id
-                    }) =>
+                if self.discovery.as_ref().is_none_or(|discovery| {
+                    discovery.transition_id != self.tested_transition_id
+                }) =>
             {
                 return Err("transition evidence is incomplete".into());
             }
@@ -651,14 +672,6 @@ impl TestEvidence {
                 return Err("discovered URL preview evidence is incomplete".into());
             }
             _ => {}
-        }
-        if self.tested_transition_id.is_some()
-            && self
-                .discovery
-                .as_ref()
-                .is_some_and(|discovery| discovery.transition_id != self.tested_transition_id)
-        {
-            return Err("TestEvidence transition identity is inconsistent".into());
         }
         if self.canonicalization.len() > MAX_TEST_EVIDENCE_INPUT_URLS
             || self.page_type_match.len() > MAX_TEST_EVIDENCE_INPUT_URLS

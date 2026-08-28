@@ -475,6 +475,11 @@ fn test_lab_error(error: TestLabError, trace: &TraceId) -> Response {
             "TEST_LAB_PROVIDER_OBSERVATION_MISMATCH",
             "The Test Lab provider returned an observation for a different requested URL.",
         ),
+        TestLabError::ProviderObservationInvalid => (
+            StatusCode::BAD_GATEWAY,
+            "TEST_LAB_PROVIDER_OBSERVATION_INVALID",
+            "The Test Lab provider returned an invalid observed final URL.",
+        ),
         TestLabError::ArtifactNotFound => (
             StatusCode::NOT_FOUND,
             "ARTIFACT_NOT_FOUND",

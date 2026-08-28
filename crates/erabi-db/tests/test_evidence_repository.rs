@@ -4,7 +4,8 @@ use erabi_db::{
 };
 use erabi_domain::{
     ArtifactId, CanonicalizationEvidence, CanonicalizationOutcome, Crawler, CrawlerVersionId,
-    TestEvidence, TestEvidenceId, TestKind,
+    DiscoveryTransition, DiscoveryTransitionEvidence, SelectorCoverageEvidence,
+    SelectorCoverageStatus, TestEvidence, TestEvidenceId, TestKind, TransitionBudget,
 };
 
 async fn setup() -> Result<
@@ -65,6 +66,88 @@ fn evidence(version_id: CrawlerVersionId, config_hash: String, executed_at: &str
         executed_at: executed_at.to_owned(),
         published_comparison: None,
     }
+}
+
+async fn transition(
+    database: &ErabiDatabase,
+    crawler: Crawler,
+    version: erabi_domain::CrawlerVersion,
+) -> Result<DiscoveryTransition, Box<dyn std::error::Error>> {
+    let repository = CrawlerRepository::new(database);
+    let source = repository
+        .create_page_type(
+            crawler.id(),
+            version.id(),
+            "Listing",
+            1,
+            "operator",
+            "unix:2",
+        )
+        .await?;
+    let target = repository
+        .create_page_type(
+            crawler.id(),
+            version.id(),
+            "Product",
+            1,
+            "operator",
+            "unix:3",
+        )
+        .await?;
+    let transition = DiscoveryTransition {
+        id: erabi_domain::DiscoveryTransitionId::new(),
+        source_page_type_id: source.id,
+        target_page_type_id: target.id,
+        name: "Product links".to_owned(),
+        enabled: true,
+        link_selector: "a.product".to_owned(),
+        url_constraints: None,
+        priority: 1,
+        budget: TransitionBudget {
+            max_links_per_source_page: 1,
+            total_budget: None,
+            depth_contribution: 1,
+        },
+        deduplicate: true,
+        latest_test_evidence_id: None,
+    };
+    repository
+        .create_discovery_transition(
+            crawler.id(),
+            version.id(),
+            &transition,
+            "operator",
+            "unix:4",
+        )
+        .await?;
+    Ok(transition)
+}
+
+fn discovery_transition_evidence(
+    version_id: CrawlerVersionId,
+    config_hash: String,
+    transition: &DiscoveryTransition,
+) -> TestEvidence {
+    let mut evidence = evidence(version_id, config_hash, "unix:5");
+    evidence.test_kind = TestKind::DiscoveryTransition;
+    evidence.tested_transition_id = Some(transition.id);
+    evidence.discovery = Some(DiscoveryTransitionEvidence {
+        transition_id: Some(transition.id),
+        transition_name: Some(transition.name.clone()),
+        source_page_type_id: Some(transition.source_page_type_id),
+        target_page_type_id: Some(transition.target_page_type_id),
+        source_match: None,
+        selector: SelectorCoverageEvidence {
+            selector: transition.link_selector.clone(),
+            matches_found: 0,
+            status: SelectorCoverageStatus::NoMatches,
+        },
+        discovered_urls: Vec::new(),
+        eligible_link_count: 0,
+        per_page_limit: transition.budget.max_links_per_source_page,
+        per_page_limit_reached: false,
+    });
+    evidence
 }
 
 #[tokio::test]
@@ -184,6 +267,7 @@ async fn hash_mismatch_and_bad_references_leave_no_partial_evidence_row()
             .is_empty()
     );
     let mut bad_page = evidence(version.id(), hash.clone(), "unix:2");
+    bad_page.test_kind = TestKind::PageTypeMatching;
     bad_page.evaluated_page_type_id = Some(erabi_domain::PageTypeId::new());
     assert!(matches!(
         repository
@@ -212,6 +296,57 @@ async fn hash_mismatch_and_bad_references_leave_no_partial_evidence_row()
             .list(crawler.id(), version.id())
             .await?
             .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transition_attachment_requires_valid_discovery_transition_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, database, crawler, version) = setup().await?;
+    let transition = transition(&database, crawler.clone(), version.clone()).await?;
+    let crawler_repository = CrawlerRepository::new(&database);
+    let hash = crawler_repository
+        .configuration_hash(crawler.id(), version.id())
+        .await?;
+    let repository = TestEvidenceRepository::new(&database);
+
+    let mut unrelated = evidence(version.id(), hash.clone(), "unix:5");
+    unrelated.tested_transition_id = Some(transition.id);
+    assert!(unrelated.validate().is_err());
+    assert!(matches!(
+        repository
+            .persist_if_configuration_matches(crawler.id(), &unrelated)
+            .await,
+        Err(TestEvidenceRepositoryError::CorruptState)
+    ));
+    assert!(
+        repository
+            .list(crawler.id(), version.id())
+            .await?
+            .is_empty()
+    );
+    assert!(
+        crawler_repository
+            .discovery_transition(crawler.id(), version.id(), transition.id)
+            .await?
+            .transition
+            .latest_test_evidence_id
+            .is_none()
+    );
+
+    let actual = discovery_transition_evidence(version.id(), hash, &transition);
+    repository
+        .persist_if_configuration_matches(crawler.id(), &actual)
+        .await?;
+    assert_eq!(repository.list(crawler.id(), version.id()).await?.len(), 1);
+    assert_eq!(
+        crawler_repository
+            .discovery_transition(crawler.id(), version.id(), transition.id)
+            .await?
+            .transition
+            .latest_test_evidence_id,
+        Some(actual.id)
     );
     Ok(())
 }

@@ -28,6 +28,13 @@ struct TransitionFixture {
 async fn transition_fixture(
     per_page_limit: u32,
 ) -> Result<TransitionFixture, Box<dyn std::error::Error>> {
+    transition_fixture_with_constraints(per_page_limit, None).await
+}
+
+async fn transition_fixture_with_constraints(
+    per_page_limit: u32,
+    url_constraints: Option<&str>,
+) -> Result<TransitionFixture, Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
     MigrationRunner::default().apply(&database).await?;
     let repository = CrawlerRepository::new(&database);
@@ -89,7 +96,7 @@ async fn transition_fixture(
         name: "Product links".to_owned(),
         enabled: true,
         link_selector: "a.product".to_owned(),
-        url_constraints: None,
+        url_constraints: url_constraints.map(str::to_owned),
         priority: 1,
         budget: TransitionBudget {
             max_links_per_source_page: per_page_limit,
@@ -961,6 +968,419 @@ async fn provider_observation_cannot_be_attributed_to_another_requested_url()
             .list(fixture.crawler.id(), fixture.version_id)
             .await?
             .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_kind_reference_matrix_rejects_cross_kind_identifiers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = transition_fixture(1).await?;
+    let service = TestLabService::new(fixture.database, None, None);
+    let page_type_id = PageTypeId::new();
+    let transition_id = DiscoveryTransitionId::new();
+    let invalid_requests = [
+        TestLabRequest {
+            test_kind: TestKind::UrlCanonicalization,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: None,
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::UrlCanonicalization,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: None,
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::PageTypeMatching,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: None,
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::Extraction,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: None,
+            transition_id: None,
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::Extraction,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::SelectorCoverage,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::Pagination,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: None,
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::Pagination,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: None,
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::DiscoveryTransition,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::DiscoveryTransition,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: None,
+            transition_id: None,
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::DiscoveredUrlPreview,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+        TestLabRequest {
+            test_kind: TestKind::CombinedUrlEvaluation,
+            input_urls: vec!["https://example.test/listing".to_owned()],
+            page_type_id: Some(page_type_id),
+            transition_id: Some(transition_id),
+            compare_with_active_published: false,
+            reuse_artifact_ids: Vec::new(),
+        },
+    ];
+    for request in invalid_requests {
+        assert!(matches!(
+            service
+                .execute(fixture.crawler.id(), fixture.version_id, request)
+                .await,
+            Err(TestLabError::InvalidRequest)
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn transition_source_uses_observed_final_url_and_comparison_reuses_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let link = ObservedLink {
+        raw_href: "/products/1".to_owned(),
+        selector: Some("a.product".to_owned()),
+    };
+    let fixture = transition_fixture(2).await?;
+    let redirected = PageObservation {
+        requested_url: "https://example.test/redirect".to_owned(),
+        final_url: Some("https://example.test/listing".to_owned()),
+        ..observation("https://example.test/redirect", vec![link.clone()])
+    };
+    let evidence = TestLabService::new(
+        fixture.database.clone(),
+        Some(Arc::new(FixtureTestLabProvider::new([redirected]))),
+        None,
+    )
+    .execute(
+        fixture.crawler.id(),
+        fixture.version_id,
+        TestLabRequest {
+            input_urls: vec!["https://example.test/redirect".to_owned()],
+            ..transition_request(fixture.transition_id, false)
+        },
+    )
+    .await?
+    .evidence;
+    let discovery = evidence.discovery.ok_or("missing transition evidence")?;
+    assert_eq!(discovery.eligible_link_count, 1);
+    assert_eq!(
+        discovery
+            .source_match
+            .and_then(|source| source.winner)
+            .map(|winner| winner.page_type_id),
+        Some(fixture.source_page_type_id)
+    );
+
+    let repository = CrawlerRepository::new(&fixture.database);
+    let article = repository
+        .create_page_type(
+            fixture.crawler.id(),
+            fixture.version_id,
+            "Article",
+            1,
+            "operator",
+            "unix:8",
+        )
+        .await?;
+    repository
+        .create_url_matcher(
+            fixture.crawler.id(),
+            fixture.version_id,
+            article.id,
+            &UrlMatcher::path_prefix(None, "/article"),
+            "operator",
+            "unix:9",
+        )
+        .await?;
+    let final_article = PageObservation {
+        requested_url: "https://example.test/listing".to_owned(),
+        final_url: Some("https://example.test/article".to_owned()),
+        ..observation("https://example.test/listing", vec![link.clone()])
+    };
+    let evidence = TestLabService::new(
+        fixture.database.clone(),
+        Some(Arc::new(FixtureTestLabProvider::new([final_article]))),
+        None,
+    )
+    .execute(
+        fixture.crawler.id(),
+        fixture.version_id,
+        transition_request(fixture.transition_id, false),
+    )
+    .await?
+    .evidence;
+    assert_eq!(
+        evidence
+            .discovery
+            .as_ref()
+            .map(|discovery| discovery.eligible_link_count),
+        Some(0)
+    );
+    assert_eq!(
+        evidence
+            .discovery
+            .and_then(|discovery| discovery.source_match)
+            .and_then(|source| source.winner)
+            .map(|winner| winner.page_type_id),
+        Some(article.id)
+    );
+    assert!(
+        evidence
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "TRANSITION_SOURCE_PAGE_TYPE_MISMATCH")
+    );
+
+    let fixture = transition_fixture(2).await?;
+    let repository = CrawlerRepository::new(&fixture.database);
+    let published = repository
+        .publish(
+            fixture.crawler.id(),
+            fixture.version_id,
+            "operator",
+            "unix:8",
+        )
+        .await?;
+    let draft = repository
+        .create_draft_from_published(
+            fixture.crawler.id(),
+            published.version.id(),
+            "operator",
+            "unix:9",
+        )
+        .await?;
+    let transition = repository
+        .list_discovery_transitions(fixture.crawler.id(), draft.id())
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("missing cloned transition")?
+        .transition;
+    let redirected = PageObservation {
+        requested_url: "https://example.test/redirect".to_owned(),
+        final_url: Some("https://example.test/listing".to_owned()),
+        ..observation("https://example.test/redirect", vec![link])
+    };
+    let evidence = TestLabService::new(
+        fixture.database,
+        Some(Arc::new(FixtureTestLabProvider::new([redirected]))),
+        None,
+    )
+    .execute(
+        fixture.crawler.id(),
+        draft.id(),
+        TestLabRequest {
+            input_urls: vec!["https://example.test/redirect".to_owned()],
+            ..transition_request(transition.id, true)
+        },
+    )
+    .await?
+    .evidence;
+    assert_eq!(
+        evidence
+            .published_comparison
+            .as_ref()
+            .and_then(|comparison| comparison.discovery_difference),
+        Some(false)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_provider_final_url_is_not_a_client_request_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = transition_fixture(1).await?;
+    let invalid_final = PageObservation {
+        final_url: Some("not a URL".to_owned()),
+        ..observation("https://example.test/listing", Vec::new())
+    };
+    let service = TestLabService::new(
+        fixture.database.clone(),
+        Some(Arc::new(FixtureTestLabProvider::new([invalid_final]))),
+        None,
+    );
+    assert!(matches!(
+        service
+            .execute(
+                fixture.crawler.id(),
+                fixture.version_id,
+                transition_request(fixture.transition_id, false),
+            )
+            .await,
+        Err(TestLabError::ProviderObservationInvalid)
+    ));
+    assert!(
+        erabi_db::repositories::TestEvidenceRepository::new(&fixture.database)
+            .list(fixture.crawler.id(), fixture.version_id)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn transition_url_constraints_fail_closed_without_consuming_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    let link = ObservedLink {
+        raw_href: "/products/1".to_owned(),
+        selector: Some("a.product".to_owned()),
+    };
+    let unconstrained = transition_fixture(1).await?;
+    let unconstrained_evidence = TestLabService::new(
+        unconstrained.database,
+        Some(Arc::new(FixtureTestLabProvider::new([observation(
+            "https://example.test/listing",
+            vec![link.clone()],
+        )]))),
+        None,
+    )
+    .execute(
+        unconstrained.crawler.id(),
+        unconstrained.version_id,
+        transition_request(unconstrained.transition_id, false),
+    )
+    .await?
+    .evidence;
+    assert_eq!(
+        unconstrained_evidence
+            .discovery
+            .as_ref()
+            .map(|discovery| discovery.eligible_link_count),
+        Some(1)
+    );
+
+    let fixture = transition_fixture_with_constraints(1, Some("^/products/.*$")).await?;
+    let repository = CrawlerRepository::new(&fixture.database);
+    let published = repository
+        .publish(
+            fixture.crawler.id(),
+            fixture.version_id,
+            "operator",
+            "unix:8",
+        )
+        .await?;
+    let draft = repository
+        .create_draft_from_published(
+            fixture.crawler.id(),
+            published.version.id(),
+            "operator",
+            "unix:9",
+        )
+        .await?;
+    let transition = repository
+        .list_discovery_transitions(fixture.crawler.id(), draft.id())
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("missing cloned transition")?
+        .transition;
+    let evidence = TestLabService::new(
+        fixture.database,
+        Some(Arc::new(FixtureTestLabProvider::new([observation(
+            "https://example.test/listing",
+            vec![link],
+        )]))),
+        None,
+    )
+    .execute(
+        fixture.crawler.id(),
+        draft.id(),
+        transition_request(transition.id, true),
+    )
+    .await?
+    .evidence;
+    let discovery = evidence
+        .discovery
+        .as_ref()
+        .ok_or("missing transition evidence")?;
+    assert_eq!(discovery.eligible_link_count, 0);
+    assert!(!discovery.per_page_limit_reached);
+    assert!(
+        discovery
+            .discovered_urls
+            .iter()
+            .all(|item| { !item.transition_eligible && item.budget.is_none() })
+    );
+    assert_eq!(
+        evidence
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == "TRANSITION_URL_CONSTRAINT_UNEVALUATED")
+            .count(),
+        1
+    );
+    assert_eq!(
+        evidence
+            .published_comparison
+            .as_ref()
+            .and_then(|comparison| comparison.discovery_difference),
+        None
+    );
+    assert!(
+        evidence
+            .published_comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.warnings.iter().any(|warning| {
+                warning.code == "TRANSITION_URL_CONSTRAINT_COMPARISON_UNAVAILABLE"
+            }))
     );
     Ok(())
 }

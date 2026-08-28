@@ -70,6 +70,8 @@ pub enum TestLabError {
     ProviderUnavailable,
     #[error("Test Lab provider returned an observation for a different request URL")]
     ProviderObservationRequestMismatch,
+    #[error("Test Lab provider returned an invalid observed final URL")]
+    ProviderObservationInvalid,
     #[error("Artifact was not found")]
     ArtifactNotFound,
     #[error("Artifact cannot safely be reused for this observation")]
@@ -185,6 +187,16 @@ impl TestLabService {
                     .map_err(map_provider_error)?;
                 if observation.requested_url != *input_url {
                     return Err(TestLabError::ProviderObservationRequestMismatch);
+                }
+                if observation.final_url.as_deref().is_some_and(|final_url| {
+                    snapshot
+                        .draft
+                        .version
+                        .canonicalization_policy()
+                        .canonicalize(final_url)
+                        .is_err()
+                }) {
+                    return Err(TestLabError::ProviderObservationInvalid);
                 }
                 if canonical_url.is_none() {
                     return Err(TestLabError::InvalidRequest);
@@ -402,16 +414,20 @@ impl TestLabService {
         observation: &PageObservation,
         warnings: &mut Vec<TestDiagnostic>,
     ) -> Result<DiscoveryTransitionEvidence, TestLabError> {
-        let base_url = observation.final_url.as_deref().unwrap_or(input_url);
+        let observed_source_url = observation.final_url.as_deref().unwrap_or(input_url);
         let base_url = snapshot
             .version
             .canonicalization_policy()
-            .canonicalize(base_url)
-            .map_err(|_| TestLabError::InvalidRequest)?
+            .canonicalize(observed_source_url)
+            .map_err(|_| TestLabError::ProviderObservationInvalid)?
             .canonical_url;
-        let source_match = transition.and_then(|_| {
-            let (_, source_match, _) = evaluate_url_without_diagnostics(input_url, snapshot);
-            source_match
+        let page_types = snapshot
+            .page_types
+            .iter()
+            .map(erabi_db::repositories::PageTypeRecord::domain_page_type)
+            .collect::<Vec<_>>();
+        let source_match = transition.map(|_| {
+            PageTypeMatchEvidence::from_decision(&resolve_page_type(&base_url, &page_types))
         });
         let source_is_applicable = transition.is_none_or(|selected| {
             let applicable = source_match.as_ref().is_some_and(|source| {
@@ -449,6 +465,17 @@ impl TestLabService {
                 ),
             );
         }
+        let transition_constraints_unevaluated =
+            transition.is_some_and(|selected| selected.url_constraints.is_some());
+        if transition_constraints_unevaluated {
+            push_diagnostic(
+                warnings,
+                diagnostic(
+                    "TRANSITION_URL_CONSTRAINT_UNEVALUATED",
+                    "The selected transition has URL constraints that this focused Test Lab evaluator cannot execute yet.",
+                ),
+            );
+        }
         let transition_for_budget = transition.map(|item| &item.budget);
         let target_guardrail = transition.and_then(|item| {
             snapshot
@@ -458,11 +485,6 @@ impl TestLabService {
                 .iter()
                 .find(|guardrail| guardrail.page_type_id == item.target_page_type_id)
         });
-        let page_types = snapshot
-            .page_types
-            .iter()
-            .map(erabi_db::repositories::PageTypeRecord::domain_page_type)
-            .collect::<Vec<_>>();
         let mut links = observation.discovered_links.clone();
         links.sort_by(|left, right| {
             left.raw_href
@@ -587,7 +609,7 @@ impl TestLabService {
                 discovered_urls.push(item);
                 continue;
             };
-            if !selected.enabled || !source_is_applicable {
+            if !selected.enabled || !source_is_applicable || transition_constraints_unevaluated {
                 discovered_urls.push(item);
                 continue;
             }
@@ -840,6 +862,15 @@ fn comparison_discovery_difference(
     let Some(observation) = observation else {
         return (None, Vec::new());
     };
+    if draft_transition.is_some_and(|transition| transition.url_constraints.is_some()) {
+        return (
+            None,
+            vec![diagnostic(
+                "TRANSITION_URL_CONSTRAINT_COMPARISON_UNAVAILABLE",
+                "Discovery comparison is unavailable because the selected transition has URL constraints that focused Test Lab cannot execute yet.",
+            )],
+        );
+    }
     let published_transition = if let Some(draft_transition) = draft_transition {
         let Some(transition) =
             unique_corresponding_transition(&snapshot.draft, published, draft_transition)
@@ -897,6 +928,23 @@ fn validate_request(request: &TestLabRequest) -> Result<(), TestLabError> {
     if request.reuse_artifact_ids.len() > erabi_domain::MAX_TEST_EVIDENCE_ARTIFACTS {
         return Err(TestLabError::InvalidRequest);
     }
+    let page_type_is_required = matches!(
+        request.test_kind,
+        TestKind::Extraction | TestKind::SelectorCoverage
+    );
+    let page_type_is_allowed = matches!(
+        request.test_kind,
+        TestKind::PageTypeMatching
+            | TestKind::Extraction
+            | TestKind::SelectorCoverage
+            | TestKind::CombinedUrlEvaluation
+    );
+    if (page_type_is_required && request.page_type_id.is_none())
+        || (!page_type_is_allowed && request.page_type_id.is_some())
+        || (request.test_kind == TestKind::DiscoveryTransition) != request.transition_id.is_some()
+    {
+        return Err(TestLabError::InvalidRequest);
+    }
     match request.test_kind {
         TestKind::Extraction
         | TestKind::SelectorCoverage
@@ -905,12 +953,6 @@ fn validate_request(request: &TestLabRequest) -> Result<(), TestLabError> {
         | TestKind::DiscoveryTransition
             if request.input_urls.len() != 1 =>
         {
-            Err(TestLabError::InvalidRequest)
-        }
-        TestKind::DiscoveryTransition if request.transition_id.is_none() => {
-            Err(TestLabError::InvalidRequest)
-        }
-        TestKind::Extraction | TestKind::SelectorCoverage if request.page_type_id.is_none() => {
             Err(TestLabError::InvalidRequest)
         }
         _ => Ok(()),

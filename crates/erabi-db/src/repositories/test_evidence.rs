@@ -233,7 +233,10 @@ async fn persist_in_transaction(
         )
         .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
-    if let Some(transition_id) = evidence.tested_transition_id {
+    if is_valid_discovery_transition_evidence(evidence) {
+        let transition_id = evidence
+            .tested_transition_id
+            .ok_or(TestEvidenceRepositoryError::CorruptState)?;
         attach_transition_evidence(
             connection,
             evidence.crawler_version_id,
@@ -243,6 +246,15 @@ async fn persist_in_transaction(
         .await?;
     }
     Ok(())
+}
+
+fn is_valid_discovery_transition_evidence(evidence: &TestEvidence) -> bool {
+    evidence.test_kind == erabi_domain::TestKind::DiscoveryTransition
+        && evidence.tested_transition_id.is_some()
+        && evidence
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.transition_id == evidence.tested_transition_id)
 }
 
 async fn validate_references(
