@@ -27,6 +27,7 @@ use crate::{
         update_canonicalization, update_crawler_version_guardrails, update_discovery_transition,
         update_domain_scope,
     },
+    discovery_preview::{discovery_preview_openapi_schemas, run_discovery_preview},
     error::{ApiErrorEnvelope, error_response},
     job_actions::{
         cancel as cancel_job, remove as remove_job, reprioritize as reprioritize_job,
@@ -159,6 +160,10 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-lab/tests",
             post(run_test_lab),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview",
+            post(run_discovery_preview),
         )
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence",
@@ -503,6 +508,10 @@ impl OpenApiDocument {
             OpenApiPath::post("Execute a bounded deterministic Test Lab test"),
         );
         paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview",
+            OpenApiPath::post("Execute an ephemeral bounded Discovery Preview"),
+        );
+        paths.insert(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence",
             OpenApiPath::get("List durable TestEvidence"),
         );
@@ -548,6 +557,7 @@ impl OpenApiDocument {
                     let mut schemas = task2_openapi_schemas();
                     schemas.extend(crawler_discovery_openapi_schemas());
                     schemas.extend(test_lab_openapi_schemas());
+                    schemas.extend(discovery_preview_openapi_schemas());
                     schemas
                 },
             },

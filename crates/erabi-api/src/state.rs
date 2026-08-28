@@ -5,7 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use erabi_crawler::{ExtractionTestHook, TestLabProvider, TestLabService};
+use erabi_crawler::{
+    DiscoveryPreviewProvider, DiscoveryPreviewService, ExtractionTestHook, PreviewClock,
+    TestLabProvider, TestLabService,
+};
 use erabi_db::ErabiDatabase;
 use erabi_jobs::{
     CancellationController, JobActionService, ProgressLiveHub, StoragePressureController,
@@ -95,6 +98,7 @@ pub struct AppState {
     job_actions: Option<Arc<JobActionRuntimeState>>,
     crawler_authoring: Option<Arc<CrawlerAuthoringService>>,
     test_lab: Option<Arc<TestLabService>>,
+    discovery_preview: Option<Arc<DiscoveryPreviewService>>,
     storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
@@ -119,6 +123,7 @@ impl AppState {
             job_actions: None,
             crawler_authoring: None,
             test_lab: None,
+            discovery_preview: None,
             storage_pressure: None,
         }
     }
@@ -158,8 +163,38 @@ impl AppState {
     pub fn with_crawler_authoring_runtime(mut self, database: ErabiDatabase) -> Self {
         self.crawler_authoring = Some(Arc::new(CrawlerAuthoringService::new(database.clone())));
         if self.test_lab.is_none() {
-            self.test_lab = Some(Arc::new(TestLabService::new(database, None, None)));
+            self.test_lab = Some(Arc::new(TestLabService::new(database.clone(), None, None)));
         }
+        if self.discovery_preview.is_none() {
+            self.discovery_preview = Some(Arc::new(DiscoveryPreviewService::new(database, None)));
+        }
+        self
+    }
+
+    /// Attaches the synchronous bounded Discovery Preview runtime. A missing
+    /// provider is intentional for normal runtimes until Plan 06 supplies a
+    /// network adapter; fixture providers belong only in tests.
+    #[must_use]
+    pub fn with_discovery_preview_runtime(
+        mut self,
+        database: ErabiDatabase,
+        provider: Option<Arc<dyn DiscoveryPreviewProvider>>,
+    ) -> Self {
+        self.discovery_preview = Some(Arc::new(DiscoveryPreviewService::new(database, provider)));
+        self
+    }
+
+    /// Test/runtime seam allowing deterministic Preview clock injection.
+    #[must_use]
+    pub fn with_discovery_preview_runtime_with_clock(
+        mut self,
+        database: ErabiDatabase,
+        provider: Option<Arc<dyn DiscoveryPreviewProvider>>,
+        clock: Arc<dyn PreviewClock>,
+    ) -> Self {
+        self.discovery_preview = Some(Arc::new(DiscoveryPreviewService::with_clock(
+            database, provider, clock,
+        )));
         self
     }
 
@@ -191,6 +226,10 @@ impl AppState {
 
     pub(crate) fn test_lab_runtime(&self) -> Option<Arc<TestLabService>> {
         self.test_lab.clone()
+    }
+
+    pub(crate) fn discovery_preview_runtime(&self) -> Option<Arc<DiscoveryPreviewService>> {
+        self.discovery_preview.clone()
     }
 
     /// Attaches the typed storage-pressure state shared with worker admission.

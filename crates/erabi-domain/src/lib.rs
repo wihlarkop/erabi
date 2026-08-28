@@ -6,6 +6,7 @@ mod collection;
 mod crawl_snapshot;
 mod crawler;
 mod crawler_version;
+mod discovery_preview;
 mod domain_scope;
 mod error;
 mod guardrails;
@@ -37,6 +38,7 @@ pub use crawl_snapshot::{
 };
 pub use crawler::Crawler;
 pub use crawler_version::{CrawlerVersion, CrawlerVersionState};
+pub use discovery_preview::*;
 pub use domain_scope::{
     DOMAIN_SCOPE_POLICY_VERSION, DomainScopeClassification, DomainScopeHostRule, DomainScopeKind,
     DomainScopePolicy, DomainScopeRationale,
