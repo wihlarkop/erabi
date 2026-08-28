@@ -70,6 +70,7 @@ pub use test_evidence::{
     PublishedComparisonStatus, SelectorCoverageEvidence, SelectorCoverageStatus,
     TEST_EVIDENCE_SCHEMA_VERSION, TestDiagnostic, TestEvidence, TestKind, TestLabComparison,
     TransitionBudgetEvidence, TransitionBudgetExclusionEvidence,
+    page_type_match_sequences_behaviorally_equivalent,
 };
 pub use transition::{DiscoveryTransition, TransitionBudget, TransitionGraph};
 pub use url_matcher::{SpecificityKey, UrlMatcher, UrlMatcherDefinition, UrlMatcherKind};

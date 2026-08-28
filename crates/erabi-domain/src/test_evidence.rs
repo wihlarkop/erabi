@@ -146,6 +146,87 @@ impl PageTypeMatchEvidence {
             },
         }
     }
+
+    /// Compares PageType-match behavior without treating version-local
+    /// `PageType` identities as behavior. Historical evidence keeps the exact
+    /// IDs for provenance; a Published-to-Draft clone deliberately has new
+    /// IDs and must still compare by its complete resolution semantics.
+    #[must_use]
+    pub fn behaviorally_equivalent(&self, other: &Self) -> bool {
+        self.decision == other.decision
+            && semantic_candidate_multiset(&self.candidates)
+                == semantic_candidate_multiset(&other.candidates)
+            && semantic_winner(self.winner.as_ref()) == semantic_winner(other.winner.as_ref())
+    }
+}
+
+/// Compares URL-by-URL `PageType` matching results by behavior. URL-batch order
+/// remains significant, while ambiguity-candidate order does not.
+#[must_use]
+pub fn page_type_match_sequences_behaviorally_equivalent(
+    left: &[PageTypeMatchEvidence],
+    right: &[PageTypeMatchEvidence],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.behaviorally_equivalent(right))
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticPageTypeCandidate {
+    page_type_name: String,
+    priority: i32,
+    matcher_kind_rank: u8,
+    specificity: (u8, u32, u32, u32, u32),
+    matched_patterns: Vec<String>,
+}
+
+fn semantic_candidate_multiset(
+    candidates: &[PageTypeCandidateEvidence],
+) -> Vec<SemanticPageTypeCandidate> {
+    let mut candidates = candidates
+        .iter()
+        .map(SemanticPageTypeCandidate::from_evidence)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+}
+
+fn semantic_winner(
+    winner: Option<&PageTypeCandidateEvidence>,
+) -> Option<SemanticPageTypeCandidate> {
+    winner.map(SemanticPageTypeCandidate::from_evidence)
+}
+
+impl SemanticPageTypeCandidate {
+    fn from_evidence(candidate: &PageTypeCandidateEvidence) -> Self {
+        let mut matched_patterns = candidate.matched_patterns.clone();
+        matched_patterns.sort();
+        Self {
+            page_type_name: candidate.page_type_name.clone(),
+            priority: candidate.priority,
+            matcher_kind_rank: matcher_kind_rank(candidate.matcher_kind),
+            specificity: (
+                candidate.specificity.matcher_kind_rank,
+                candidate.specificity.literal_path_segments,
+                candidate.specificity.explicit_query_constraints,
+                candidate.specificity.literal_characters,
+                candidate.specificity.wildcard_capture_count,
+            ),
+            matched_patterns,
+        }
+    }
+}
+
+const fn matcher_kind_rank(kind: MatcherKindEvidence) -> u8 {
+    match kind {
+        MatcherKindEvidence::ExactUrl => 4,
+        MatcherKindEvidence::ExactHostPathTemplate => 3,
+        MatcherKindEvidence::PathPrefixOrGlob => 2,
+        MatcherKindEvidence::Regex => 1,
+    }
 }
 
 impl PageTypeCandidateEvidence {
@@ -824,6 +905,8 @@ fn validate_comparison(
 ) -> Result<(), String> {
     if comparison.draft_version_id != evidence.crawler_version_id
         || comparison.draft_config_hash != evidence.config_hash
+        || comparison.draft_canonicalization != evidence.canonicalization
+        || comparison.draft_page_type_match != evidence.page_type_match
         || comparison.draft_config_hash.len() != 64
         || !comparison
             .draft_config_hash
@@ -869,10 +952,26 @@ fn validate_comparison(
             {
                 return Err("Published comparison identity is incomplete".into());
             }
+            if comparison.canonicalization_difference
+                != (comparison.draft_canonicalization != comparison.published_canonicalization)
+                || comparison.page_type_match_difference
+                    == page_type_match_sequences_behaviorally_equivalent(
+                        &comparison.draft_page_type_match,
+                        &comparison.published_page_type_match,
+                    )
+            {
+                return Err("Published comparison differences are inconsistent".into());
+            }
         }
         PublishedComparisonStatus::NoActivePublishedVersion => {
             if comparison.published_version_id.is_some()
                 || comparison.published_config_hash.is_some()
+                || !comparison.published_canonicalization.is_empty()
+                || !comparison.published_page_type_match.is_empty()
+                || comparison.canonicalization_difference
+                || comparison.page_type_match_difference
+                || comparison.discovery_difference.is_some()
+                || comparison.extraction_difference.is_some()
             {
                 return Err("no-Published comparison has Published identity".into());
             }

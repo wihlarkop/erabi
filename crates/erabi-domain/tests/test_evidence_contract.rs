@@ -2,7 +2,8 @@ use erabi_domain::{
     CanonicalizationDecisionCode, CanonicalizationDecisionEvidence, CanonicalizationEvidence,
     CanonicalizationOutcome, MatcherKindEvidence, MatcherSpecificityEvidence,
     PageTypeCandidateEvidence, PageTypeMatchEvidence, PageTypeMatchStatus,
-    TEST_EVIDENCE_SCHEMA_VERSION, TestDiagnostic, TestEvidence, TestEvidenceId, TestKind,
+    PublishedComparisonStatus, TEST_EVIDENCE_SCHEMA_VERSION, TestDiagnostic, TestEvidence,
+    TestEvidenceId, TestKind, TestLabComparison,
 };
 
 fn evidence() -> TestEvidence {
@@ -122,4 +123,51 @@ fn invalid_evidence_diagnostics_and_unsorted_artifacts_are_rejected()
         serde_json::json!([artifact_ids[0].to_string(), artifact_ids[1].to_string()]);
     assert!(serde_json::from_value::<TestEvidence>(value).is_err());
     Ok(())
+}
+
+#[test]
+fn page_type_comparison_ignores_regenerated_ids_and_ambiguity_order() {
+    let published_first = candidate(erabi_domain::PageTypeId::new(), "Duplicate");
+    let published_second = candidate(erabi_domain::PageTypeId::new(), "Duplicate");
+    let draft_first = candidate(erabi_domain::PageTypeId::new(), "Duplicate");
+    let draft_second = candidate(erabi_domain::PageTypeId::new(), "Duplicate");
+    let published = PageTypeMatchEvidence {
+        decision: PageTypeMatchStatus::Ambiguous,
+        winner: None,
+        candidates: vec![published_first, published_second],
+    };
+    let draft = PageTypeMatchEvidence {
+        decision: PageTypeMatchStatus::Ambiguous,
+        winner: None,
+        candidates: vec![draft_second, draft_first],
+    };
+    assert!(draft.behaviorally_equivalent(&published));
+}
+
+#[test]
+fn persisted_comparison_rejects_contradictory_redundant_booleans() {
+    let mut evidence = evidence();
+    let published_id = erabi_domain::CrawlerVersionId::new();
+    evidence.published_comparison = Some(TestLabComparison {
+        status: PublishedComparisonStatus::Compared,
+        draft_version_id: evidence.crawler_version_id,
+        draft_config_hash: evidence.config_hash.clone(),
+        published_version_id: Some(published_id),
+        published_config_hash: Some("11".repeat(32)),
+        canonicalization_difference: false,
+        draft_canonicalization: evidence.canonicalization.clone(),
+        published_canonicalization: vec![CanonicalizationEvidence {
+            original_url: "https://example.test/changed".to_owned(),
+            canonical_url: Some("https://example.test/changed".to_owned()),
+            outcome: CanonicalizationOutcome::Canonicalized,
+            decisions: Vec::new(),
+        }],
+        page_type_match_difference: false,
+        draft_page_type_match: Vec::new(),
+        published_page_type_match: Vec::new(),
+        discovery_difference: None,
+        extraction_difference: None,
+        warnings: Vec::new(),
+    });
+    assert!(evidence.validate().is_err());
 }

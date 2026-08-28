@@ -44,6 +44,7 @@ fn loopback(database: &ErabiDatabase) -> Result<Router, Box<dyn std::error::Erro
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_lab_executes_persists_and_reads_server_owned_evidence()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
@@ -68,6 +69,14 @@ async fn test_lab_executes_persists_and_reads_server_owned_evidence()
     assert_eq!(evidence["test_kind"], "URL_CANONICALIZATION");
     assert_eq!(evidence["crawler_version_id"], version.id().to_string());
     assert_eq!(evidence["matches_current_configuration"], true);
+    for field in [
+        "extraction",
+        "pagination",
+        "discovery",
+        "published_comparison",
+    ] {
+        assert!(evidence[field].is_null(), "{field} must serialize as null");
+    }
     assert!(evidence["id"].as_str().is_some());
     assert!(evidence["executed_at"].as_str().is_some());
     assert!(evidence["config_hash"].as_str().is_some());
@@ -120,6 +129,28 @@ async fn test_lab_executes_persists_and_reads_server_owned_evidence()
         assert!(
             openapi["components"]["schemas"][schema].is_object(),
             "missing {schema}"
+        );
+    }
+    for (schema, field, reference) in [
+        ("TestEvidence", "extraction", "ExtractionObservation"),
+        ("TestEvidence", "pagination", "PaginationEvidence"),
+        ("TestEvidence", "discovery", "DiscoveryTransitionEvidence"),
+        ("TestEvidence", "published_comparison", "TestLabComparison"),
+        (
+            "DiscoveryTransitionEvidence",
+            "source_match",
+            "PageTypeMatchEvidence",
+        ),
+    ] {
+        let property = &openapi["components"]["schemas"][schema]["properties"][field];
+        assert_eq!(
+            property["anyOf"][0]["$ref"],
+            format!("#/components/schemas/{reference}"),
+            "{schema}.{field} must retain its typed reference"
+        );
+        assert_eq!(
+            property["anyOf"][1]["type"], "null",
+            "{schema}.{field} must accept serde null"
         );
     }
     Ok(())
