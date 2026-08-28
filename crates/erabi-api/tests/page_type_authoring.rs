@@ -7,7 +7,8 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use erabi_api::{AppState, SecurityConfig, build_router};
-use erabi_db::{ErabiDatabase, MigrationRunner};
+use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
+use erabi_domain::{CrawlerId, CrawlerVersionId, Seed};
 use tower::ServiceExt;
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -254,6 +255,7 @@ async fn invalid_matchers_are_rejected_and_unmatched_is_explicit()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn equal_candidates_remain_ambiguous_and_published_mutations_conflict()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
@@ -280,7 +282,7 @@ async fn equal_candidates_remain_ambiguous_and_published_mutations_conflict()
             .oneshot(request(
                 "POST",
                 &matcher_path,
-                r#"{"kind":"PATH_PREFIX","host":"example.test","prefix":"/same"}"#,
+                r#"{"kind":"REGEX","pattern":"^https://example\\.test/same/.*$"}"#,
             )?)
             .await?;
         assert_eq!(matcher.status(), StatusCode::CREATED);
@@ -313,6 +315,20 @@ async fn equal_candidates_remain_ambiguous_and_published_mutations_conflict()
         actual,
         ids.iter().map(String::as_str).collect::<BTreeSet<_>>()
     );
+
+    let crawler_id_typed = CrawlerId::from_uuid(crawler_id.parse()?).ok_or("invalid crawler id")?;
+    let version_id_typed =
+        CrawlerVersionId::from_uuid(version_id.parse()?).ok_or("invalid version id")?;
+    let repository = CrawlerRepository::new(&database);
+    let mut version = repository
+        .version(crawler_id_typed, version_id_typed)
+        .await?
+        .version;
+    version.add_seed(Seed::new(
+        "https://example.test/other".parse()?,
+        "https://example.test/other".parse()?,
+    ))?;
+    repository.save_draft(&version, "test", "unix:seed").await?;
 
     let published = router
         .clone()

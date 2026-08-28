@@ -6,7 +6,7 @@ use erabi_db::{
 };
 use erabi_domain::{
     CrawlRunId, CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunStatus, CrawlRunType, Crawler,
-    CrawlerVersion, ResolvedValue, RobotsAudit, RunConfiguration, SettingSource,
+    CrawlerVersion, ResolvedValue, RobotsAudit, RunConfiguration, Seed, SettingSource,
     SnapshotOperationalSettings,
 };
 
@@ -67,6 +67,10 @@ async fn repositories_preserve_published_version_and_run_snapshot_immutability()
     let mut crawler = Crawler::new("Catalog");
     crawler_repository.create(&crawler).await?;
     let mut version = CrawlerVersion::draft(crawler.id());
+    version.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
     crawler_repository
         .save_draft(&version, "operator", "2026-08-23T00:00:00Z")
         .await?;

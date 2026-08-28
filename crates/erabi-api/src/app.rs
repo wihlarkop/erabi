@@ -17,7 +17,8 @@ use uuid::Uuid;
 use crate::{
     AppState, Crawl4AiAvailability, MutationAdmission, RuntimeMode, SecurityConfig,
     crawler_authoring::{
-        create_crawler, create_draft, list_crawlers, list_versions, publish_version,
+        create_crawler, create_draft, list_crawlers, list_versions,
+        publication_validation_openapi_schemas, publish_validation, publish_version,
         reactivate_version, read_crawler, read_version,
     },
     discovery_policy::{
@@ -102,6 +103,10 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish",
             post(publish_version),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation",
+            get(publish_validation),
         )
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate",
@@ -452,6 +457,10 @@ impl OpenApiDocument {
             OpenApiPath::post("Publish the active Draft"),
         );
         paths.insert(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation",
+            OpenApiPath::get("Validate the active Draft for publication"),
+        );
+        paths.insert(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate",
             OpenApiPath::post("Reactivate a historical Published version"),
         );
@@ -556,6 +565,7 @@ impl OpenApiDocument {
                 schemas: {
                     let mut schemas = task2_openapi_schemas();
                     schemas.extend(crawler_discovery_openapi_schemas());
+                    schemas.extend(publication_validation_openapi_schemas());
                     schemas.extend(test_lab_openapi_schemas());
                     schemas.extend(discovery_preview_openapi_schemas());
                     schemas

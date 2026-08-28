@@ -6,7 +6,9 @@ mod integrity;
 mod migrate;
 pub mod repositories;
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
+
+use erabi_domain::VersionValidationRegistry;
 
 pub use artifact_store::{ArtifactStore, ArtifactStoreError, StoredArtifact};
 pub use configuration::{
@@ -50,6 +52,7 @@ pub enum DbError {
 #[derive(Clone, Debug)]
 pub struct ErabiDatabase {
     database: turso::Database,
+    validation_registry: Arc<VersionValidationRegistry>,
 }
 
 impl ErabiDatabase {
@@ -60,7 +63,10 @@ impl ErabiDatabase {
     pub async fn open_local(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref().to_string_lossy().into_owned();
         let database = turso::Builder::new_local(&path).build().await?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            validation_registry: Arc::new(VersionValidationRegistry::new()),
+        })
     }
 
     /// Opens an isolated in-memory database for tests and bounded probes.
@@ -69,7 +75,22 @@ impl ErabiDatabase {
     /// Returns a Turso error when the database cannot be opened.
     pub async fn in_memory() -> Result<Self, DbError> {
         let database = turso::Builder::new_local(":memory:").build().await?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            validation_registry: Arc::new(VersionValidationRegistry::new()),
+        })
+    }
+
+    /// Replaces the runtime's complete publication-validation registry before
+    /// the database is attached to application services.
+    #[must_use]
+    pub fn with_version_validation_registry(mut self, registry: VersionValidationRegistry) -> Self {
+        self.validation_registry = Arc::new(registry);
+        self
+    }
+
+    pub(crate) fn version_validation_registry(&self) -> &VersionValidationRegistry {
+        &self.validation_registry
     }
 
     /// Opens a connection with Erabi's required per-connection invariants.

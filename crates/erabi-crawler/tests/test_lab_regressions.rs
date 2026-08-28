@@ -454,6 +454,17 @@ async fn matching_clone_fixture()
     let version = repository
         .create_draft(crawler.id(), "operator", "unix:1")
         .await?;
+    let mut configured = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    configured.add_seed(Seed::new(
+        "https://example.test/items".parse()?,
+        "https://example.test/items".parse()?,
+    ))?;
+    repository
+        .save_draft(&configured, "operator", "unix:1b")
+        .await?;
     for (name, priority, time) in [("Listing", 2, "unix:2"), ("Other", 1, "unix:3")] {
         let page_type = repository
             .create_page_type(crawler.id(), version.id(), name, priority, "operator", time)
@@ -565,6 +576,17 @@ async fn ambiguous_clone_comparison_is_semantic_and_order_independent()
     let version = repository
         .create_draft(crawler.id(), "operator", "unix:1")
         .await?;
+    let mut configured = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    configured.add_seed(Seed::new(
+        "https://example.test/other".parse()?,
+        "https://example.test/other".parse()?,
+    ))?;
+    repository
+        .save_draft(&configured, "operator", "unix:1b")
+        .await?;
     for name in ["First", "Second"] {
         let page_type = repository
             .create_page_type(crawler.id(), version.id(), name, 1, "operator", "unix:2")
@@ -574,7 +596,7 @@ async fn ambiguous_clone_comparison_is_semantic_and_order_independent()
                 crawler.id(),
                 version.id(),
                 page_type.id,
-                &UrlMatcher::path_prefix(None, "/items"),
+                &UrlMatcher::regex(r"^https://example\.test/items/.*$")?,
                 "operator",
                 "unix:3",
             )
@@ -721,6 +743,17 @@ async fn extraction_clone_fixture(
     let version = repository
         .create_draft(crawler.id(), "operator", "unix:1")
         .await?;
+    let mut configured = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    configured.add_seed(Seed::new(
+        "https://example.test/other".parse()?,
+        "https://example.test/other".parse()?,
+    ))?;
+    repository
+        .save_draft(&configured, "operator", "unix:1b")
+        .await?;
     let page_type = repository
         .create_page_type(
             crawler.id(),
@@ -731,12 +764,17 @@ async fn extraction_clone_fixture(
             "unix:2",
         )
         .await?;
+    let primary_matcher = if duplicate_published_page_type {
+        UrlMatcher::regex(r"^https://example\.test/products/.*$")?
+    } else {
+        UrlMatcher::path_prefix(None, "/products")
+    };
     repository
         .create_url_matcher(
             crawler.id(),
             version.id(),
             page_type.id,
-            &UrlMatcher::path_prefix(None, "/products"),
+            &primary_matcher,
             "operator",
             "unix:3",
         )
@@ -757,7 +795,7 @@ async fn extraction_clone_fixture(
                 crawler.id(),
                 version.id(),
                 duplicate.id,
-                &UrlMatcher::path_prefix(None, "/products"),
+                &UrlMatcher::regex(r"^https://example\.test/products/.*$")?,
                 "operator",
                 "unix:5",
             )

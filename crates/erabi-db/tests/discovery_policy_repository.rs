@@ -79,9 +79,14 @@ async fn transition_crud_is_typed_transactional_and_clone_safe()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, crawler) = setup().await?;
     let repository = CrawlerRepository::new(&database);
-    let version = repository
+    let mut version = repository
         .create_draft(crawler.id(), "operator", "2026-08-27T00:00:00Z")
         .await?;
+    version.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
+    repository.save_draft(&version, "operator", "now").await?;
     let source = repository
         .create_page_type(crawler.id(), version.id(), "Listing", 10, "operator", "now")
         .await?;
@@ -251,9 +256,14 @@ async fn transition_page_type_ownership_and_persisted_corruption_fail_closed()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, crawler) = setup().await?;
     let repository = CrawlerRepository::new(&database);
-    let version = repository
+    let mut version = repository
         .create_draft(crawler.id(), "operator", "now")
         .await?;
+    version.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
+    repository.save_draft(&version, "operator", "now").await?;
     let source = repository
         .create_page_type(crawler.id(), version.id(), "Source", 1, "operator", "now")
         .await?;

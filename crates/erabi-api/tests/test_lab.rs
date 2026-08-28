@@ -7,7 +7,7 @@ use axum::{
 };
 use erabi_api::{AppState, SecurityConfig, build_router};
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
-use erabi_domain::Crawler;
+use erabi_domain::{Crawler, Seed};
 use secrecy::SecretString;
 use tower::ServiceExt;
 
@@ -53,6 +53,17 @@ async fn test_lab_executes_persists_and_reads_server_owned_evidence()
     repository.create(&crawler).await?;
     let version = repository
         .create_draft(crawler.id(), "operator", "unix:1")
+        .await?;
+    let mut version_to_publish = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    version_to_publish.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
+    repository
+        .save_draft(&version_to_publish, "operator", "unix:1b")
         .await?;
     let router = loopback(&database)?;
     let path = format!(
@@ -217,6 +228,17 @@ async fn published_test_lab_targets_are_rejected() -> Result<(), Box<dyn std::er
     repository.create(&crawler).await?;
     let version = repository
         .create_draft(crawler.id(), "operator", "unix:1")
+        .await?;
+    let mut version_to_publish = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    version_to_publish.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
+    repository
+        .save_draft(&version_to_publish, "operator", "unix:1b")
         .await?;
     repository
         .publish(crawler.id(), version.id(), "operator", "unix:2")

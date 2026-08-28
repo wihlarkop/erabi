@@ -178,6 +178,40 @@ struct StoredEvidence {
     evidence: TestEvidence,
 }
 
+/// Loads all evidence for a publication snapshot without opening a second
+/// connection. Every row is validated, including its durable references, so
+/// publication never counts malformed or foreign evidence as confidence.
+pub(crate) async fn load_for_version_in_transaction(
+    connection: &Connection,
+    version_id: CrawlerVersionId,
+) -> Result<Vec<TestEvidence>, TestEvidenceRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT id, crawler_version_id, evidence_json, executed_at FROM test_evidence WHERE crawler_version_id = ?1 ORDER BY executed_at COLLATE BINARY, id COLLATE BINARY",
+            [version_id.to_string()],
+        )
+        .await
+        .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
+    let mut evidence = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?
+    {
+        let stored = read_row(&row)?;
+        if stored.evidence.crawler_version_id != version_id {
+            return Err(TestEvidenceRepositoryError::CorruptState);
+        }
+        stored
+            .evidence
+            .validate()
+            .map_err(|_| TestEvidenceRepositoryError::CorruptState)?;
+        validate_references(connection, &stored.evidence).await?;
+        evidence.push(stored.evidence);
+    }
+    Ok(evidence)
+}
+
 fn read_row(row: &Row) -> Result<StoredEvidence, TestEvidenceRepositoryError> {
     let row_id = parse_evidence_id(
         &row.get::<String>(0)

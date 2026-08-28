@@ -3,6 +3,7 @@
 mod budget;
 mod canonicalization;
 mod collection;
+mod complete_snapshot;
 mod crawl_snapshot;
 mod crawler;
 mod crawler_version;
@@ -22,6 +23,7 @@ mod status;
 mod test_evidence;
 mod transition;
 mod url_matcher;
+mod version_validation;
 
 pub use budget::{
     DiscoveryBudgetCandidate, DiscoveryBudgetDecision, DiscoveryBudgetError,
@@ -32,6 +34,10 @@ pub use canonicalization::{
     CanonicalizationResult,
 };
 pub use collection::Collection;
+pub use complete_snapshot::{
+    CompleteSnapshotReason, CompleteSnapshotStructuralDecision, CompleteSnapshotStructuralInput,
+    CompleteSnapshotStructuralInputError, ExtractionHealth,
+};
 pub use crawl_snapshot::{
     CrawlRunSnapshot, CrawlRunSnapshotDraft, MAX_ROBOTS_OVERRIDE_REASON_CHARS, RobotsAudit,
     RobotsDecision, RunConfiguration, SnapshotError, SnapshotOperationalSettings, canonical_sha256,
@@ -76,3 +82,12 @@ pub use test_evidence::{
 };
 pub use transition::{DiscoveryTransition, TransitionBudget, TransitionGraph};
 pub use url_matcher::{SpecificityKey, UrlMatcher, UrlMatcherDefinition, UrlMatcherKind};
+pub use version_validation::{
+    CoreVersionValidationContributor, InvalidValidationIdentifier, MAX_VALIDATION_DETAIL_CHARS,
+    MAX_VALIDATION_DETAILS, MAX_VALIDATION_IDENTIFIER_CHARS, MAX_VALIDATION_ISSUES,
+    MAX_VALIDATION_ISSUES_PER_CONTRIBUTOR, MAX_VALIDATION_MESSAGE_CHARS, ValidationContributorKey,
+    ValidationIssueCode, ValidationSubjectKind, VersionValidationContext,
+    VersionValidationContribution, VersionValidationContributor, VersionValidationContributorError,
+    VersionValidationError, VersionValidationIssue, VersionValidationRegistry,
+    VersionValidationReport, VersionValidationSeverity, VersionValidationSubject,
+};

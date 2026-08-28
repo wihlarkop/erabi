@@ -775,6 +775,12 @@ fn crawler_discovery_repository_error(error: CrawlerRepositoryError, trace: &Tra
             "PERSISTED_STATE_INVALID",
             "The durable Crawler state failed validation.",
         ),
+        CrawlerRepositoryError::PublicationValidationFailed(_)
+        | CrawlerRepositoryError::PublicationValidationInfrastructure => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CRAWLER_PUBLICATION_VALIDATION_FAILED",
+            "Crawler publication validation could not complete safely.",
+        ),
         CrawlerRepositoryError::Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "CRAWLER_PERSISTENCE_FAILED",

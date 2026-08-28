@@ -24,6 +24,17 @@ async fn setup() -> Result<(ErabiDatabase, Crawler, CrawlerVersion), Box<dyn std
     let version = repository
         .create_draft(crawler.id(), "operator", "unix:1")
         .await?;
+    let mut version = repository
+        .version(crawler.id(), version.id())
+        .await?
+        .version;
+    version.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
+    repository
+        .save_draft(&version, "operator", "unix:1b")
+        .await?;
     Ok((database, crawler, version))
 }
 

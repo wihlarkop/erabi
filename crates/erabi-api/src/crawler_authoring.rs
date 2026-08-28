@@ -10,7 +10,9 @@ use erabi_db::{
     ErabiDatabase,
     repositories::{CrawlerRepository, CrawlerRepositoryError, CrawlerVersionRecord},
 };
-use erabi_domain::{Crawler, CrawlerId, CrawlerVersionId, CrawlerVersionState};
+use erabi_domain::{
+    Crawler, CrawlerId, CrawlerVersionId, CrawlerVersionState, VersionValidationReport,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -281,6 +283,34 @@ pub(crate) async fn publish_version(
     .await
 }
 
+pub(crate) async fn publish_validation(
+    State(state): State<AppState>,
+    Extension(trace): Extension<TraceId>,
+    Path((raw_crawler_id, raw_version_id)): Path<(String, String)>,
+) -> Response {
+    let (Ok(crawler_id), Ok(version_id)) = (
+        parse_crawler_id(&raw_crawler_id),
+        parse_version_id(&raw_version_id),
+    ) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_VERSION_ID",
+            "The CrawlerVersion identifier is invalid.",
+            &trace,
+        );
+    };
+    let Some(runtime) = state.crawler_authoring_runtime() else {
+        return unavailable(&trace);
+    };
+    match CrawlerRepository::new(runtime.database())
+        .publish_validation(crawler_id, version_id)
+        .await
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => crawler_error(error, &trace),
+    }
+}
+
 pub(crate) async fn reactivate_version(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -516,6 +546,14 @@ fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
             "PERSISTED_STATE_INVALID",
             "The durable Crawler state failed validation.",
         ),
+        CrawlerRepositoryError::PublicationValidationInfrastructure => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CRAWLER_PUBLICATION_VALIDATION_FAILED",
+            "Crawler publication validation could not complete safely.",
+        ),
+        CrawlerRepositoryError::PublicationValidationFailed(report) => {
+            return publication_validation_error(report, trace);
+        }
         CrawlerRepositoryError::Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "CRAWLER_PERSISTENCE_FAILED",
@@ -523,6 +561,68 @@ fn crawler_error(error: CrawlerRepositoryError, trace: &TraceId) -> Response {
         ),
     };
     api_error(status, code, message, trace)
+}
+
+fn publication_validation_error(report: VersionValidationReport, trace: &TraceId) -> Response {
+    match serde_json::to_value(report) {
+        Ok(details) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ApiErrorEnvelope::new(
+                "PUBLISH_VALIDATION_FAILED",
+                "The active Draft is not publishable.",
+                trace.as_str(),
+            )
+            .with_details(details),
+        ),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CRAWLER_PUBLICATION_VALIDATION_FAILED",
+            "Crawler publication validation could not complete safely.",
+            trace,
+        ),
+    }
+}
+
+pub(crate) fn publication_validation_openapi_schemas()
+-> std::collections::BTreeMap<&'static str, serde_json::Value> {
+    let mut schemas = std::collections::BTreeMap::new();
+    schemas.insert(
+        "VersionValidationSeverity",
+        serde_json::json!({"type":"string","enum":["BLOCKER","WARNING"]}),
+    );
+    schemas.insert(
+        "ValidationIssueCode",
+        serde_json::json!({"type":"string","pattern":"^[A-Za-z][A-Za-z0-9_-]{0,63}$"}),
+    );
+    schemas.insert(
+        "ValidationSubjectKind",
+        serde_json::json!({"type":"string","pattern":"^[A-Za-z][A-Za-z0-9_-]{0,63}$"}),
+    );
+    schemas.insert(
+        "VersionValidationSubject",
+        serde_json::json!({"type":"object","required":["kind","id"],"properties":{"kind":{"$ref":"#/components/schemas/ValidationSubjectKind"},"id":{"type":["string","null"],"maxLength":256}}}),
+    );
+    schemas.insert(
+        "VersionValidationIssue",
+        serde_json::json!({"type":"object","required":["code","severity","contributor","message","subject","details"],"properties":{"code":{"$ref":"#/components/schemas/ValidationIssueCode"},"severity":{"$ref":"#/components/schemas/VersionValidationSeverity"},"contributor":{"anyOf":[{"$ref":"#/components/schemas/ValidationContributorKey"},{"type":"null"}]},"message":{"type":"string","maxLength":512},"subject":{"anyOf":[{"$ref":"#/components/schemas/VersionValidationSubject"},{"type":"null"}]},"details":{"type":"object","additionalProperties":{"type":"string","maxLength":256}}}}),
+    );
+    schemas.insert(
+        "ValidationContributorKey",
+        serde_json::json!({"type":"string","pattern":"^[A-Za-z][A-Za-z0-9_-]{0,63}$"}),
+    );
+    schemas.insert(
+        "VersionValidationReport",
+        serde_json::json!({"type":"object","required":["version_id","config_hash","blockers","warnings","publishable"],"properties":{"version_id":{"type":"string","format":"uuid"},"config_hash":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},"blockers":{"type":"array","items":{"$ref":"#/components/schemas/VersionValidationIssue"}},"warnings":{"type":"array","items":{"$ref":"#/components/schemas/VersionValidationIssue"}},"publishable":{"type":"boolean"}}}),
+    );
+    schemas.insert(
+        "CrawlerVersionResponse",
+        serde_json::json!({"type":"object","required":["id","crawler_id","state","active_draft","active_published","seed_count","page_type_count","transition_count","config_hash","base_version_id","actor","occurred_at","warning_summary"],"properties":{"id":{"type":"string","format":"uuid"},"crawler_id":{"type":"string","format":"uuid"},"state":{"type":"string","enum":["DRAFT","PUBLISHED"]},"active_draft":{"type":"boolean"},"active_published":{"type":"boolean"},"seed_count":{"type":"integer","minimum":0},"page_type_count":{"type":"integer","minimum":0},"transition_count":{"type":"integer","minimum":0},"config_hash":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{64}$"},"base_version_id":{"type":["string","null"],"format":"uuid"},"actor":{"type":["string","null"]},"occurred_at":{"type":["string","null"]},"warning_summary":{"type":"array","items":{"type":"string","maxLength":512}}}}),
+    );
+    schemas.insert(
+        "PublishValidationFailed",
+        serde_json::json!({"type":"object","required":["code","message","details","trace_id"],"properties":{"code":{"const":"PUBLISH_VALIDATION_FAILED"},"message":{"type":"string"},"details":{"$ref":"#/components/schemas/VersionValidationReport"},"trace_id":{"type":"string"}}}),
+    );
+    schemas
 }
 
 fn unavailable(trace: &TraceId) -> Response {

@@ -6,7 +6,8 @@ use std::{
 use erabi_domain::{
     CanonicalizationPolicy, Crawler, CrawlerId, CrawlerVersion, CrawlerVersionGuardrails,
     CrawlerVersionId, CrawlerVersionState, DiscoveryTransition, DiscoveryTransitionId,
-    DomainScopePolicy, OperationalOverrides, PageType, PageTypeId, UrlMatcher, canonical_sha256,
+    DomainScopePolicy, OperationalOverrides, PageType, PageTypeId, UrlMatcher,
+    VersionValidationContext, VersionValidationRegistry, VersionValidationReport, canonical_sha256,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -93,6 +94,10 @@ pub enum CrawlerRepositoryError {
     ConcurrentVersionTransition,
     #[error("durable Crawler state is invalid")]
     CorruptState,
+    #[error("CrawlerVersion publication validation failed")]
+    PublicationValidationFailed(VersionValidationReport),
+    #[error("CrawlerVersion publication validation infrastructure failed")]
+    PublicationValidationInfrastructure,
     #[error("database operation failed")]
     Database(#[source] DbError),
 }
@@ -265,7 +270,7 @@ impl<'database> CrawlerRepository<'database> {
         while let Some(row) = rows.next().await.map_err(Self::database)? {
             let version = version_from_row(&row)?;
             validate_seed_projection(&connection, &version).await?;
-            load_transition_records(&connection, &version).await?;
+            load_transition_records(&connection, &version, true).await?;
             let audit = audit_metadata(&connection, version.id()).await?;
             versions.push(CrawlerVersionRecord { version, audit });
         }
@@ -295,7 +300,7 @@ impl<'database> CrawlerRepository<'database> {
             return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
         }
         validate_seed_projection(&connection, &version).await?;
-        load_transition_records(&connection, &version).await?;
+        load_transition_records(&connection, &version, true).await?;
         let audit = audit_metadata(&connection, version.id()).await?;
         Ok(CrawlerVersionRecord { version, audit })
     }
@@ -447,9 +452,49 @@ impl<'database> CrawlerRepository<'database> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(Self::database)?;
-        let result =
-            publish_in_transaction(&transaction, crawler_id, version_id, actor, occurred_at).await;
+        let result = publish_in_transaction(
+            &transaction,
+            crawler_id,
+            version_id,
+            actor,
+            occurred_at,
+            self.database.version_validation_registry(),
+        )
+        .await;
         finish_transaction!(transaction, result)
+    }
+
+    /// Runs the configured publication registry against one immutable Draft
+    /// snapshot without mutating the database. The result is advisory; the
+    /// publication transaction always runs validation again.
+    pub async fn publish_validation(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+    ) -> Result<VersionValidationReport, CrawlerRepositoryError> {
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .await
+            .map_err(Self::database)?;
+        let result = publication_validation_in_transaction(
+            &transaction,
+            crawler_id,
+            version_id,
+            self.database.version_validation_registry(),
+        )
+        .await;
+        match result {
+            Ok(report) => transaction
+                .commit()
+                .await
+                .map_err(Self::database)
+                .map(|()| report),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn publish_and_activate(
@@ -760,7 +805,7 @@ impl<'database> CrawlerRepository<'database> {
     ) -> Result<Vec<DiscoveryTransitionRecord>, CrawlerRepositoryError> {
         let version = self.version(crawler_id, version_id).await?;
         let connection = self.database.connection().await.map_err(Self::database)?;
-        load_transition_records(&connection, &version.version).await
+        load_transition_records(&connection, &version.version, true).await
     }
 
     /// Reads one typed transition while validating version ownership.
@@ -1514,7 +1559,7 @@ async fn insert_draft_in_transaction(
         actor,
         occurred_at,
         &version.id().to_string(),
-        audit_payload(version.id(), base_version_id, None),
+        audit_payload(version.id(), base_version_id, None, &[]),
     )
     .await
 }
@@ -1677,7 +1722,12 @@ async fn clone_draft_in_transaction(
         actor,
         occurred_at,
         &clone.id().to_string(),
-        audit_payload(clone.id(), Some(source_version_id), Some(hash.as_str())),
+        audit_payload(
+            clone.id(),
+            Some(source_version_id),
+            Some(hash.as_str()),
+            &[],
+        ),
     )
     .await?;
     Ok(clone)
@@ -1689,23 +1739,18 @@ async fn publish_in_transaction(
     version_id: CrawlerVersionId,
     actor: &str,
     occurred_at: &str,
+    registry: &VersionValidationRegistry,
 ) -> Result<CrawlerVersionRecord, CrawlerRepositoryError> {
-    let draft = load_version(connection, version_id).await?;
-    if draft.crawler_id() != crawler_id {
-        return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
+    let context = publication_validation_context(connection, crawler_id, version_id).await?;
+    let report = registry
+        .validate(&context)
+        .map_err(|_| CrawlerRepositoryError::PublicationValidationInfrastructure)?;
+    if !report.is_publishable() {
+        return Err(CrawlerRepositoryError::PublicationValidationFailed(report));
     }
-    if draft.state() != CrawlerVersionState::Draft {
-        return Err(CrawlerRepositoryError::VersionNotDraft);
-    }
-    let active_draft = active_draft_for(connection, crawler_id).await?;
-    if active_draft.as_deref() != Some(version_id.to_string().as_str()) {
-        return Err(if active_draft.is_some() {
-            CrawlerRepositoryError::InvalidLifecycleTransition
-        } else {
-            CrawlerRepositoryError::VersionNotDraft
-        });
-    }
-    let hash = semantic_hash(connection, &draft).await?;
+    let draft = context.version().clone();
+    let hash = report.config_hash.clone();
+    let warning_summary = report.warning_summary();
     let mut published = draft.clone();
     published
         .publish()
@@ -1739,7 +1784,12 @@ async fn publish_in_transaction(
         actor,
         occurred_at,
         &version_id.to_string(),
-        audit_payload(version_id, base_version_id, Some(hash.as_str())),
+        audit_payload(
+            version_id,
+            base_version_id,
+            Some(hash.as_str()),
+            &warning_summary,
+        ),
     )
     .await?;
     Ok(CrawlerVersionRecord {
@@ -1748,10 +1798,70 @@ async fn publish_in_transaction(
             actor: Some(actor.to_owned()),
             occurred_at: Some(occurred_at.to_owned()),
             config_hash: Some(hash),
-            warning_summary: Vec::new(),
+            warning_summary,
             base_version_id,
         },
     })
+}
+
+async fn publication_validation_in_transaction(
+    connection: &Connection,
+    crawler_id: CrawlerId,
+    version_id: CrawlerVersionId,
+    registry: &VersionValidationRegistry,
+) -> Result<VersionValidationReport, CrawlerRepositoryError> {
+    let context = publication_validation_context(connection, crawler_id, version_id).await?;
+    registry
+        .validate(&context)
+        .map_err(|_| CrawlerRepositoryError::PublicationValidationInfrastructure)
+}
+
+async fn publication_validation_context(
+    connection: &Connection,
+    crawler_id: CrawlerId,
+    version_id: CrawlerVersionId,
+) -> Result<VersionValidationContext, CrawlerRepositoryError> {
+    ensure_crawler_exists(connection, crawler_id).await?;
+    ensure_pointer_consistency(connection, crawler_id).await?;
+    let version = load_publication_version(connection, version_id).await?;
+    if version.crawler_id() != crawler_id {
+        return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
+    }
+    if version.state() != CrawlerVersionState::Draft {
+        return Err(CrawlerRepositoryError::VersionNotDraft);
+    }
+    let active_draft = active_draft_for(connection, crawler_id).await?;
+    if active_draft.as_deref() != Some(version_id.to_string().as_str()) {
+        return Err(if active_draft.is_some() {
+            CrawlerRepositoryError::InvalidLifecycleTransition
+        } else {
+            CrawlerRepositoryError::VersionNotDraft
+        });
+    }
+    let page_types = load_page_type_records(connection, &version).await?;
+    let transitions = load_transition_records(connection, &version, false).await?;
+    let config_hash = semantic_hash_with_semantic_validation(connection, &version, false).await?;
+    let evidence = super::test_evidence::load_for_version_in_transaction(connection, version_id)
+        .await
+        .map_err(|error| match error {
+            super::test_evidence::TestEvidenceRepositoryError::Database(error) => {
+                CrawlerRepositoryError::Database(error)
+            }
+            _ => CrawlerRepositoryError::CorruptState,
+        })?;
+    Ok(VersionValidationContext::new(
+        version,
+        page_types
+            .into_iter()
+            .map(|page_type| page_type.domain_page_type())
+            .collect(),
+        transitions
+            .into_iter()
+            .map(|transition| transition.transition)
+            .collect(),
+        evidence,
+        config_hash,
+    ))
 }
 
 async fn reactivate_in_transaction(
@@ -1785,7 +1895,7 @@ async fn reactivate_in_transaction(
         actor,
         occurred_at,
         &version_id.to_string(),
-        audit_payload(version_id, None, None),
+        audit_payload(version_id, None, None, &[]),
     )
     .await
 }
@@ -1916,8 +2026,8 @@ async fn load_semantic_snapshot(
     }
     validate_seed_projection(connection, &version).await?;
     let page_types = load_page_type_records(connection, &version).await?;
-    let transitions = load_transition_records(connection, &version).await?;
-    let config_hash = semantic_hash(connection, &version).await?;
+    let transitions = load_transition_records(connection, &version, true).await?;
+    let config_hash = semantic_hash_with_semantic_validation(connection, &version, true).await?;
     Ok(CrawlerSemanticSnapshot {
         version,
         page_types,
@@ -1947,7 +2057,7 @@ async fn load_mutation_version(
     // A mutation must not compound an existing mismatch between the declared
     // version projection and typed child rows.
     load_page_type_records(connection, &version).await?;
-    load_transition_records(connection, &version).await?;
+    load_transition_records(connection, &version, true).await?;
     Ok(version)
 }
 
@@ -2112,6 +2222,7 @@ async fn load_page_type_records(
 async fn load_transition_records(
     connection: &Connection,
     version: &CrawlerVersion,
+    validate_semantics: bool,
 ) -> Result<Vec<DiscoveryTransitionRecord>, CrawlerRepositoryError> {
     let declared = version
         .transition_ids()
@@ -2149,33 +2260,46 @@ async fn load_transition_records(
         let configuration: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
         let transition: DiscoveryTransition = serde_json::from_str(&configuration)
             .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-        if transition.id != id
-            || !version
-                .page_type_ids()
-                .contains(&transition.source_page_type_id)
-            || !version
-                .page_type_ids()
-                .contains(&transition.target_page_type_id)
-        {
+        if transition.id != id {
             return Err(CrawlerRepositoryError::CorruptState);
         }
-        ensure_page_type_belongs_to_version(
-            connection,
-            version.id(),
-            transition.source_page_type_id,
-        )
-        .await
-        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-        ensure_page_type_belongs_to_version(
-            connection,
-            version.id(),
-            transition.target_page_type_id,
-        )
-        .await
-        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-        transition
-            .validate()
+        if validate_semantics {
+            if !version
+                .page_type_ids()
+                .contains(&transition.source_page_type_id)
+                || !version
+                    .page_type_ids()
+                    .contains(&transition.target_page_type_id)
+            {
+                return Err(CrawlerRepositoryError::CorruptState);
+            }
+            ensure_page_type_belongs_to_version(
+                connection,
+                version.id(),
+                transition.source_page_type_id,
+            )
+            .await
             .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+            ensure_page_type_belongs_to_version(
+                connection,
+                version.id(),
+                transition.target_page_type_id,
+            )
+            .await
+            .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+            transition
+                .validate()
+                .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+        } else {
+            for page_type_id in [
+                transition.source_page_type_id,
+                transition.target_page_type_id,
+            ] {
+                if !version.page_type_ids().contains(&page_type_id) {
+                    ensure_missing_transition_page_type_is_absent(connection, page_type_id).await?;
+                }
+            }
+        }
         records.push(DiscoveryTransitionRecord {
             crawler_version_id: owner,
             transition,
@@ -2190,6 +2314,28 @@ async fn load_transition_records(
         return Err(CrawlerRepositoryError::CorruptState);
     }
     Ok(records)
+}
+
+async fn ensure_missing_transition_page_type_is_absent(
+    connection: &Connection,
+    page_type_id: PageTypeId,
+) -> Result<(), CrawlerRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT crawler_version_id FROM page_types WHERE id = ?1",
+            [page_type_id.to_string()],
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    if rows
+        .next()
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+        .is_some()
+    {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+    Ok(())
 }
 
 async fn load_matchers_for_page_type(
@@ -2493,6 +2639,29 @@ async fn load_version(
     Ok(version)
 }
 
+async fn load_publication_version(
+    connection: &Connection,
+    version_id: CrawlerVersionId,
+) -> Result<CrawlerVersion, CrawlerRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT id, crawler_id, state, semantic_configuration_json FROM crawler_versions WHERE id = ?1",
+            [version_id.to_string()],
+        )
+        .await
+        .map_err(CrawlerRepositoryError::database)?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(CrawlerRepositoryError::database)?
+    else {
+        return Err(CrawlerRepositoryError::CrawlerVersionNotFound);
+    };
+    let version = version_from_row_with_semantic_validation(&row, false)?;
+    validate_seed_projection(connection, &version).await?;
+    Ok(version)
+}
+
 fn crawler_from_row(row: &Row) -> Result<Crawler, CrawlerRepositoryError> {
     let id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
     let id = parse_crawler_id(&id)?;
@@ -2520,6 +2689,13 @@ fn crawler_from_row(row: &Row) -> Result<Crawler, CrawlerRepositoryError> {
 }
 
 fn version_from_row(row: &Row) -> Result<CrawlerVersion, CrawlerRepositoryError> {
+    version_from_row_with_semantic_validation(row, true)
+}
+
+fn version_from_row_with_semantic_validation(
+    row: &Row,
+    validate_semantics: bool,
+) -> Result<CrawlerVersion, CrawlerRepositoryError> {
     let row_id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
     let crawler_id: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
     let state: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
@@ -2536,9 +2712,11 @@ fn version_from_row(row: &Row) -> Result<CrawlerVersion, CrawlerRepositoryError>
     if version.id() != id || version.crawler_id() != owner || version.state() != expected_state {
         return Err(CrawlerRepositoryError::CorruptState);
     }
-    version
-        .validate_semantic_contract()
-        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+    if validate_semantics {
+        version
+            .validate_semantic_contract()
+            .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+    }
     Ok(version)
 }
 
@@ -2581,20 +2759,39 @@ async fn audit_metadata(
                 .and_then(Value::as_str)
                 .map(parse_version_id)
                 .transpose()?;
-            metadata.warning_summary = payload
-                .get("warning_summary")
-                .and_then(Value::as_array)
-                .map(|warnings| {
-                    warnings
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
+            metadata.warning_summary = audit_warning_summary(payload.get("warning_summary"))?;
         }
     }
     Ok(metadata)
+}
+
+fn audit_warning_summary(value: Option<&Value>) -> Result<Vec<String>, CrawlerRepositoryError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(CrawlerRepositoryError::CorruptState);
+    };
+    if values.len() > erabi_domain::MAX_VALIDATION_ISSUES {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+    let mut summary = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(CrawlerRepositoryError::CorruptState);
+        };
+        if value.is_empty()
+            || value.chars().count() > erabi_domain::MAX_VALIDATION_MESSAGE_CHARS
+            || value.chars().any(char::is_control)
+        {
+            return Err(CrawlerRepositoryError::CorruptState);
+        }
+        summary.push(value.to_owned());
+    }
+    if summary.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(CrawlerRepositoryError::CorruptState);
+    }
+    Ok(summary)
 }
 
 async fn base_version_from_audit(
@@ -2610,12 +2807,13 @@ fn audit_payload(
     version_id: CrawlerVersionId,
     base_version_id: Option<CrawlerVersionId>,
     config_hash: Option<&str>,
+    warning_summary: &[String],
 ) -> String {
     serde_json::json!({
         "version_id": version_id.to_string(),
         "base_version_id": base_version_id.map(|id| id.to_string()),
         "config_hash": config_hash,
-        "warning_summary": [],
+        "warning_summary": warning_summary,
     })
     .to_string()
 }
@@ -2892,10 +3090,21 @@ async fn semantic_hash(
     connection: &Connection,
     version: &CrawlerVersion,
 ) -> Result<String, CrawlerRepositoryError> {
-    version
-        .validate_semantic_contract()
-        .map_err(|_| CrawlerRepositoryError::CorruptState)?;
-    load_transition_records(connection, version).await?;
+    semantic_hash_with_semantic_validation(connection, version, true).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn semantic_hash_with_semantic_validation(
+    connection: &Connection,
+    version: &CrawlerVersion,
+    validate_semantics: bool,
+) -> Result<String, CrawlerRepositoryError> {
+    if validate_semantics {
+        version
+            .validate_semantic_contract()
+            .map_err(|_| CrawlerRepositoryError::CorruptState)?;
+    }
+    load_transition_records(connection, version, validate_semantics).await?;
     let mut version_json = serde_json::to_value(version).map_err(|error| {
         CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
     })?;
@@ -4450,8 +4659,15 @@ mod tests {
         let repository = CrawlerRepository::new(&database);
         let crawler = Crawler::new("Audit projection");
         repository.create(&crawler).await?;
-        let initial = repository
+        let mut initial = repository
             .create_draft(crawler.id(), "author-a", "2026-08-25T00:00:00Z")
+            .await?;
+        initial.add_seed(Seed::new(
+            "https://example.test/".parse()?,
+            "https://example.test/".parse()?,
+        ))?;
+        repository
+            .save_draft(&initial, "author-a", "2026-08-25T00:00:00Z")
             .await?;
         let initial = repository
             .publish(
@@ -4708,14 +4924,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
     async fn delayed_published_clone_winner_is_classified_after_bounded_retry()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let repository = CrawlerRepository::new(&database);
         let crawler = Crawler::new("Delayed clone contention");
         repository.create(&crawler).await?;
-        let published = repository
+        let mut published = repository
             .create_draft(crawler.id(), "author", "2026-08-25T00:00:00Z")
+            .await?;
+        published.add_seed(Seed::new(
+            "https://example.test/".parse()?,
+            "https://example.test/".parse()?,
+        ))?;
+        repository
+            .save_draft(&published, "author", "2026-08-25T00:00:00Z")
             .await?;
         repository
             .publish(
@@ -4785,7 +5009,7 @@ mod tests {
         );
         assert_eq!(
             count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
-            0
+            2
         );
         assert_eq!(
             count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
@@ -4896,8 +5120,15 @@ mod tests {
         let crawler = Crawler::new("Clone concurrency");
         let repository = CrawlerRepository::new(&database);
         repository.create(&crawler).await?;
-        let initial = repository
+        let mut initial = repository
             .create_draft(crawler.id(), "operator", "2026-08-25T00:00:00Z")
+            .await?;
+        initial.add_seed(Seed::new(
+            "https://example.test/".parse()?,
+            "https://example.test/".parse()?,
+        ))?;
+        repository
+            .save_draft(&initial, "operator", "2026-08-25T00:00:00Z")
             .await?;
         repository
             .publish(
@@ -4961,7 +5192,7 @@ mod tests {
         );
         assert_eq!(
             count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
-            0
+            2
         );
         assert_eq!(
             count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
@@ -5479,9 +5710,14 @@ mod tests {
         let repository = CrawlerRepository::new(&database);
         let crawler = Crawler::new("Discovery policy integrity");
         repository.create(&crawler).await?;
-        let draft = repository
+        let mut draft = repository
             .create_draft(crawler.id(), "operator", "now")
             .await?;
+        draft.add_seed(Seed::new(
+            "https://example.test/".parse()?,
+            "https://example.test/".parse()?,
+        ))?;
+        repository.save_draft(&draft, "operator", "now").await?;
         let page = repository
             .create_page_type(crawler.id(), draft.id(), "Cycle", 1, "operator", "now")
             .await?;

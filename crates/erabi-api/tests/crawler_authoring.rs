@@ -6,7 +6,8 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use erabi_api::{AppState, SecurityConfig, build_router};
-use erabi_db::{ErabiDatabase, MigrationRunner};
+use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
+use erabi_domain::{CrawlerId, CrawlerVersionId, Seed};
 use secrecy::SecretString;
 use tower::ServiceExt;
 
@@ -110,6 +111,36 @@ async fn crawler_authoring_routes_return_typed_lifecycle_dtos_and_errors()
     let version_id = draft["id"].as_str().ok_or("missing version id")?;
     assert_eq!(draft["state"], "DRAFT");
     assert!(draft["active_draft"].as_bool().unwrap_or(false));
+    let version_id =
+        CrawlerVersionId::from_uuid(version_id.parse()?).ok_or("invalid version id")?;
+    let typed_crawler_id = CrawlerId::from_uuid(crawler_id.parse()?).ok_or("invalid crawler id")?;
+    let repository = CrawlerRepository::new(&database);
+    let mut version_to_publish = repository
+        .version(typed_crawler_id, version_id)
+        .await?
+        .version;
+    version_to_publish.add_seed(Seed::new(
+        "https://example.test/".parse()?,
+        "https://example.test/".parse()?,
+    ))?;
+    repository
+        .save_draft(&version_to_publish, "operator", "unix:1b")
+        .await?;
+    let version_id = version_id.to_string();
+
+    let preflight = router
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation"),
+            "",
+        )?)
+        .await?;
+    assert_eq!(preflight.status(), StatusCode::OK);
+    let preflight = json(preflight).await?;
+    assert_eq!(preflight["version_id"], version_id);
+    assert_eq!(preflight["publishable"], true);
+    assert_eq!(preflight["blockers"], serde_json::json!([]));
 
     let duplicate = router
         .clone()
@@ -160,6 +191,34 @@ async fn crawler_authoring_routes_return_typed_lifecycle_dtos_and_errors()
     assert_eq!(read_version.status(), StatusCode::OK);
     assert_eq!(json(read_version).await?["id"], version_id);
 
+    let invalid_draft = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/api/v1/crawlers/{crawler_id}/drafts"),
+            r#"{"base_version_id":null}"#,
+        )?)
+        .await?;
+    assert_eq!(invalid_draft.status(), StatusCode::CREATED);
+    let invalid_draft = json(invalid_draft).await?;
+    let invalid_draft_id = invalid_draft["id"]
+        .as_str()
+        .ok_or("missing invalid draft id")?;
+    let blocked = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/api/v1/crawlers/{crawler_id}/versions/{invalid_draft_id}/publish"),
+            r#"{"actor":"operator"}"#,
+        )?)
+        .await?;
+    assert_eq!(blocked.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let blocked = json(blocked).await?;
+    assert_eq!(blocked["code"], "PUBLISH_VALIDATION_FAILED");
+    assert_eq!(blocked["details"]["version_id"], invalid_draft_id);
+    assert_eq!(blocked["details"]["publishable"], false);
+    assert_eq!(blocked["details"]["blockers"][0]["code"], "NO_ENABLED_SEED");
+
     let openapi = router
         .oneshot(request("GET", "/api/v1/openapi.json", "")?)
         .await?;
@@ -174,6 +233,12 @@ async fn crawler_authoring_routes_return_typed_lifecycle_dtos_and_errors()
             .get("/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate")
             .is_some()
     );
+    assert!(
+        openapi["paths"]
+            .get("/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation")
+            .is_some()
+    );
+    assert!(openapi["components"]["schemas"]["VersionValidationReport"].is_object());
     Ok(())
 }
 
