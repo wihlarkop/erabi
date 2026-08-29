@@ -278,6 +278,9 @@ impl CrawlerExecuteRequest {
             || url_text.chars().any(char::is_control)
             || target_url.host_str().is_none()
             || !matches!(target_url.scheme(), "http" | "https")
+            || !target_url.username().is_empty()
+            || target_url.password().is_some()
+            || target_url.fragment().is_some()
         {
             return Err(CrawlerRequestError::InvalidHttpUrl);
         }
@@ -830,7 +833,12 @@ fn validate_absolute_http_url(value: &str) -> Result<(), CrawlerAdapterError> {
         return Err(CrawlerAdapterError::InvalidProviderResponse);
     }
     let parsed = Url::parse(value).map_err(|_| CrawlerAdapterError::InvalidProviderResponse)?;
-    if parsed.host_str().is_none() || !matches!(parsed.scheme(), "http" | "https") {
+    if parsed.host_str().is_none()
+        || !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(CrawlerAdapterError::InvalidProviderResponse);
     }
     Ok(())

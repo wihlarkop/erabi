@@ -344,6 +344,24 @@ fn record(
     }
 }
 
+#[test]
+fn execution_record_debug_redacts_url_query_values() {
+    let record = record(
+        CrawlExecutionId::new(),
+        CrawlRunId::new(),
+        "https://example.test/requested?token=secret",
+        "https://example.test/canonical?token=secret",
+        Some("https://example.test/final?token=secret"),
+        CrawlExecutionOutcome::Completed,
+        None,
+    );
+
+    let debug = format!("{record:?}");
+    assert!(!debug.contains("secret"));
+    assert!(!debug.contains("token="));
+    assert!(debug.contains("https://example.test/requested"));
+}
+
 #[tokio::test]
 async fn existing_0001_through_0004_database_upgrades_and_preserves_snapshots()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -979,6 +997,41 @@ async fn malformed_result_and_summary_state_fails_closed_on_reads()
         .await?;
     assert!(matches!(
         repository.summary(run_id).await,
+        Err(CrawlExecutionRepositoryError::CorruptState)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_repository_rejects_tampered_run_snapshot_projections()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (directory, database, run_id) =
+        quick_setup("https://example.test/snapshot-integrity").await?;
+    let repository = CrawlExecutionRepository::new(&database);
+    let expected = record(
+        CrawlExecutionId::new(),
+        run_id,
+        "https://example.test/snapshot-integrity",
+        "https://example.test/snapshot-integrity",
+        None,
+        CrawlExecutionOutcome::Completed,
+        None,
+    );
+    repository.persist(&expected).await?;
+
+    let connection = raw_connection(&directory).await?;
+    connection
+        .execute_batch("DROP TRIGGER crawl_runs_snapshot_immutable")
+        .await?;
+    connection
+        .execute(
+            "UPDATE crawl_runs SET snapshot_hash = ?1 WHERE id = ?2",
+            ("0".repeat(64), run_id.to_string()),
+        )
+        .await?;
+
+    assert!(matches!(
+        repository.read(expected.id).await,
         Err(CrawlExecutionRepositoryError::CorruptState)
     ));
     Ok(())

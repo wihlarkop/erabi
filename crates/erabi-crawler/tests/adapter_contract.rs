@@ -383,6 +383,28 @@ fn request_and_value_validation_is_bounded() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn credential_and_fragment_request_urls_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    for target_url in [
+        "https://user:password@example.test",
+        "https://example.test/fragment#section",
+    ] {
+        assert!(matches!(
+            CrawlerExecuteRequest::try_new(
+                url(target_url)?,
+                Duration::from_secs(1),
+                "agent",
+                RenderingRequirement::RawHtml,
+                None,
+                None,
+                CrawlerEvidencePolicy::default(),
+            ),
+            Err(CrawlerRequestError::InvalidHttpUrl)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn value_validation_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
     assert!(AutoScrollPolicy::new(MAX_CRAWLER_AUTO_SCROLL_STEPS + 1).is_err());
     assert!(CrawlerMediaType::new(" \t").is_err());
@@ -529,6 +551,21 @@ fn invalid_final_urls_and_artifact_identity_fail_closed() -> Result<(), Box<dyn 
         false,
     );
     assert_eq!(invalid, Err(CrawlerAdapterError::InvalidProviderResponse));
+    for final_url in [
+        "https://user:password@example.test/final",
+        "https://example.test/final#section",
+    ] {
+        assert_eq!(
+            CrawlerExecuteResult::try_new(
+                &request,
+                page(request.target_url().as_str(), Some(final_url)),
+                CrawlerResponseMetadata::try_new(None, None, None, None)?,
+                Vec::new(),
+                false,
+            ),
+            Err(CrawlerAdapterError::InvalidProviderResponse)
+        );
+    }
 
     let mut observation = page(request.target_url().as_str(), None);
     observation
@@ -551,7 +588,7 @@ fn invalid_final_urls_and_artifact_identity_fail_closed() -> Result<(), Box<dyn 
 fn observation_and_result_debug_are_redacted_and_summarized()
 -> Result<(), Box<dyn std::error::Error>> {
     let request = request(
-        "https://example.test/start?token=secret#fragment",
+        "https://example.test/start?token=secret",
         CrawlerEvidencePolicy {
             raw_html: true,
             ..CrawlerEvidencePolicy::default()

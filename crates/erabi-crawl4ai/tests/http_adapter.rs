@@ -611,6 +611,30 @@ async fn target_failures_remain_distinct_from_provider_failures() -> Result<(), 
         };
         assert_eq!(error, expected);
     }
+
+    let mut result = base_result();
+    result["success"] = json!(false);
+    result["status_code"] = json!(429);
+    result["response_headers"] = json!({ "retry-after": "2" });
+    let server = FixtureServer::start(FixtureResponse::json(200, &crawl_body(&result))?).await?;
+    let adapter = adapter(&server, None)?;
+    let Err(error) = adapter
+        .execute(request_with(
+            CrawlerEvidencePolicy::default(),
+            None,
+            None,
+            Duration::from_secs(5),
+        )?)
+        .await
+    else {
+        return Err(fixture_error("rate-limited target was accepted").into());
+    };
+    assert_eq!(
+        error,
+        CrawlerAdapterError::RateLimited {
+            retry_after_ms: Some(2_000),
+        }
+    );
     Ok(())
 }
 

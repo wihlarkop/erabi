@@ -223,7 +223,10 @@ fn normalize_crawl_response(
         .transpose()?;
 
     if !result.success {
-        return Err(map_target_failure(status_code));
+        return Err(map_target_failure(
+            status_code,
+            result.response_headers.as_ref(),
+        ));
     }
 
     let final_url = result
@@ -366,12 +369,15 @@ fn header_string(
     }
 }
 
-fn map_target_failure(status_code: Option<u16>) -> CrawlerAdapterError {
+fn map_target_failure(
+    status_code: Option<u16>,
+    response_headers: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> CrawlerAdapterError {
     match status_code {
         Some(401 | 403) => CrawlerAdapterError::AccessDenied,
         Some(404) => CrawlerAdapterError::NotFound,
         Some(429) => CrawlerAdapterError::RateLimited {
-            retry_after_ms: None,
+            retry_after_ms: retry_after_from_provider_headers(response_headers),
         },
         Some(status_code @ 500..=599) => CrawlerAdapterError::RemoteFailure {
             status_code: Some(status_code),
@@ -396,6 +402,22 @@ fn map_provider_status(
 
 fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    retry_after_value_ms(value)
+}
+
+fn retry_after_from_provider_headers(
+    headers: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Option<u64> {
+    let value = headers?
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))?
+        .1
+        .as_str()?
+        .trim();
+    retry_after_value_ms(value)
+}
+
+fn retry_after_value_ms(value: &str) -> Option<u64> {
     let seconds = value.parse::<u64>().ok()?;
     if seconds > MAX_RETRY_AFTER_SECONDS {
         return None;

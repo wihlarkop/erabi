@@ -1,4 +1,7 @@
-use std::collections::{BTreeSet, HashSet};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt,
+};
 
 use erabi_domain::{
     CrawlExecutionErrorCode, CrawlExecutionId, CrawlExecutionOutcome, CrawlRunId, CrawlRunSnapshot,
@@ -32,7 +35,7 @@ pub struct CrawlExecutionArtifact {
 }
 
 /// Durable provider-neutral evidence for one page execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CrawlExecutionRecord {
     pub id: CrawlExecutionId,
     pub crawl_run_id: CrawlRunId,
@@ -50,6 +53,33 @@ pub struct CrawlExecutionRecord {
     pub content_length_bytes: Option<u64>,
     pub provider_elapsed_ms: Option<u64>,
     pub artifacts: Vec<CrawlExecutionArtifact>,
+}
+
+impl fmt::Debug for CrawlExecutionRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CrawlExecutionRecord")
+            .field("id", &self.id)
+            .field("crawl_run_id", &self.crawl_run_id)
+            .field("requested_url", &safe_url_identity(&self.requested_url))
+            .field("canonical_url", &safe_url_identity(&self.canonical_url))
+            .field(
+                "observed_final_url",
+                &self.observed_final_url.as_deref().map(safe_url_identity),
+            )
+            .field("source_id", &self.source_id)
+            .field("page_type_id", &self.page_type_id)
+            .field("transition_id", &self.transition_id)
+            .field("discovered_url_id", &self.discovered_url_id)
+            .field("outcome", &self.outcome)
+            .field("error_code", &self.error_code)
+            .field("http_status", &self.http_status)
+            .field("media_type", &self.media_type)
+            .field("content_length_bytes", &self.content_length_bytes)
+            .field("provider_elapsed_ms", &self.provider_elapsed_ms)
+            .field("artifacts", &self.artifacts)
+            .finish()
+    }
 }
 
 /// Durable structural facts consumed by later run finalization.
@@ -833,7 +863,7 @@ async fn load_run_context(
 ) -> Result<RunContext, CrawlExecutionRepositoryError> {
     let row = connection
         .prepare(
-            "SELECT id, run_type, crawler_id, crawler_version_id, snapshot_json FROM crawl_runs WHERE id = ?1",
+            "SELECT id, run_type, crawler_id, crawler_version_id, snapshot_json, snapshot_hash, checkpoint_compatibility_hash FROM crawl_runs WHERE id = ?1",
         )
         .await
         .map_err(CrawlExecutionRepositoryError::database)?
@@ -869,6 +899,17 @@ async fn load_run_context(
         .map_err(CrawlExecutionRepositoryError::database)?;
     let snapshot: CrawlRunSnapshot = serde_json::from_str(&snapshot_json)
         .map_err(|_| CrawlExecutionRepositoryError::CorruptState)?;
+    let stored_snapshot_hash: String = row
+        .get(5)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let stored_checkpoint_compatibility_hash: String = row
+        .get(6)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    if snapshot.snapshot_hash() != stored_snapshot_hash
+        || snapshot.checkpoint_compatibility_hash() != stored_checkpoint_compatibility_hash
+    {
+        return Err(CrawlExecutionRepositoryError::CorruptState);
+    }
     if snapshot.run_type() != run_type {
         return Err(CrawlExecutionRepositoryError::CorruptState);
     }
@@ -1019,6 +1060,17 @@ fn validate_http_url(value: &str) -> Result<(), CrawlExecutionRepositoryError> {
         ));
     }
     Ok(())
+}
+
+fn safe_url_identity(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "<invalid-url>".to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn validate_outcome_error(
