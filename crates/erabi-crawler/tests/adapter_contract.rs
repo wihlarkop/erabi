@@ -8,9 +8,10 @@ use erabi_crawler::{
     CrawlerResultCompleteness, CrawlerValueError, DeterministicMockAdapter,
     DeterministicMockHealth, MAX_CRAWLER_AUTO_SCROLL_STEPS, MAX_CRAWLER_DISCOVERED_LINKS,
     MAX_CRAWLER_PAGINATION_OBSERVATIONS, MAX_CRAWLER_SCREENSHOT_BYTES, MAX_CRAWLER_SELECTOR_CHARS,
-    MAX_CRAWLER_SELECTOR_OBSERVATIONS, MAX_CRAWLER_TEXT_ARTIFACT_BYTES,
-    MAX_CRAWLER_USER_AGENT_CHARS, MockCrawlerFixture, ObservedLink, PageObservation,
-    PaginationObservation, RenderingRequirement, ScreenshotPolicy, SelectorObservation,
+    MAX_CRAWLER_SELECTOR_OBSERVATIONS, MAX_CRAWLER_TEXT_ARTIFACT_BYTES, MAX_CRAWLER_URL_CHARS,
+    MAX_CRAWLER_USER_AGENT_CHARS, MockAdapterConfigError, MockCrawlerFixture, ObservedLink,
+    PageObservation, PaginationObservation, RenderingRequirement, ScreenshotPolicy,
+    SelectorObservation,
 };
 use erabi_domain::PaginationKind;
 
@@ -450,10 +451,66 @@ fn observation_and_response_bounds_fail_closed() -> Result<(), Box<dyn std::erro
         Err(CrawlerAdapterError::InvalidProviderResponse)
     );
 
+    let mut oversized_href = page(request.target_url().as_str(), None);
+    oversized_href.discovered_links = vec![ObservedLink {
+        raw_href: "x".repeat(MAX_CRAWLER_URL_CHARS + 1),
+        selector: None,
+    }];
+    assert_eq!(
+        CrawlerExecuteResult::try_new(
+            &request,
+            oversized_href,
+            CrawlerResponseMetadata::try_new(None, None, None, None)?,
+            Vec::new(),
+            false,
+        ),
+        Err(CrawlerAdapterError::InvalidProviderResponse)
+    );
+
+    let mut control_character_href = page(request.target_url().as_str(), None);
+    control_character_href.discovered_links = vec![ObservedLink {
+        raw_href: "/next\n".to_owned(),
+        selector: None,
+    }];
+    assert_eq!(
+        CrawlerExecuteResult::try_new(
+            &request,
+            control_character_href,
+            CrawlerResponseMetadata::try_new(None, None, None, None)?,
+            Vec::new(),
+            false,
+        ),
+        Err(CrawlerAdapterError::InvalidProviderResponse)
+    );
+
     assert_eq!(
         CrawlerResponseMetadata::try_new(Some(600), None, None, None),
         Err(CrawlerAdapterError::InvalidProviderResponse)
     );
+    Ok(())
+}
+
+#[test]
+fn empty_raw_href_is_accepted_and_preserved() -> Result<(), Box<dyn std::error::Error>> {
+    let request = request(
+        "https://example.test/empty-href",
+        CrawlerEvidencePolicy::default(),
+    )?;
+    let mut observation = page(request.target_url().as_str(), None);
+    observation.discovered_links = vec![ObservedLink {
+        raw_href: String::new(),
+        selector: Some("a.empty".to_owned()),
+    }];
+
+    let result = CrawlerExecuteResult::try_new(
+        &request,
+        observation,
+        CrawlerResponseMetadata::try_new(None, None, None, None)?,
+        Vec::new(),
+        false,
+    )?;
+
+    assert_eq!(result.observation().discovered_links[0].raw_href, "");
     Ok(())
 }
 
@@ -668,6 +725,30 @@ async fn fixture_lookup_is_explicit_and_insertion_order_independent()
             .await,
         Err(CrawlerAdapterError::Timeout)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_fixture_rejection_preserves_first_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target_url = url("https://example.test/duplicate")?;
+    let mut adapter = DeterministicMockAdapter::new(DeterministicMockHealth::Healthy(health()?));
+    adapter.insert_fixture(&target_url, MockCrawlerFixture::Timeout)?;
+
+    assert_eq!(
+        adapter.insert_fixture(&target_url, MockCrawlerFixture::NotFound),
+        Err(MockAdapterConfigError::DuplicateFixtureUrl)
+    );
+    assert_eq!(
+        adapter
+            .execute(request(
+                target_url.as_str(),
+                CrawlerEvidencePolicy::default(),
+            )?)
+            .await,
+        Err(CrawlerAdapterError::Timeout)
+    );
+    assert_eq!(adapter.fixture_count(), 1);
     Ok(())
 }
 

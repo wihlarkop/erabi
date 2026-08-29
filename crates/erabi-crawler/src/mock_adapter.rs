@@ -1,6 +1,9 @@
 //! Deterministic, network-free adapter fixtures.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fmt,
+};
 
 use url::Url;
 
@@ -74,14 +77,13 @@ impl DeterministicMockAdapter {
         target_url: &Url,
         fixture: MockCrawlerFixture,
     ) -> Result<(), MockAdapterConfigError> {
-        if self
-            .fixtures
-            .insert(target_url.as_str().to_owned(), fixture)
-            .is_some()
-        {
-            return Err(MockAdapterConfigError::DuplicateFixtureUrl);
+        match self.fixtures.entry(target_url.as_str().to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(fixture);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(MockAdapterConfigError::DuplicateFixtureUrl),
         }
-        Ok(())
     }
 
     #[must_use]

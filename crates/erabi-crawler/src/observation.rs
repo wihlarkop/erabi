@@ -37,8 +37,7 @@ impl PageObservation {
             return Err(ObservationValidationError::Invalid);
         }
         for link in &self.discovered_links {
-            if link.raw_href.is_empty()
-                || link.raw_href.chars().count() > MAX_CRAWLER_URL_CHARS
+            if link.raw_href.chars().count() > MAX_CRAWLER_URL_CHARS
                 || link.raw_href.chars().any(char::is_control)
                 || link.selector.as_deref().is_some_and(|selector| {
                     selector.is_empty()
