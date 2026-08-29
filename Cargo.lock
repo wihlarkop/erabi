@@ -751,6 +751,7 @@ version = "0.1.0"
 dependencies = [
  "erabi-db",
  "erabi-domain",
+ "reqwest",
  "thiserror",
  "tokio",
  "url",

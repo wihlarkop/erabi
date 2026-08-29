@@ -10,8 +10,10 @@ workspace = true
 [dependencies]
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
+reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["net", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "rt-multi-thread", "sync"] }

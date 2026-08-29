@@ -9,6 +9,7 @@ mod identity;
 mod job;
 mod progress;
 mod run;
+mod source;
 mod test_evidence;
 
 pub use artifact::ArtifactRepository;
@@ -42,4 +43,5 @@ pub use progress::{
     ProgressSequence, ProgressTerminalState,
 };
 pub use run::{CrawlRunRepository, CrawlRunRepositoryError};
+pub use source::{NewSource, SourceRepository, SourceRepositoryError};
 pub use test_evidence::{TestEvidenceRecord, TestEvidenceRepository, TestEvidenceRepositoryError};
