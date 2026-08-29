@@ -3,6 +3,7 @@
 mod artifact;
 mod checkpoint;
 mod configuration;
+mod crawl_execution;
 mod crawler;
 mod identity;
 mod job;
@@ -19,6 +20,10 @@ pub use checkpoint::{
     MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
 };
 pub use configuration::ConfigurationRepository;
+pub use crawl_execution::{
+    CrawlExecutionArtifact, CrawlExecutionArtifactKind, CrawlExecutionRecord,
+    CrawlExecutionRepository, CrawlExecutionRepositoryError, CrawlExecutionSummary,
+};
 pub use crawler::{
     CrawlerAuditMetadata, CrawlerEvaluationSnapshot, CrawlerPointers, CrawlerRepository,
     CrawlerRepositoryError, CrawlerSemanticSnapshot, CrawlerVersionRecord,

@@ -40,6 +40,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "jobs",
         include_str!("../../../migrations/0004_jobs.sql"),
     ),
+    (
+        "0005",
+        "crawl_execution",
+        include_str!("../../../migrations/0005_crawl_execution.sql"),
+    ),
 ];
 
 /// One ordered SQL migration owned by Erabi.

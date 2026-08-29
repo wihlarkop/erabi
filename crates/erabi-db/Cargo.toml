@@ -15,6 +15,7 @@ sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 turso = "0.7.2"
+url = "2.5.8"
 uuid = { version = "1.25.0", features = ["v7"] }
 
 [dev-dependencies]

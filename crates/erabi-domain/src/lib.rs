@@ -4,6 +4,7 @@ mod budget;
 mod canonicalization;
 mod collection;
 mod complete_snapshot;
+mod crawl_execution;
 mod crawl_snapshot;
 mod crawler;
 mod crawler_version;
@@ -38,6 +39,7 @@ pub use complete_snapshot::{
     CompleteSnapshotReason, CompleteSnapshotStructuralDecision, CompleteSnapshotStructuralInput,
     CompleteSnapshotStructuralInputError, ExtractionHealth,
 };
+pub use crawl_execution::{CrawlExecutionErrorCode, CrawlExecutionOutcome};
 pub use crawl_snapshot::{
     CrawlRunSnapshot, CrawlRunSnapshotDraft, MAX_ROBOTS_OVERRIDE_REASON_CHARS, RobotsAudit,
     RobotsDecision, RunConfiguration, SnapshotError, SnapshotOperationalSettings, canonical_sha256,
@@ -55,9 +57,9 @@ pub use guardrails::{
     PageTypeDiscoveryGuardrails, ResolvedOperationalLimits,
 };
 pub use id::{
-    ArtifactId, CanonicalizationPolicyId, CollectionId, CrawlRunId, CrawlerId, CrawlerVersionId,
-    DiscoveryTransitionId, DomainScopeId, PageTypeId, RunProfileId, SeedId, SourceId,
-    TestEvidenceId,
+    ArtifactId, CanonicalizationPolicyId, CollectionId, CrawlExecutionId, CrawlRunId, CrawlerId,
+    CrawlerVersionId, DiscoveryTransitionId, DomainScopeId, PageTypeId, RunProfileId, SeedId,
+    SourceId, TestEvidenceId,
 };
 pub use matching::{PageTypeCandidate, PageTypeMatchDecision, resolve_page_type};
 pub use naming::{derive_dataset_name, derive_source_name};

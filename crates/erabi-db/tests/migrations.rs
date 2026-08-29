@@ -1,13 +1,13 @@
 use erabi_db::{DbError, ErabiDatabase, Migration, MigrationFailureState, MigrationRunner};
 
 #[tokio::test]
-async fn empty_database_applies_the_complete_plan_04_task_1_chain()
+async fn empty_database_applies_the_complete_migration_chain()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
     let runner = MigrationRunner::default();
 
     let report = runner.apply(&database).await?;
-    assert_eq!(report.applied, ["0001", "0002", "0003", "0004"]);
+    assert_eq!(report.applied, ["0001", "0002", "0003", "0004", "0005"]);
     assert_eq!(
         runner
             .status(&database)
@@ -15,13 +15,13 @@ async fn empty_database_applies_the_complete_plan_04_task_1_chain()
             .into_iter()
             .map(|version| version.version)
             .collect::<Vec<_>>(),
-        ["0001", "0002", "0003", "0004"]
+        ["0001", "0002", "0003", "0004", "0005"]
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn supported_0001_baseline_migrates_to_the_current_plan_04_task_1_schema()
+async fn supported_0001_baseline_migrates_to_the_current_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
     let runner = MigrationRunner::default();
@@ -32,7 +32,7 @@ async fn supported_0001_baseline_migrates_to_the_current_plan_04_task_1_schema()
     );
     assert_eq!(
         runner.apply(&database).await?.applied,
-        ["0002", "0003", "0004"]
+        ["0002", "0003", "0004", "0005"]
     );
     Ok(())
 }
@@ -71,8 +71,8 @@ fn migration_plan_rejects_out_of_order_versions() {
 }
 
 #[test]
-fn plan_04_task_1_adds_only_its_declared_jobs_migration() -> Result<(), Box<dyn std::error::Error>>
-{
+fn migration_directory_contains_the_historical_chain_and_task_3_migration()
+-> Result<(), Box<dyn std::error::Error>> {
     let migrations = std::fs::read_dir(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations"),
     )?
@@ -86,7 +86,8 @@ fn plan_04_task_1_adds_only_its_declared_jobs_migration() -> Result<(), Box<dyn 
             "0001_system.sql",
             "0002_crawler_core.sql",
             "0003_runs.sql",
-            "0004_jobs.sql"
+            "0004_jobs.sql",
+            "0005_crawl_execution.sql"
         ]
     );
     Ok(())
