@@ -3,6 +3,7 @@ name = "erabi-crawler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [lints]
 workspace = true
@@ -12,8 +13,29 @@ erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["net", "time"] }
+httpdate = "1.0.3"
+tokio = { version = "1.53.1", features = ["net", "sync", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["io-util", "macros", "rt-multi-thread", "sync"] }
+
+[[test]]
+name = "adapter_contract"
+path = "tests/adapter_contract.rs"
+
+[[test]]
+name = "discovery_preview"
+path = "tests/discovery_preview.rs"
+
+[[test]]
+name = "source_intake"
+path = "tests/source_intake.rs"
+
+[[test]]
+name = "test_lab"
+path = "tests/test_lab.rs"
+
+[[test]]
+name = "test_lab_regressions"
+path = "tests/test_lab_regressions.rs"
