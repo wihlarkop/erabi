@@ -7,7 +7,7 @@ use std::sync::{
 
 use erabi_crawler::{
     DiscoveryPreviewProvider, DiscoveryPreviewService, ExtractionTestHook, PreviewClock,
-    TestLabProvider, TestLabService,
+    QuickScrapeSubmissionService, TestLabProvider, TestLabService,
 };
 use erabi_db::ErabiDatabase;
 use erabi_jobs::{
@@ -99,6 +99,7 @@ pub struct AppState {
     crawler_authoring: Option<Arc<CrawlerAuthoringService>>,
     test_lab: Option<Arc<TestLabService>>,
     discovery_preview: Option<Arc<DiscoveryPreviewService>>,
+    quick_scrape: Option<Arc<QuickScrapeSubmissionService>>,
     storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
@@ -124,6 +125,7 @@ impl AppState {
             crawler_authoring: None,
             test_lab: None,
             discovery_preview: None,
+            quick_scrape: None,
             storage_pressure: None,
         }
     }
@@ -215,6 +217,14 @@ impl AppState {
         self
     }
 
+    /// Attaches the provider-neutral single-URL Quick Scrape submission
+    /// service. Provider execution remains owned by the durable jobs runtime.
+    #[must_use]
+    pub fn with_quick_scrape_runtime(mut self, service: QuickScrapeSubmissionService) -> Self {
+        self.quick_scrape = Some(Arc::new(service));
+        self
+    }
+
     #[must_use]
     pub(crate) fn job_actions_runtime(&self) -> Option<Arc<JobActionRuntimeState>> {
         self.job_actions.clone()
@@ -230,6 +240,10 @@ impl AppState {
 
     pub(crate) fn discovery_preview_runtime(&self) -> Option<Arc<DiscoveryPreviewService>> {
         self.discovery_preview.clone()
+    }
+
+    pub(crate) fn quick_scrape_runtime(&self) -> Option<Arc<QuickScrapeSubmissionService>> {
+        self.quick_scrape.clone()
     }
 
     /// Attaches the typed storage-pressure state shared with worker admission.

@@ -697,6 +697,8 @@ dependencies = [
  "axum",
  "dotenvy",
  "erabi-api",
+ "erabi-crawl4ai",
+ "erabi-crawler",
  "erabi-db",
  "erabi-jobs",
  "secrecy",
@@ -753,6 +755,7 @@ dependencies = [
  "erabi-domain",
  "httpdate",
  "reqwest",
+ "serde_json",
  "thiserror",
  "tokio",
  "url",
@@ -800,13 +803,18 @@ version = "0.1.0"
 name = "erabi-jobs"
 version = "0.1.0"
 dependencies = [
+ "erabi-crawler",
  "erabi-db",
  "erabi-domain",
  "fs4 1.1.0",
  "futures-util",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]

@@ -11,6 +11,8 @@ workspace = true
 axum = "0.8.9"
 dotenvy = "0.15.7"
 erabi-api = { version = "0.1.0", path = "../erabi-api" }
+erabi-crawl4ai = { version = "0.1.0", path = "../erabi-crawl4ai" }
+erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }
 secrecy = "0.10.3"

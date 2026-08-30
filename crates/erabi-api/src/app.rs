@@ -41,6 +41,7 @@ use crate::{
         update_page_type,
     },
     progress::job_progress_sse,
+    quick_scrape::start_quick_scrape,
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
     test_lab::{list_test_evidence, read_test_evidence, run_test_lab, test_lab_openapi_schemas},
 };
@@ -92,6 +93,7 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .merge(documentation)
         .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
+        .route("/api/v1/quick-scrapes", post(start_quick_scrape))
         .route("/api/v1/crawlers", get(list_crawlers).post(create_crawler))
         .route("/api/v1/crawlers/{crawler_id}", get(read_crawler))
         .route("/api/v1/crawlers/{crawler_id}/versions", get(list_versions))
@@ -428,6 +430,10 @@ impl OpenApiDocument {
         let mut paths = BTreeMap::new();
         paths.insert("/api/v1/health", OpenApiPath::get("Liveness"));
         paths.insert("/api/v1/readiness", OpenApiPath::get("Readiness"));
+        paths.insert(
+            "/api/v1/quick-scrapes",
+            OpenApiPath::post("Accept one durable Quick Scrape URL"),
+        );
         paths.insert(
             "/api/v1/diagnostics/status",
             OpenApiPath::get("Safe runtime diagnostics"),

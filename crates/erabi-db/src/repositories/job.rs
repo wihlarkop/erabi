@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use erabi_domain::{CrawlRunId, CrawlRunSnapshot, CrawlRunStatus};
+use erabi_domain::{CrawlRunId, CrawlRunSnapshot, CrawlRunStatus, RunConfiguration};
 use turso::{Connection, transaction::TransactionBehavior};
 use uuid::Uuid;
 
@@ -163,6 +163,14 @@ pub struct NewJob {
     pub crawl_run_id: Option<String>,
     pub scheduled_at: i64,
     pub max_attempts: u32,
+}
+
+/// Durable identities returned only after an initial Quick Scrape run and its
+/// viable root job have committed together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuickScrapeRunJob {
+    pub crawl_run_id: CrawlRunId,
+    pub job_id: JobId,
 }
 
 impl NewJob {
@@ -368,6 +376,85 @@ impl<'database> JobRepository<'database> {
         Self { database }
     }
 
+    /// Atomically creates the immutable Quick Scrape run and its root durable
+    /// job. Source intake intentionally happens before this boundary; this
+    /// transaction owns the invariant that neither a run nor a root job can be
+    /// committed without the other.
+    ///
+    /// # Errors
+    /// Returns a typed invariant or durable database failure and rolls back
+    /// both inserts when either insert cannot complete.
+    pub async fn create_quick_scrape_run_with_root_job(
+        &self,
+        snapshot: &CrawlRunSnapshot,
+        job: &NewJob,
+        now: i64,
+    ) -> Result<QuickScrapeRunJob, JobRepositoryError> {
+        if !matches!(
+            snapshot.configuration(),
+            RunConfiguration::QuickScrape { .. }
+        ) || job.parent_job_id.is_some()
+            || job.crawl_run_id.is_some()
+        {
+            return Err(JobRepositoryError::QueueInvariant);
+        }
+        let serialized = serde_json::to_string(snapshot).map_err(|error| {
+            JobRepositoryError::Database(DbError::Serialization(error.to_string()))
+        })?;
+        let run_id = CrawlRunId::new();
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            insert_run_in_transaction(
+                &transaction,
+                run_id,
+                CrawlRunStatus::Queued,
+                snapshot,
+                &serialized,
+            )
+            .await
+            .map_err(JobRepositoryError::Database)?;
+            transaction
+                .execute(
+                    "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', NULL, ?4, ?5, 0, ?6, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?7, ?7)",
+                    (
+                        job.id.as_str(),
+                        job.kind.as_str(),
+                        job.priority,
+                        run_id.to_string(),
+                        job.scheduled_at,
+                        i64::from(job.max_attempts),
+                        now,
+                    ),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            Ok(QuickScrapeRunJob {
+                crawl_run_id: run_id,
+                job_id: job.id.clone(),
+            })
+        }
+        .await;
+        match result {
+            Ok(submission) => transaction
+                .commit()
+                .await
+                .map(|()| submission)
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Creates a job in its only valid initial state: `QUEUED`.
     ///
     /// # Errors
@@ -552,6 +639,43 @@ impl<'database> JobRepository<'database> {
         failure: JobFailureCode,
         retry_at: i64,
     ) -> Result<JobState, JobRepositoryError> {
+        self.fail_with_disposition(job_id, lease, now, failure, retry_at, false)
+            .await
+    }
+
+    /// Fails the active attempt and terminally fails its job, even when the
+    /// durable retry budget has remaining attempts. This is reserved for a
+    /// handler's stable, non-retryable outcome after that outcome has been
+    /// persisted separately.
+    ///
+    /// # Errors
+    /// Returns an error when the job is absent, no longer owned by `lease`, or
+    /// its durable attempt/lifecycle update cannot be committed.
+    pub async fn fail_terminal(
+        &self,
+        job_id: &JobId,
+        lease: &JobLease,
+        now: i64,
+        failure: JobFailureCode,
+    ) -> Result<(), JobRepositoryError> {
+        match self
+            .fail_with_disposition(job_id, lease, now, failure, now, true)
+            .await?
+        {
+            JobState::Failed => Ok(()),
+            _ => Err(JobRepositoryError::QueueInvariant),
+        }
+    }
+
+    async fn fail_with_disposition(
+        &self,
+        job_id: &JobId,
+        lease: &JobLease,
+        now: i64,
+        failure: JobFailureCode,
+        retry_at: i64,
+        terminal: bool,
+    ) -> Result<JobState, JobRepositoryError> {
         let mut connection = self
             .database
             .connection()
@@ -563,7 +687,7 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::database)?;
         let result = async {
             let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
-            let next_state = if job.current_attempt < job.max_attempts {
+            let next_state = if !terminal && job.current_attempt < job.max_attempts {
                 JobState::Queued
             } else {
                 JobState::Failed
@@ -1734,4 +1858,92 @@ fn valid_worker_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[cfg(test)]
+mod quick_scrape_submission_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::MigrationRunner;
+    use erabi_domain::{
+        CrawlRunSnapshotDraft, CrawlRunType, ResolvedValue, RobotsAudit, RunConfiguration,
+        SettingSource, SnapshotOperationalSettings,
+    };
+
+    fn resolved<T>(value: T) -> ResolvedValue<T> {
+        ResolvedValue {
+            value,
+            source: SettingSource::BuiltInDefault,
+        }
+    }
+
+    fn snapshot() -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {
+        Ok(CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
+            run_type: CrawlRunType::QuickScrape,
+            configuration: RunConfiguration::QuickScrape {
+                target_url: "https://atomic.example.test/".parse()?,
+                ad_hoc_configuration: BTreeMap::from([
+                    (
+                        "source_id".to_owned(),
+                        serde_json::json!(uuid::Uuid::now_v7().to_string()),
+                    ),
+                    (
+                        "source_target_type".to_owned(),
+                        serde_json::json!("WEB_PAGE"),
+                    ),
+                ]),
+            },
+            selected_seed_ids: Vec::new(),
+            run_profile_id: None,
+            settings: SnapshotOperationalSettings {
+                max_pages: resolved(1),
+                max_depth: resolved(0),
+                max_duration_seconds: resolved(60),
+                concurrency: resolved(1),
+                request_delay_ms: resolved(0),
+                timeout_ms: resolved(1_000),
+                screenshot: resolved(false),
+                asset_download_limit_bytes: resolved(1_000_000),
+                retain_artifacts: resolved(false),
+                user_agent: resolved("Erabi/0.1".to_owned()),
+            },
+            robots: RobotsAudit::respect(
+                "atomic-test",
+                "unix:1",
+                "https://atomic.example.test:443",
+                "Erabi/0.1",
+                None,
+            ),
+            actor: "atomic-test".to_owned(),
+            created_at: "unix:1".to_owned(),
+        })?)
+    }
+
+    #[tokio::test]
+    async fn root_job_insert_failure_rolls_back_the_new_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = ErabiDatabase::in_memory().await?;
+        MigrationRunner::default().apply(&database).await?;
+        let repository = JobRepository::new(&database);
+        let job = NewJob::new(JobKind::new("QUICK_SCRAPE")?, 0, 1, 1)?;
+        repository.enqueue(&job, 1).await?;
+
+        assert!(
+            repository
+                .create_quick_scrape_run_with_root_job(&snapshot()?, &job, 1)
+                .await
+                .is_err()
+        );
+
+        let connection = database.connection().await?;
+        let row = connection
+            .prepare("SELECT COUNT(*) FROM crawl_runs WHERE actor = 'atomic-test'")
+            .await?
+            .query_row(())
+            .await?;
+        let count: i64 = row.get(0)?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
 }

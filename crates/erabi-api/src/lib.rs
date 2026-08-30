@@ -12,6 +12,7 @@ mod error;
 mod job_actions;
 mod page_type_authoring;
 mod progress;
+mod quick_scrape;
 mod redaction;
 mod run_safety;
 mod state;

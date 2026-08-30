@@ -65,6 +65,81 @@ impl<'database> CrawlRunRepository<'database> {
         self.snapshot_by_stored_id(&id.to_string()).await
     }
 
+    /// Moves a run through the execution lifecycle without ever modifying its
+    /// immutable snapshot. A recovered leased job may observe `RUNNING` again,
+    /// so that transition is intentionally idempotent.
+    ///
+    /// # Errors
+    /// Returns a typed error when the run is missing, already terminal, or the
+    /// requested transition is not part of the canonical run lifecycle.
+    pub async fn transition_execution_status(
+        &self,
+        id: CrawlRunId,
+        status: CrawlRunStatus,
+    ) -> Result<(), CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let changed = match status {
+            CrawlRunStatus::Running => connection
+                .execute(
+                    "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING')",
+                    [id.to_string()],
+                )
+                .await,
+            CrawlRunStatus::Succeeded => {
+                connection
+                    .execute(
+                        "UPDATE crawl_runs SET status = 'SUCCEEDED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED')",
+                        [id.to_string()],
+                    )
+                    .await
+            }
+            CrawlRunStatus::PartialResult => {
+                connection
+                    .execute(
+                        "UPDATE crawl_runs SET status = 'PARTIAL_RESULT' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'PARTIAL_RESULT')",
+                        [id.to_string()],
+                    )
+                    .await
+            }
+            CrawlRunStatus::Failed => {
+                connection
+                    .execute(
+                        "UPDATE crawl_runs SET status = 'FAILED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'FAILED')",
+                        [id.to_string()],
+                    )
+                    .await
+            }
+            CrawlRunStatus::Queued | CrawlRunStatus::Cancelled => {
+                return Err(CrawlRunRepositoryError::Database(DbError::Invariant(
+                    "execution workers cannot directly set queued or cancelled run status".into(),
+                )));
+            }
+        }
+        .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        if changed != 1 {
+            let exists = connection
+                .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
+                .await
+                .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+                .next()
+                .await
+                .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+                .is_some();
+            return Err(if exists {
+                CrawlRunRepositoryError::Database(DbError::Invariant(
+                    "Crawl Run lifecycle transition is not legal".into(),
+                ))
+            } else {
+                CrawlRunRepositoryError::NotFound
+            });
+        }
+        Ok(())
+    }
+
     /// Loads a snapshot using a durable foreign-key value from another
     /// repository. The stored identifier is kept opaque at this boundary.
     ///

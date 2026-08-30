@@ -34,7 +34,7 @@ pub use identity::JobIdParseError;
 pub use job::{
     AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,
     JobFailureCode, JobId, JobKind, JobLease, JobRecord, JobRepository, JobRepositoryError,
-    JobState, JobStorageClass, NewJob, StaleJobRecovery,
+    JobState, JobStorageClass, NewJob, QuickScrapeRunJob, StaleJobRecovery,
 };
 pub use progress::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,

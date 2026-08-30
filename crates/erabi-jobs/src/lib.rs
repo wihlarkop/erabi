@@ -28,6 +28,7 @@ use tokio::{
 mod actions;
 mod cancellation;
 mod progress;
+mod quick_scrape;
 mod storage_pressure;
 
 pub use actions::{
@@ -46,7 +47,9 @@ pub use storage_pressure::{
 };
 
 pub use erabi_db::repositories::JobStorageClass;
-pub use erabi_db::repositories::{AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob};
+pub use erabi_db::repositories::{
+    AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob, QuickScrapeRunJob,
+};
 pub use erabi_db::repositories::{
     CURRENT_CHECKPOINT_SCHEMA_VERSION, CheckpointArtifactReference, CheckpointCompatibility,
     CheckpointEnvelope, CheckpointIdentity, CheckpointPosition, CheckpointRecord,
@@ -60,6 +63,7 @@ pub use erabi_db::repositories::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
+pub use quick_scrape::QuickScrapeJobHandler;
 
 /// Fixed bounded retry and lease policy for one generic worker runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,12 +101,14 @@ impl WorkerPolicy {
 pub struct JobExecutionContext {
     job_id: JobId,
     kind: JobKind,
+    attempt_id: String,
     attempt_number: u32,
     worker_id: String,
     lease: JobLease,
     cancellation: CancellationToken,
     storage_pressure: StoragePressureToken,
     checkpoint_writer: CheckpointWriter,
+    terminal_failure: Arc<AtomicBool>,
 }
 
 impl JobExecutionContext {
@@ -114,6 +120,13 @@ impl JobExecutionContext {
     #[must_use]
     pub fn kind(&self) -> &JobKind {
         &self.kind
+    }
+
+    /// Returns the durable `UUIDv7` identity of the current attempt. Progress
+    /// events use this reference instead of inventing an in-memory sequence.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
     }
 
     #[must_use]
@@ -153,6 +166,18 @@ impl JobExecutionContext {
         checkpoint: &CheckpointEnvelope,
     ) -> Result<CheckpointRecord, JobRepositoryError> {
         self.checkpoint_writer.append(checkpoint).await
+    }
+
+    /// Marks the current expected handler error as permanently terminal after
+    /// the handler has durably recorded its stable outcome. Generic handlers
+    /// remain retryable by default; this narrow signal prevents a known
+    /// permanent external result from consuming unrelated retry attempts.
+    pub(crate) fn mark_terminal_failure(&self) {
+        self.terminal_failure.store(true, Ordering::Release);
+    }
+
+    fn terminal_failure_requested(&self) -> bool {
+        self.terminal_failure.load(Ordering::Acquire)
     }
 }
 
@@ -416,12 +441,14 @@ impl<'database> JobRuntime<'database> {
         let context = JobExecutionContext {
             job_id: acquired.job.id.clone(),
             kind: acquired.job.kind.clone(),
+            attempt_id: acquired.attempt.id.clone(),
             attempt_number: acquired.attempt.attempt_number,
             worker_id: self.worker_id.clone(),
             lease: current_lease,
             cancellation,
             storage_pressure,
             checkpoint_writer,
+            terminal_failure: Arc::new(AtomicBool::new(false)),
         };
         let outcome = self.execute_acquired(handler, context, now, started).await;
         self.cancellation.release(
@@ -529,6 +556,7 @@ impl<'database> JobRuntime<'database> {
                     &current_lease,
                     completed_at,
                     JobFailureCode::HandlerFailed,
+                    context.terminal_failure_requested(),
                 )
                 .await
             }
@@ -538,6 +566,7 @@ impl<'database> JobRuntime<'database> {
                     &current_lease,
                     completed_at,
                     JobFailureCode::HandlerPanicked,
+                    false,
                 )
                 .await
             }
@@ -550,7 +579,18 @@ impl<'database> JobRuntime<'database> {
         lease: &JobLease,
         now: i64,
         failure: JobFailureCode,
+        terminal: bool,
     ) -> Result<WorkerTurn, JobRuntimeError> {
+        if terminal {
+            self.repository
+                .fail_terminal(&context.job_id, lease, now, failure)
+                .await
+                .map_err(JobRuntimeError::Repository)?;
+            return Ok(WorkerTurn::Failed {
+                job_id: context.job_id.clone(),
+                failure,
+            });
+        }
         let retry_at = now
             .checked_add(self.policy.retry_delay_seconds)
             .ok_or(JobRuntimeError::InvalidPolicy)?;
