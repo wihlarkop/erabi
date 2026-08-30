@@ -11,7 +11,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use erabi_crawler::{OriginKey, QuickScrapeSubmissionError, QuickScrapeSubmissionRequest};
+use erabi_crawler::{
+    OriginKey, QuickScrapeSubmissionError, QuickScrapeSubmissionRequest, SourceIntakeError,
+};
+use erabi_db::repositories::SourceRepositoryError;
 use erabi_domain::{ResolvedValue, SettingSource, SnapshotOperationalSettings};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +27,13 @@ use crate::{
 
 const API_ACTOR: &str = "api";
 const QUICK_SCRAPE_MAX_ATTEMPTS: u32 = 3;
+/// Matches the established bounded multi-URL Test Lab surface. Sequential
+/// submission keeps the associated DNS/probe work conservatively bounded.
+pub(crate) const QUICK_SCRAPE_BATCH_MAX_ITEMS: usize = 8;
+/// Fits eight independently bounded 4 KiB target URLs and 1 KiB override
+/// reasons with JSON overhead, while remaining below the 64 KiB global
+/// mutation-body ceiling.
+pub(crate) const QUICK_SCRAPE_BATCH_BODY_LIMIT_BYTES: usize = 48 * 1024;
 
 /// The deliberately small Task 6 API: exactly one target and, optionally, a
 /// fresh reasoned robots override. There are no provider fields or batch URLs.
@@ -41,12 +51,59 @@ struct RobotsOverrideRequest {
     reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QuickScrapeBatchRequest {
+    items: Vec<QuickScrapeRequest>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[allow(clippy::struct_field_names)] // Wire contract intentionally uses durable identity names.
 pub(crate) struct QuickScrapeAcceptedResponse {
     run_id: String,
     job_id: String,
     source_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickScrapeBatchResponse {
+    halted: bool,
+    items: Vec<QuickScrapeBatchOutcome>,
+}
+
+/// Ordered wire outcomes for the convenience envelope. `CONFLICT` is omitted
+/// deliberately: Task 6's single-item primitive has no legitimate conflict
+/// error, so the batch route must not manufacture one.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE")]
+enum QuickScrapeBatchOutcome {
+    Accepted {
+        run_id: String,
+        job_id: String,
+        source_id: String,
+    },
+    ValidationError {
+        code: &'static str,
+    },
+    SystemError {
+        code: &'static str,
+        trace_id: String,
+    },
+    NotProcessed {
+        code: &'static str,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum QuickScrapeRequestError {
+    InvalidTargetUrl,
+    UnsupportedOrigin,
+    InvalidRobotsOverride,
+}
+
+enum QuickScrapeBatchItemError {
+    Validation { code: &'static str },
+    System,
 }
 
 pub(crate) async fn start_quick_scrape(
@@ -70,70 +127,182 @@ pub(crate) async fn start_quick_scrape(
             &trace,
         );
     };
-    let Ok(url) = input.target_url.parse() else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_QUICK_SCRAPE_REQUEST",
-            "The target URL is invalid.",
-            &trace,
-        );
-    };
-    let Ok(origin) = OriginKey::from_url(&url) else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_QUICK_SCRAPE_REQUEST",
-            "The target URL must use a supported HTTP(S) origin.",
-            &trace,
-        );
-    };
     let created_at = timestamp();
-    let robots_input = input
-        .robots_override
-        .map_or(RobotsOverrideInput::Respect, |value| {
-            RobotsOverrideInput::Override {
-                reason: value.reason,
-            }
-        });
-    let Ok(robots) = new_run_robots_decision(
-        robots_input,
-        RobotsDecisionContext {
-            actor: API_ACTOR.to_owned(),
-            decided_at: created_at.clone(),
-            affected_scope: origin.to_string(),
-            user_agent: quick_scrape_settings().user_agent.value.clone(),
-            crawler_version_id: None,
-        },
-    ) else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_ROBOTS_OVERRIDE",
-            "A Quick Scrape robots override requires a non-empty bounded reason.",
-            &trace,
-        );
-    };
-
-    let request = QuickScrapeSubmissionRequest {
-        target_url: input.target_url,
-        collection_id: None,
-        source_name: None,
-        settings: quick_scrape_settings(),
-        robots,
-        actor: API_ACTOR.to_owned(),
-        created_at,
-        priority: 0,
-        max_attempts: QUICK_SCRAPE_MAX_ATTEMPTS,
+    let request = match input.into_submission_request(&created_at) {
+        Ok(request) => request,
+        Err(error) => return quick_scrape_request_error(error, &trace),
     };
     match service.submit(request, epoch_seconds()).await {
         Ok(accepted) => (
             StatusCode::ACCEPTED,
-            Json(QuickScrapeAcceptedResponse {
+            Json(QuickScrapeAcceptedResponse::from(accepted)),
+        )
+            .into_response(),
+        Err(error) => quick_scrape_error(&error, &trace),
+    }
+}
+
+/// Accepts a bounded pasted-URL convenience envelope. Every accepted item
+/// delegates to the Task 6 primitive; this route owns neither a batch run nor
+/// a batch transaction.
+pub(crate) async fn start_quick_scrape_batch(
+    State(state): State<AppState>,
+    Extension(trace): Extension<TraceId>,
+    input: Result<Json<QuickScrapeBatchRequest>, JsonRejection>,
+) -> Response {
+    let input = match input {
+        Ok(Json(input)) => input,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BODY_TOO_LARGE",
+                "The Quick Scrape batch body exceeds this endpoint's limit.",
+                &trace,
+            );
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_QUICK_SCRAPE_BATCH_REQUEST",
+                "The Quick Scrape batch request body is invalid.",
+                &trace,
+            );
+        }
+    };
+    if input.items.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "EMPTY_QUICK_SCRAPE_BATCH",
+            "A Quick Scrape batch must contain at least one item.",
+            &trace,
+        );
+    }
+    if input.items.len() > QUICK_SCRAPE_BATCH_MAX_ITEMS {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "TOO_MANY_QUICK_SCRAPE_ITEMS",
+            "The Quick Scrape batch exceeds the fixed item limit.",
+            &trace,
+        );
+    }
+    let Some(service) = state.quick_scrape_runtime() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "QUICK_SCRAPE_UNAVAILABLE",
+            "Quick Scrape is not configured in this runtime.",
+            &trace,
+        );
+    };
+
+    // All independently accepted runs share the request acceptance instant,
+    // but each call below retains Task 6's own Source and run/job transaction.
+    let (created_at, now) = submission_time();
+    let mut outcomes = Vec::with_capacity(input.items.len());
+    let mut items = input.items.into_iter();
+    let mut halted = false;
+    while let Some(item) = items.next() {
+        let request = match item.into_submission_request(&created_at) {
+            Ok(request) => request,
+            Err(error) => {
+                outcomes.push(QuickScrapeBatchOutcome::ValidationError {
+                    code: quick_scrape_request_error_code(error),
+                });
+                continue;
+            }
+        };
+        match service.submit(request, now).await {
+            Ok(accepted) => outcomes.push(QuickScrapeBatchOutcome::Accepted {
                 run_id: accepted.run_id.to_string(),
                 job_id: accepted.job_id,
                 source_id: accepted.source_id.to_string(),
             }),
+            Err(error) => match quick_scrape_batch_item_error(&error) {
+                QuickScrapeBatchItemError::Validation { code } => {
+                    outcomes.push(QuickScrapeBatchOutcome::ValidationError { code });
+                }
+                QuickScrapeBatchItemError::System => {
+                    outcomes.push(QuickScrapeBatchOutcome::SystemError {
+                        code: "QUICK_SCRAPE_SUBMISSION_FAILED",
+                        trace_id: trace.as_str().to_owned(),
+                    });
+                    // A database or invariant failure is not a validation
+                    // result. Keep prior durable acceptances visible, mark
+                    // each remaining input as unattempted, and stop admission.
+                    let has_unprocessed_items = items.len() > 0;
+                    outcomes.extend(items.by_ref().map(|_| {
+                        QuickScrapeBatchOutcome::NotProcessed {
+                            code: "BATCH_HALTED",
+                        }
+                    }));
+                    halted = has_unprocessed_items;
+                    break;
+                }
+            },
+        }
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(QuickScrapeBatchResponse {
+            halted,
+            items: outcomes,
+        }),
+    )
+        .into_response()
+}
+
+impl QuickScrapeRequest {
+    fn into_submission_request(
+        self,
+        created_at: &str,
+    ) -> Result<QuickScrapeSubmissionRequest, QuickScrapeRequestError> {
+        let url = self
+            .target_url
+            .parse()
+            .map_err(|_| QuickScrapeRequestError::InvalidTargetUrl)?;
+        let origin =
+            OriginKey::from_url(&url).map_err(|_| QuickScrapeRequestError::UnsupportedOrigin)?;
+        let settings = quick_scrape_settings();
+        let robots_input = self
+            .robots_override
+            .map_or(RobotsOverrideInput::Respect, |value| {
+                RobotsOverrideInput::Override {
+                    reason: value.reason,
+                }
+            });
+        let robots = new_run_robots_decision(
+            robots_input,
+            RobotsDecisionContext {
+                actor: API_ACTOR.to_owned(),
+                decided_at: created_at.to_owned(),
+                affected_scope: origin.to_string(),
+                user_agent: settings.user_agent.value.clone(),
+                crawler_version_id: None,
+            },
         )
-            .into_response(),
-        Err(error) => quick_scrape_error(&error, &trace),
+        .map_err(|_| QuickScrapeRequestError::InvalidRobotsOverride)?;
+
+        Ok(QuickScrapeSubmissionRequest {
+            target_url: self.target_url,
+            collection_id: None,
+            source_name: None,
+            settings,
+            robots,
+            actor: API_ACTOR.to_owned(),
+            created_at: created_at.to_owned(),
+            priority: 0,
+            max_attempts: QUICK_SCRAPE_MAX_ATTEMPTS,
+        })
+    }
+}
+
+impl From<erabi_crawler::QuickScrapeSubmission> for QuickScrapeAcceptedResponse {
+    fn from(accepted: erabi_crawler::QuickScrapeSubmission) -> Self {
+        Self {
+            run_id: accepted.run_id.to_string(),
+            job_id: accepted.job_id,
+            source_id: accepted.source_id.to_string(),
+        }
     }
 }
 
@@ -179,6 +348,52 @@ fn quick_scrape_error(error: &QuickScrapeSubmissionError, trace: &TraceId) -> Re
     api_error(status, code, message, trace)
 }
 
+fn quick_scrape_batch_item_error(error: &QuickScrapeSubmissionError) -> QuickScrapeBatchItemError {
+    match error {
+        QuickScrapeSubmissionError::SourceIntake(
+            SourceIntakeError::Canonicalization(_)
+            | SourceIntakeError::NetworkTarget(_)
+            | SourceIntakeError::Repository(SourceRepositoryError::InvalidInput(_)),
+        ) => QuickScrapeBatchItemError::Validation {
+            code: "QUICK_SCRAPE_TARGET_REJECTED",
+        },
+        QuickScrapeSubmissionError::Snapshot(_)
+        | QuickScrapeSubmissionError::SourceIntake(SourceIntakeError::Repository(
+            SourceRepositoryError::CollectionNotFound
+            | SourceRepositoryError::NotFound
+            | SourceRepositoryError::CorruptState
+            | SourceRepositoryError::Database(_),
+        ))
+        | QuickScrapeSubmissionError::Job(_) => QuickScrapeBatchItemError::System,
+    }
+}
+
+fn quick_scrape_request_error(error: QuickScrapeRequestError, trace: &TraceId) -> Response {
+    let (code, message) = match error {
+        QuickScrapeRequestError::InvalidTargetUrl => {
+            ("INVALID_QUICK_SCRAPE_REQUEST", "The target URL is invalid.")
+        }
+        QuickScrapeRequestError::UnsupportedOrigin => (
+            "INVALID_QUICK_SCRAPE_REQUEST",
+            "The target URL must use a supported HTTP(S) origin.",
+        ),
+        QuickScrapeRequestError::InvalidRobotsOverride => (
+            "INVALID_ROBOTS_OVERRIDE",
+            "A Quick Scrape robots override requires a non-empty bounded reason.",
+        ),
+    };
+    api_error(StatusCode::BAD_REQUEST, code, message, trace)
+}
+
+const fn quick_scrape_request_error_code(error: QuickScrapeRequestError) -> &'static str {
+    match error {
+        QuickScrapeRequestError::InvalidTargetUrl | QuickScrapeRequestError::UnsupportedOrigin => {
+            "INVALID_QUICK_SCRAPE_REQUEST"
+        }
+        QuickScrapeRequestError::InvalidRobotsOverride => "INVALID_ROBOTS_OVERRIDE",
+    }
+}
+
 fn api_error(
     status: StatusCode,
     code: &'static str,
@@ -194,6 +409,11 @@ fn epoch_seconds() -> i64 {
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+fn submission_time() -> (String, i64) {
+    let now = epoch_seconds();
+    (format!("unix:{now}"), now)
 }
 
 fn timestamp() -> String {

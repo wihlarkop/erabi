@@ -2,7 +2,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Extension, State},
+    extract::{DefaultBodyLimit, Extension, State},
     http::{HeaderName, HeaderValue, Request, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
@@ -41,7 +41,9 @@ use crate::{
         update_page_type,
     },
     progress::job_progress_sse,
-    quick_scrape::start_quick_scrape,
+    quick_scrape::{
+        QUICK_SCRAPE_BATCH_BODY_LIMIT_BYTES, start_quick_scrape, start_quick_scrape_batch,
+    },
     security::{apply_security_headers, enforce_browser_request_policy, require_bearer},
     test_lab::{list_test_evidence, read_test_evidence, run_test_lab, test_lab_openapi_schemas},
 };
@@ -94,6 +96,11 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/diagnostics/status", get(runtime_diagnostics))
         .route("/api/v1/quick-scrapes", post(start_quick_scrape))
+        .route(
+            "/api/v1/quick-scrapes/batch",
+            post(start_quick_scrape_batch)
+                .layer(DefaultBodyLimit::max(QUICK_SCRAPE_BATCH_BODY_LIMIT_BYTES)),
+        )
         .route("/api/v1/crawlers", get(list_crawlers).post(create_crawler))
         .route("/api/v1/crawlers/{crawler_id}", get(read_crawler))
         .route("/api/v1/crawlers/{crawler_id}/versions", get(list_versions))
@@ -433,6 +440,10 @@ impl OpenApiDocument {
         paths.insert(
             "/api/v1/quick-scrapes",
             OpenApiPath::post("Accept one durable Quick Scrape URL"),
+        );
+        paths.insert(
+            "/api/v1/quick-scrapes/batch",
+            OpenApiPath::post("Accept a bounded ordered Quick Scrape batch with per-item outcomes"),
         );
         paths.insert(
             "/api/v1/diagnostics/status",
