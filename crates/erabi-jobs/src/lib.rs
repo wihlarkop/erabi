@@ -27,6 +27,7 @@ use tokio::{
 
 mod actions;
 mod cancellation;
+mod production;
 mod progress;
 mod quick_scrape;
 mod storage_pressure;
@@ -63,7 +64,46 @@ pub use erabi_db::repositories::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
+pub use production::ProductionCrawlJobHandler;
 pub use quick_scrape::QuickScrapeJobHandler;
+
+/// One durable runtime dispatcher for the two Plan 06 crawl root-job kinds.
+/// The queue leases by priority, not handler kind, so separate polling loops
+/// would be able to lease and incorrectly fail one another's work.
+#[derive(Clone)]
+pub struct CrawlRootJobHandler {
+    quick_scrape: QuickScrapeJobHandler,
+    production: ProductionCrawlJobHandler,
+}
+
+impl CrawlRootJobHandler {
+    #[must_use]
+    pub const fn new(
+        quick_scrape: QuickScrapeJobHandler,
+        production: ProductionCrawlJobHandler,
+    ) -> Self {
+        Self {
+            quick_scrape,
+            production,
+        }
+    }
+}
+
+impl JobHandler for CrawlRootJobHandler {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let handler = self.clone();
+        async move {
+            match context.kind().as_str() {
+                "QUICK_SCRAPE" | "RETRY" => handler.quick_scrape.execute(context).await,
+                "PRODUCTION_CRAWL" => handler.production.execute(context).await,
+                _ => Err(JobExecutionError),
+            }
+        }
+    }
+}
 
 /// Fixed bounded retry and lease policy for one generic worker runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -581,6 +621,16 @@ impl<'database> JobRuntime<'database> {
         failure: JobFailureCode,
         terminal: bool,
     ) -> Result<WorkerTurn, JobRuntimeError> {
+        if context.kind().as_str() == "PRODUCTION_CRAWL" {
+            self.repository
+                .fail_terminal_production(&context.job_id, lease, now, failure)
+                .await
+                .map_err(JobRuntimeError::Repository)?;
+            return Ok(WorkerTurn::Failed {
+                job_id: context.job_id.clone(),
+                failure,
+            });
+        }
         if terminal {
             self.repository
                 .fail_terminal(&context.job_id, lease, now, failure)

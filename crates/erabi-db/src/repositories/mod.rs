@@ -34,7 +34,7 @@ pub use identity::JobIdParseError;
 pub use job::{
     AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,
     JobFailureCode, JobId, JobKind, JobLease, JobRecord, JobRepository, JobRepositoryError,
-    JobState, JobStorageClass, NewJob, QuickScrapeRunJob, StaleJobRecovery,
+    JobState, JobStorageClass, NewJob, ProductionRunJob, QuickScrapeRunJob, StaleJobRecovery,
 };
 pub use progress::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
@@ -42,6 +42,6 @@ pub use progress::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
-pub use run::{CrawlRunRepository, CrawlRunRepositoryError};
+pub use run::{CrawlRunRepository, CrawlRunRepositoryError, DiscoveredUrlRecord};
 pub use source::{NewSource, SourceRepository, SourceRepositoryError};
 pub use test_evidence::{TestEvidenceRecord, TestEvidenceRepository, TestEvidenceRepositoryError};

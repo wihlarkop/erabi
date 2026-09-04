@@ -309,6 +309,13 @@ pub struct DiscoveryPreviewSummary {
     pub budget_hit_counts: BTreeMap<PreviewBudgetKind, u64>,
     pub frontier_remaining: u64,
     pub newly_enqueued_urls: u64,
+    /// Observed pagination work that the bounded traversal could not admit.
+    /// This is normal-path incompleteness evidence, not a complete-snapshot
+    /// decision.
+    pub pagination_truncation_count: u64,
+    /// True only when the duration boundary prevented expansion of observed
+    /// links or pagination work.
+    pub duration_work_not_expanded: bool,
 }
 
 /// Integer/count growth evidence. It is advisory and never a site-size claim.

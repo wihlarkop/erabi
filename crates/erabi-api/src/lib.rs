@@ -11,6 +11,7 @@ mod discovery_preview;
 mod error;
 mod job_actions;
 mod page_type_authoring;
+mod production_run;
 mod progress;
 mod quick_scrape;
 mod redaction;

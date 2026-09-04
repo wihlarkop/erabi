@@ -7,7 +7,7 @@ use std::sync::{
 
 use erabi_crawler::{
     DiscoveryPreviewProvider, DiscoveryPreviewService, ExtractionTestHook, PreviewClock,
-    QuickScrapeSubmissionService, TestLabProvider, TestLabService,
+    ProductionRunSubmissionService, QuickScrapeSubmissionService, TestLabProvider, TestLabService,
 };
 use erabi_db::ErabiDatabase;
 use erabi_jobs::{
@@ -100,6 +100,8 @@ pub struct AppState {
     test_lab: Option<Arc<TestLabService>>,
     discovery_preview: Option<Arc<DiscoveryPreviewService>>,
     quick_scrape: Option<Arc<QuickScrapeSubmissionService>>,
+    production_run: Option<Arc<ProductionRunSubmissionService>>,
+    production_run_database: Option<ErabiDatabase>,
     storage_pressure: Option<Arc<StoragePressureController>>,
 }
 
@@ -126,6 +128,8 @@ impl AppState {
             test_lab: None,
             discovery_preview: None,
             quick_scrape: None,
+            production_run: None,
+            production_run_database: None,
             storage_pressure: None,
         }
     }
@@ -225,6 +229,20 @@ impl AppState {
         self
     }
 
+    /// Attaches the provider-neutral Production Run submission service. The
+    /// database is retained only for acceptance-time settings resolution; no
+    /// provider work happens in the HTTP request.
+    #[must_use]
+    pub fn with_production_run_runtime(
+        mut self,
+        database: ErabiDatabase,
+        service: ProductionRunSubmissionService,
+    ) -> Self {
+        self.production_run = Some(Arc::new(service));
+        self.production_run_database = Some(database);
+        self
+    }
+
     #[must_use]
     pub(crate) fn job_actions_runtime(&self) -> Option<Arc<JobActionRuntimeState>> {
         self.job_actions.clone()
@@ -244,6 +262,14 @@ impl AppState {
 
     pub(crate) fn quick_scrape_runtime(&self) -> Option<Arc<QuickScrapeSubmissionService>> {
         self.quick_scrape.clone()
+    }
+
+    pub(crate) fn production_run_runtime(&self) -> Option<Arc<ProductionRunSubmissionService>> {
+        self.production_run.clone()
+    }
+
+    pub(crate) fn production_run_database(&self) -> Option<ErabiDatabase> {
+        self.production_run_database.clone()
     }
 
     /// Attaches the typed storage-pressure state shared with worker admission.

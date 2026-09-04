@@ -9,7 +9,8 @@ use erabi_db::{
     },
 };
 use erabi_domain::{
-    CrawlRunSnapshot, CrawlRunSnapshotDraft, RobotsAudit, RobotsDecision, SnapshotError,
+    CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunType, RobotsAudit, RobotsDecision,
+    SnapshotError,
 };
 
 use crate::{CancellationController, JobRuntimeError, request_job_cancellation};
@@ -105,6 +106,7 @@ impl JobActionService {
     /// Returns a typed lifecycle, attempt, lineage, or persistence error.
     pub async fn retry(&self, job_id: &JobId, now: i64) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
+        self.reject_production_recovery(&source).await?;
         if source.current_attempt == 0 {
             return Err(JobActionError::IllegalLifecycleState);
         }
@@ -139,6 +141,7 @@ impl JobActionService {
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
+        self.reject_production_recovery(&source).await?;
         if source.current_attempt >= source.max_attempts {
             return Err(JobActionError::AttemptsExhausted);
         }
@@ -175,6 +178,7 @@ impl JobActionService {
         input: RerunFullCrawlInput,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.terminal_source(job_id).await?;
+        self.reject_production_recovery(&source).await?;
         let snapshot = self
             .snapshot_for(&source)
             .await?
@@ -204,6 +208,7 @@ impl JobActionService {
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
+        self.reject_production_recovery(&source).await?;
         let (_snapshot, _) = self.compatible_checkpoint(&source).await?;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
@@ -229,6 +234,7 @@ impl JobActionService {
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
+        self.reject_production_recovery(&source).await?;
         self.snapshot_for(&source).await?;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
@@ -331,6 +337,19 @@ impl JobActionService {
             return Err(JobActionError::IllegalLifecycleState);
         }
         Ok(job)
+    }
+
+    /// Production recovery actions require the durable frontier owned by Task
+    /// 9.  Do not create an action child that would restart the frozen run
+    /// from Seeds (or let a generic RETRY be dispatched as Quick Scrape).
+    async fn reject_production_recovery(&self, source: &JobRecord) -> Result<(), JobActionError> {
+        let Some(snapshot) = self.snapshot_for(source).await? else {
+            return Ok(());
+        };
+        if snapshot.run_type() == CrawlRunType::ProductionRun {
+            return Err(JobActionError::IllegalLifecycleState);
+        }
+        Ok(())
     }
 
     async fn snapshot_for(

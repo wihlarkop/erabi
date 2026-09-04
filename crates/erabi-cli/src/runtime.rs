@@ -12,17 +12,17 @@ use erabi_api::{AppState, RuntimeMode, SecurityConfig, SecurityConfigError, buil
 use erabi_crawl4ai::{Crawl4AiAdapter, Crawl4AiConfig};
 use erabi_crawler::{
     CrawlerAdapter, CrawlerAdapterError, CrawlerExecuteRequest, CrawlerExecuteResult,
-    CrawlerFuture, CrawlerHealth, NetworkTargetPolicy, PacingService, QuickScrapeSubmissionService,
-    RobotsPolicyService,
+    CrawlerFuture, CrawlerHealth, NetworkTargetPolicy, PacingService,
+    ProductionRunSubmissionService, QuickScrapeSubmissionService, RobotsPolicyService,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
     repositories::ConcurrencyState,
 };
 use erabi_jobs::{
-    CancellationController, JobRuntime, ProgressLiveHub, QuickScrapeJobHandler,
-    StoragePressureMonitor, StoragePressurePolicy, StoragePressureState, WorkerPolicy,
-    recover_and_rebuild_at,
+    CancellationController, CrawlRootJobHandler, JobRuntime, ProductionCrawlJobHandler,
+    ProgressLiveHub, QuickScrapeJobHandler, StoragePressureMonitor, StoragePressurePolicy,
+    StoragePressureState, WorkerPolicy, recover_and_rebuild_at,
 };
 use secrecy::ExposeSecret;
 use std::sync::Arc;
@@ -192,11 +192,13 @@ impl RunningRuntime {
         let adapter = crawler_adapter(&config);
         let quick_scrape_submission =
             QuickScrapeSubmissionService::new(database.clone(), network_policy.clone());
+        let production_run_submission = ProductionRunSubmissionService::new(database.clone());
         let app_state = AppState::with_readiness(false)
             .with_progress_runtime(database.clone(), progress_live_hub.clone())
             .with_job_actions_runtime(database.clone(), cancellation.clone())
             .with_crawler_authoring_runtime(database.clone())
             .with_quick_scrape_runtime(quick_scrape_submission)
+            .with_production_run_runtime(database.clone(), production_run_submission)
             .with_storage_pressure_controller(storage_pressure.controller().clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
@@ -241,8 +243,8 @@ impl RunningRuntime {
                             "Erabi could not prepare controlled artifact storage.",
                         )
                     })?;
-                Some(spawn_quick_scrape_worker(
-                    QuickScrapeWorkerDependencies {
+                Some(spawn_crawl_root_worker(
+                    CrawlRootWorkerDependencies {
                         database: database.clone(),
                         adapter,
                         robots: RobotsPolicyService::new(network_policy.clone(), pacing.clone()),
@@ -412,7 +414,7 @@ fn spawn_server(
     })
 }
 
-struct QuickScrapeWorkerDependencies {
+struct CrawlRootWorkerDependencies {
     database: ErabiDatabase,
     adapter: Arc<dyn CrawlerAdapter>,
     robots: RobotsPolicyService,
@@ -424,12 +426,12 @@ struct QuickScrapeWorkerDependencies {
     storage_pressure: StoragePressureMonitor,
 }
 
-fn spawn_quick_scrape_worker(
-    dependencies: QuickScrapeWorkerDependencies,
+fn spawn_crawl_root_worker(
+    dependencies: CrawlRootWorkerDependencies,
     mut stop_receiver: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let QuickScrapeWorkerDependencies {
+        let CrawlRootWorkerDependencies {
             database,
             adapter,
             robots,
@@ -442,14 +444,23 @@ fn spawn_quick_scrape_worker(
         } = dependencies;
         let Ok(runtime) = JobRuntime::with_storage_pressure_monitor(
             &database,
-            "quick-scrape-worker",
+            "crawl-root-worker",
             WorkerPolicy::conservative(),
             cancellation,
             storage_pressure,
         ) else {
             return;
         };
-        let handler = QuickScrapeJobHandler::new(
+        let quick_scrape = QuickScrapeJobHandler::new(
+            database.clone(),
+            Arc::clone(&adapter),
+            robots.clone(),
+            pacing.clone(),
+            network_policy.clone(),
+            artifact_store.clone(),
+        )
+        .with_progress_live_hub(progress_live_hub.clone());
+        let production = ProductionCrawlJobHandler::new(
             database.clone(),
             adapter,
             robots,
@@ -458,6 +469,7 @@ fn spawn_quick_scrape_worker(
             artifact_store,
         )
         .with_progress_live_hub(progress_live_hub);
+        let handler = CrawlRootJobHandler::new(quick_scrape, production);
         let mut polling = tokio::time::interval(Duration::from_millis(100));
         polling.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {

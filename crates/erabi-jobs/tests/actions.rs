@@ -1,20 +1,63 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
+use erabi_crawler::{
+    PRODUCTION_ROOT_MAX_ATTEMPTS, ProductionRunSubmissionRequest, ProductionRunSubmissionService,
+};
 use erabi_db::repositories::{
-    CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, CrawlRunRepository, JobFailureCode,
-    JobKind, JobRepository, JobState, NewJob,
+    CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, CrawlExecutionRecord,
+    CrawlExecutionRepository, CrawlRunRepository, CrawlerRepository, JobFailureCode, JobId,
+    JobKind, JobRepository, JobState, NewJob, ProgressReplayRequest, ProgressRepository,
+    ProgressTerminalState,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
-    CrawlRunId, CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunStatus, CrawlRunType,
-    ResolvedValue, RobotsAudit, RobotsDecision, RunConfiguration, SettingSource,
-    SnapshotOperationalSettings,
+    CrawlExecutionId, CrawlExecutionOutcome, CrawlRunId, CrawlRunSnapshot, CrawlRunSnapshotDraft,
+    CrawlRunStatus, CrawlRunType, Crawler, ResolvedValue, RobotsAudit, RobotsDecision,
+    RunConfiguration, Seed, SettingSource, SnapshotOperationalSettings,
 };
 use erabi_jobs::{
     CancellationController, JobAction, JobActionError, JobActionService, JobExecutionContext,
-    JobExecutionError, JobHandler, JobRuntime, RerunFullCrawlInput, WorkerPolicy, WorkerTurn,
+    JobExecutionError, JobHandler, JobRuntime, RerunFullCrawlInput, StoragePressureMonitor,
+    StoragePressurePolicy, StorageProbe, StorageProbeError, WorkerPolicy, WorkerTurn,
 };
 use tokio::sync::Notify;
+
+#[derive(Clone, Copy)]
+struct HealthyStorageProbe;
+
+impl StorageProbe for HealthyStorageProbe {
+    fn free_bytes(&self, _path: &Path) -> Result<u64, StorageProbeError> {
+        Ok(u64::MAX)
+    }
+}
+
+struct SystemFailureHandler {
+    database: ErabiDatabase,
+    run_id: CrawlRunId,
+    mark_running: bool,
+}
+
+impl JobHandler for SystemFailureHandler {
+    fn execute(
+        &self,
+        _context: JobExecutionContext,
+    ) -> impl std::future::Future<Output = Result<(), JobExecutionError>> + Send {
+        let database = self.database.clone();
+        let run_id = self.run_id;
+        let mark_running = self.mark_running;
+        async move {
+            if mark_running
+                && CrawlRunRepository::new(&database)
+                    .transition_execution_status(run_id, CrawlRunStatus::Running)
+                    .await
+                    .is_err()
+            {
+                return Err(JobExecutionError);
+            }
+            Err(JobExecutionError)
+        }
+    }
+}
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
@@ -100,9 +143,75 @@ async fn run_backed_job_with_snapshot(
     Ok((job, run_id, snapshot))
 }
 
+async fn production_root_job(
+    database: &ErabiDatabase,
+) -> Result<(JobId, CrawlRunId), Box<dyn std::error::Error>> {
+    let crawler_repository = CrawlerRepository::new(database);
+    let crawler = Crawler::new("Production recovery action fixture");
+    crawler_repository.create(&crawler).await?;
+    let draft = crawler_repository
+        .create_draft(crawler.id(), "operator", "2026-08-23T00:00:00Z")
+        .await?;
+    let mut draft = crawler_repository
+        .version(crawler.id(), draft.id())
+        .await?
+        .version;
+    draft.add_seed(Seed::new(
+        "https://example.test/listing".parse()?,
+        "https://example.test/listing".parse()?,
+    ))?;
+    crawler_repository
+        .save_draft(&draft, "operator", "2026-08-23T00:00:01Z")
+        .await?;
+    let published = crawler_repository
+        .publish(crawler.id(), draft.id(), "operator", "2026-08-23T00:00:02Z")
+        .await?;
+    let accepted = ProductionRunSubmissionService::new(database.clone())
+        .submit(
+            ProductionRunSubmissionRequest {
+                crawler_id: crawler.id(),
+                crawler_version_id: published.version.id(),
+                selected_seed_ids: None,
+                settings: SnapshotOperationalSettings {
+                    max_pages: resolved(100),
+                    max_depth: resolved(3),
+                    max_duration_seconds: resolved(60),
+                    concurrency: resolved(1),
+                    request_delay_ms: resolved(250),
+                    timeout_ms: resolved(30_000),
+                    screenshot: resolved(false),
+                    asset_download_limit_bytes: resolved(1_000_000),
+                    retain_artifacts: resolved(true),
+                    user_agent: resolved("Erabi/0.1".into()),
+                },
+                robots: RobotsAudit::respect(
+                    "operator",
+                    "2026-08-23T00:00:03Z",
+                    "https://example.test",
+                    "Erabi/0.1",
+                    Some(published.version.id()),
+                ),
+                actor: "operator".into(),
+                created_at: "2026-08-23T00:00:03Z".into(),
+                priority: 0,
+            },
+            0,
+        )
+        .await?;
+    Ok((accepted.job_id.parse()?, accepted.run_id))
+}
+
 async fn cancel_active(
     database: &ErabiDatabase,
     job: &NewJob,
+    checkpoint: Option<CheckpointEnvelope>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cancel_active_by_id(database, &job.id, checkpoint).await
+}
+
+async fn cancel_active_by_id(
+    database: &ErabiDatabase,
+    job_id: &JobId,
     checkpoint: Option<CheckpointEnvelope>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repository = JobRepository::new(database);
@@ -113,10 +222,10 @@ async fn cancel_active(
     let lease = acquired.job.lease.clone().ok_or("lease missing")?;
     if let Some(checkpoint) = checkpoint {
         repository
-            .append_checkpoint(&job.id, &acquired.attempt.id, &lease, &checkpoint, 1)
+            .append_checkpoint(job_id, &acquired.attempt.id, &lease, &checkpoint, 1)
             .await?;
     }
-    repository.cancel(&job.id, &lease, 2).await?;
+    repository.cancel(job_id, &lease, 2).await?;
     Ok(())
 }
 
@@ -202,6 +311,192 @@ async fn retry_preserves_attempt_history_and_creates_a_new_attempt()
     assert_eq!(second.attempt.attempt_number, 1);
     assert_eq!(repository.attempts(&job.id).await?.len(), 1);
     assert_eq!(repository.attempts(&result.job_id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_recovery_actions_are_unavailable_until_frontier_reconstruction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job_id, run_id) = production_root_job(&database).await?;
+    let root = JobRepository::new(&database).job(&job_id).await?;
+    assert_eq!(root.kind.as_str(), "PRODUCTION_CRAWL");
+    assert_eq!(root.crawl_run_id, Some(run_id.to_string()));
+    assert_eq!(root.max_attempts, PRODUCTION_ROOT_MAX_ATTEMPTS);
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .snapshot(run_id)
+            .await?
+            .run_type(),
+        CrawlRunType::ProductionRun
+    );
+    cancel_active_by_id(&database, &job_id, None).await?;
+    let service = JobActionService::new(database.clone(), CancellationController::default());
+
+    assert!(matches!(
+        service.retry(&job_id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service.retry_failed_parts(&job_id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service.resume(&job_id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service.restart_from_beginning(&job_id, 3).await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert!(matches!(
+        service
+            .rerun_full_crawl(&job_id, 3, RerunFullCrawlInput::default())
+            .await,
+        Err(JobActionError::IllegalLifecycleState)
+    ));
+    assert_eq!(
+        JobRepository::new(&database).attempts(&job_id).await?.len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_single_attempt_production_root_is_terminal_and_never_requeues()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job_id, run_id) = production_root_job(&database).await?;
+    assert_eq!(
+        JobRepository::new(&database)
+            .job(&job_id)
+            .await?
+            .max_attempts,
+        PRODUCTION_ROOT_MAX_ATTEMPTS
+    );
+    CrawlExecutionRepository::new(&database)
+        .persist(&CrawlExecutionRecord {
+            id: CrawlExecutionId::new(),
+            crawl_run_id: run_id,
+            requested_url: "https://example.test/listing/already-persisted".to_owned(),
+            canonical_url: "https://example.test/listing/already-persisted".to_owned(),
+            observed_final_url: Some("https://example.test/listing/already-persisted".to_owned()),
+            source_id: None,
+            page_type_id: None,
+            transition_id: None,
+            discovered_url_id: None,
+            outcome: CrawlExecutionOutcome::Completed,
+            error_code: None,
+            http_status: Some(200),
+            media_type: Some("text/html".to_owned()),
+            content_length_bytes: Some(1),
+            provider_elapsed_ms: Some(1),
+            artifacts: Vec::new(),
+        })
+        .await?;
+    let repository = JobRepository::new(&database);
+    let acquired = repository
+        .acquire_next("production-stale-worker", 0, 2)
+        .await?
+        .ok_or("Production root was not acquired")?;
+    assert_eq!(acquired.job.id, job_id);
+
+    let recovery = repository.recover_stale_jobs(2).await?;
+    assert_eq!(recovery.requeued, 0);
+    assert_eq!(recovery.failed, 1);
+    let recovered = repository.job(&job_id).await?;
+    assert_eq!(recovered.state, JobState::Failed);
+    assert_eq!(recovered.current_attempt, 1);
+    assert_eq!(recovered.max_attempts, 1);
+    assert_eq!(
+        CrawlRunRepository::new(&database).status(run_id).await?,
+        CrawlRunStatus::Failed
+    );
+    let progress = ProgressRepository::new(&database)
+        .replay(&job_id, ProgressReplayRequest::new(None, 16)?)
+        .await?;
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| { event.terminal == Some(ProgressTerminalState::Failed) })
+    );
+    assert_eq!(
+        CrawlExecutionRepository::new(&database)
+            .list_for_run(run_id)
+            .await?
+            .len(),
+        1
+    );
+    assert!(
+        repository
+            .acquire_next("production-reentry-worker", 3, 2)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_production_system_failure_fails_run_from_queued_or_running()
+-> Result<(), Box<dyn std::error::Error>> {
+    for mark_running in [false, true] {
+        let database = database().await?;
+        let (job_id, run_id) = production_root_job(&database).await?;
+        let runtime = JobRuntime::with_storage_pressure_monitor(
+            &database,
+            "production-system-failure",
+            WorkerPolicy::conservative(),
+            CancellationController::default(),
+            StoragePressureMonitor::new(
+                HealthyStorageProbe,
+                "production-system-failure-data",
+                StoragePressurePolicy::default(),
+            ),
+        )?;
+        let turn = runtime
+            .execute_next_at(
+                &SystemFailureHandler {
+                    database: database.clone(),
+                    run_id,
+                    mark_running,
+                },
+                0,
+            )
+            .await?;
+        assert_eq!(
+            turn,
+            WorkerTurn::Failed {
+                job_id: job_id.clone(),
+                failure: JobFailureCode::HandlerFailed,
+            }
+        );
+        assert_eq!(
+            JobRepository::new(&database).job(&job_id).await?.state,
+            JobState::Failed
+        );
+        assert_eq!(
+            CrawlRunRepository::new(&database).status(run_id).await?,
+            CrawlRunStatus::Failed
+        );
+        let progress = ProgressRepository::new(&database)
+            .replay(&job_id, ProgressReplayRequest::new(None, 16)?)
+            .await?;
+        assert!(progress.events.iter().any(|event| {
+            event.terminal == Some(ProgressTerminalState::Failed)
+                && event.key.as_str() == "COMPLETED"
+        }));
+        assert_eq!(
+            JobRepository::new(&database).attempts(&job_id).await?.len(),
+            1
+        );
+        assert!(
+            JobRepository::new(&database)
+                .acquire_next("production-no-retry", 1, 2)
+                .await?
+                .is_none()
+        );
+    }
     Ok(())
 }
 

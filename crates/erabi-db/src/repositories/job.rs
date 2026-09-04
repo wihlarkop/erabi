@@ -11,7 +11,10 @@ use crate::{DbError, ErabiDatabase};
 use super::checkpoint::{
     CheckpointEnvelope, CheckpointRecord, CheckpointRepository, CheckpointRepositoryError,
 };
-use super::run::insert_run_in_transaction;
+use super::progress::{
+    NewProgressEvent, ProgressMetadata, ProgressTerminalState, append_in_transaction,
+};
+use super::run::{insert_run_in_transaction, transition_execution_status_in_transaction};
 
 /// Stable durable identity for a queued unit of work.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -169,6 +172,14 @@ pub struct NewJob {
 /// viable root job have committed together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuickScrapeRunJob {
+    pub crawl_run_id: CrawlRunId,
+    pub job_id: JobId,
+}
+
+/// Durable identities returned only after a Production Run and its viable root
+/// job have committed together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionRunJob {
     pub crawl_run_id: CrawlRunId,
     pub job_id: JobId,
 }
@@ -455,6 +466,86 @@ impl<'database> JobRepository<'database> {
         }
     }
 
+    /// Atomically creates the immutable Production Run and its root durable
+    /// job. The caller has already captured the exact Published configuration
+    /// and resolved settings; this short transaction performs no provider or
+    /// network work.
+    ///
+    /// # Errors
+    /// Returns a typed invariant or durable database failure and rolls back
+    /// both inserts when either insert cannot complete.
+    pub async fn create_production_run_with_root_job(
+        &self,
+        snapshot: &CrawlRunSnapshot,
+        job: &NewJob,
+        now: i64,
+    ) -> Result<ProductionRunJob, JobRepositoryError> {
+        if !matches!(
+            snapshot.configuration(),
+            RunConfiguration::CrawlerVersion { .. }
+        ) || snapshot.run_type() != erabi_domain::CrawlRunType::ProductionRun
+            || job.parent_job_id.is_some()
+            || job.crawl_run_id.is_some()
+        {
+            return Err(JobRepositoryError::QueueInvariant);
+        }
+        let serialized = serde_json::to_string(snapshot).map_err(|error| {
+            JobRepositoryError::Database(DbError::Serialization(error.to_string()))
+        })?;
+        let run_id = CrawlRunId::new();
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            insert_run_in_transaction(
+                &transaction,
+                run_id,
+                CrawlRunStatus::Queued,
+                snapshot,
+                &serialized,
+            )
+            .await
+            .map_err(JobRepositoryError::Database)?;
+            transaction
+                .execute(
+                    "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', NULL, ?4, ?5, 0, ?6, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?7, ?7)",
+                    (
+                        job.id.as_str(),
+                        job.kind.as_str(),
+                        job.priority,
+                        run_id.to_string(),
+                        job.scheduled_at,
+                        i64::from(job.max_attempts),
+                        now,
+                    ),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            Ok(ProductionRunJob {
+                crawl_run_id: run_id,
+                job_id: job.id.clone(),
+            })
+        }
+        .await;
+        match result {
+            Ok(submission) => transaction
+                .commit()
+                .await
+                .map(|()| submission)
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Creates a job in its only valid initial state: `QUEUED`.
     ///
     /// # Errors
@@ -664,6 +755,78 @@ impl<'database> JobRepository<'database> {
         {
             JobState::Failed => Ok(()),
             _ => Err(JobRepositoryError::QueueInvariant),
+        }
+    }
+
+    /// Atomically fails a Production root's active attempt, Job, owning Crawl
+    /// Run, and progress stream. This is deliberately narrower than the
+    /// generic terminal failure boundary because only Production owns the
+    /// paired Crawl Run lifecycle contract.
+    ///
+    /// # Errors
+    /// Returns an error when the job is absent, no longer owned by `lease`, or
+    /// its paired Production lifecycle cannot be committed safely.
+    pub async fn fail_terminal_production(
+        &self,
+        job_id: &JobId,
+        lease: &JobLease,
+        now: i64,
+        failure: JobFailureCode,
+    ) -> Result<(), JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+            if job.kind.as_str() != "PRODUCTION_CRAWL" {
+                return Err(JobRepositoryError::QueueInvariant);
+            }
+            finish_attempt_in_transaction(
+                &transaction,
+                job_id,
+                lease,
+                now,
+                AttemptOutcome::Failed,
+                Some(failure),
+            )
+            .await?;
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET state = 'FAILED', scheduled_at = ?1, lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = ?2, updated_at = ?3 WHERE id = ?4 AND state = 'RUNNING' AND lease_id = ?5 AND lease_owner = ?6 AND lease_generation = ?7",
+                    (
+                        job.scheduled_at,
+                        failure.as_sql(),
+                        now,
+                        job_id.as_str(),
+                        lease.id.as_str(),
+                        lease.owner.as_str(),
+                        i64::try_from(lease.generation)
+                            .map_err(|_| JobRepositoryError::QueueInvariant)?,
+                    ),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            if changed != 1 {
+                return Err(JobRepositoryError::LeaseLost);
+            }
+            finalize_production_failure_in_transaction(&transaction, &job, now).await
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
     }
 
@@ -1693,8 +1856,37 @@ async fn recover_expired_in_transaction(
         if changed != 1 {
             return Err(JobRepositoryError::LeaseLost);
         }
+        if next_state == JobState::Failed && job.kind.as_str() == "PRODUCTION_CRAWL" {
+            finalize_production_failure_in_transaction(connection, &job, now).await?;
+        }
     }
     Ok(recovery)
+}
+
+async fn finalize_production_failure_in_transaction(
+    connection: &Connection,
+    job: &JobRecord,
+    now: i64,
+) -> Result<(), JobRepositoryError> {
+    let run_id = job
+        .crawl_run_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .and_then(CrawlRunId::from_uuid)
+        .ok_or(JobRepositoryError::QueueInvariant)?;
+    transition_execution_status_in_transaction(connection, run_id, CrawlRunStatus::Failed)
+        .await
+        .map_err(|_| JobRepositoryError::QueueInvariant)?;
+    let event = NewProgressEvent::terminal(
+        job.id.clone(),
+        ProgressTerminalState::Failed,
+        ProgressMetadata::default(),
+    )
+    .map_err(|_| JobRepositoryError::QueueInvariant)?;
+    append_in_transaction(connection, &event, now)
+        .await
+        .map(|_| ())
+        .map_err(|_| JobRepositoryError::QueueInvariant)
 }
 
 async fn cancel_related_run(

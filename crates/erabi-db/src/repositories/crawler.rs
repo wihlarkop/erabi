@@ -621,6 +621,37 @@ impl<'database> CrawlerRepository<'database> {
         }
     }
 
+    /// Captures one exact Published `CrawlerVersion` and all of its semantic
+    /// children from a coherent read transaction. Production submission and
+    /// execution address this immutable version directly; no active-pointer or
+    /// latest-version lookup participates in the result.
+    ///
+    /// # Errors
+    /// Returns `VersionNotPublished` for a Draft and preserves the existing
+    /// typed ownership/corruption failures for all other invalid state.
+    pub async fn published_semantic_snapshot(
+        &self,
+        crawler_id: CrawlerId,
+        version_id: CrawlerVersionId,
+    ) -> Result<CrawlerSemanticSnapshot, CrawlerRepositoryError> {
+        let mut connection = self.database.connection().await.map_err(Self::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .await
+            .map_err(Self::database)?;
+        let result = async {
+            ensure_crawler_exists(&transaction, crawler_id).await?;
+            ensure_pointer_consistency(&transaction, crawler_id).await?;
+            let snapshot = load_semantic_snapshot(&transaction, crawler_id, version_id).await?;
+            if snapshot.version.state() != CrawlerVersionState::Published {
+                return Err(CrawlerRepositoryError::VersionNotPublished);
+            }
+            Ok(snapshot)
+        }
+        .await;
+        finish_transaction!(transaction, result)
+    }
+
     /// Reads the selected version's typed canonicalization policy.
     pub async fn canonicalization_policy(
         &self,

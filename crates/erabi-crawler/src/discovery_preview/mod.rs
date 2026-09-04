@@ -7,4 +7,4 @@ pub use provider::{
     DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider, DiscoveryPreviewProviderError,
     DiscoveryPreviewProviderOutcome, FixtureDiscoveryPreviewProvider,
 };
-pub use service::{DiscoveryPreviewError, DiscoveryPreviewService};
+pub use service::{DiscoveryPreviewError, DiscoveryPreviewService, SemanticTraversal};

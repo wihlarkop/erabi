@@ -38,6 +38,10 @@ name = "quick_scrape"
 path = "tests/quick_scrape.rs"
 
 [[test]]
+name = "production_crawl"
+path = "tests/production_crawl.rs"
+
+[[test]]
 name = "test_lab"
 path = "tests/test_lab.rs"
 

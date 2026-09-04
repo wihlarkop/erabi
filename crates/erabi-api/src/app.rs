@@ -40,6 +40,7 @@ use crate::{
         list_page_types, match_page_type, read_matcher, read_page_type, update_matcher,
         update_page_type,
     },
+    production_run::start_production_run,
     progress::job_progress_sse,
     quick_scrape::{
         QUICK_SCRAPE_BATCH_BODY_LIMIT_BYTES, start_quick_scrape, start_quick_scrape_batch,
@@ -178,6 +179,10 @@ pub fn build_router(app_state: AppState, security: SecurityConfig) -> Router {
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview",
             post(run_discovery_preview),
+        )
+        .route(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/production-runs",
+            post(start_production_run),
         )
         .route(
             "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence",

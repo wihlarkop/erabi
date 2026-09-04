@@ -179,7 +179,7 @@ impl DiscoveryPreviewService {
             .map_err(map_crawler_error)?;
         let context = PreviewContext::new(&snapshot, request.limits.clone())?;
         let selected_seeds = select_seeds(&context, &request.seed_ids)?;
-        let mut run = PreviewRun::new(
+        let mut run = SemanticTraversal::new(
             context,
             request.seed_ids,
             provider,
@@ -201,11 +201,10 @@ struct PreviewContext {
 }
 
 impl PreviewContext {
-    fn new(
-        evaluation: &CrawlerEvaluationSnapshot,
-        limits: DiscoveryPreviewLimits,
+    fn from_snapshot(
+        snapshot: CrawlerSemanticSnapshot,
+        limits: erabi_domain::EffectiveDiscoveryPreviewLimits,
     ) -> Result<Self, DiscoveryPreviewError> {
-        let snapshot = evaluation.draft.clone();
         snapshot
             .version
             .validate_semantic_contract()
@@ -248,6 +247,25 @@ impl PreviewContext {
         }
         let graph = TransitionGraph::new(snapshot.version.page_type_ids(), transitions.clone())
             .map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+        Ok(Self {
+            snapshot,
+            page_types,
+            transitions,
+            graph,
+            limits,
+        })
+    }
+
+    fn new(
+        evaluation: &CrawlerEvaluationSnapshot,
+        limits: DiscoveryPreviewLimits,
+    ) -> Result<Self, DiscoveryPreviewError> {
+        let snapshot = evaluation.draft.clone();
+        let transitions = snapshot
+            .transitions
+            .iter()
+            .map(|record| record.transition.clone())
+            .collect::<Vec<_>>();
         let semantic_duration_ms = snapshot
             .version
             .guardrails()
@@ -304,13 +322,7 @@ impl PreviewContext {
             max_downloaded_bytes: snapshot.version.guardrails().max_downloaded_bytes,
             transition_total_limits,
         };
-        Ok(Self {
-            snapshot,
-            page_types,
-            transitions,
-            graph,
-            limits: effective,
-        })
+        Self::from_snapshot(snapshot, effective)
     }
 
     fn transition_total_limit(&self, id: DiscoveryTransitionId) -> Option<u64> {
@@ -397,7 +409,11 @@ struct ObservedSource<'a> {
     canonical: &'a str,
 }
 
-struct PreviewRun {
+/// Provider-neutral Plan 05 traversal state shared by Discovery Preview and
+/// Production. Its interface accepts only a coherent semantic snapshot,
+/// selected Seed identities, bounded limits, and observed pages; all URL
+/// admission decisions remain here rather than in a caller-specific engine.
+pub struct SemanticTraversal {
     context: PreviewContext,
     selected_seed_ids: Vec<SeedId>,
     provider: Arc<dyn DiscoveryPreviewProvider>,
@@ -434,6 +450,14 @@ struct PreviewRun {
     newly_enqueued_urls: u64,
     peak_new_from_page: u64,
     time_budget_hit: bool,
+    pagination_truncation_count: u64,
+    duration_work_not_expanded: bool,
+}
+
+#[derive(Clone)]
+struct TraversalObservedLink {
+    link: ObservedLink,
+    is_pagination: bool,
 }
 
 #[derive(Default)]
@@ -444,7 +468,7 @@ struct TransitionRuntimeCount {
     source_pages: BTreeSet<String>,
 }
 
-impl PreviewRun {
+impl SemanticTraversal {
     fn new(
         context: PreviewContext,
         selected_seed_ids: Vec<SeedId>,
@@ -503,7 +527,47 @@ impl PreviewRun {
             newly_enqueued_urls: 0,
             peak_new_from_page: 0,
             time_budget_hit: false,
+            pagination_truncation_count: 0,
+            duration_work_not_expanded: false,
         }
+    }
+
+    /// Builds the shared traversal from an immutable Published snapshot. The
+    /// caller supplies its own operational limits but cannot replace any
+    /// canonicalization, scope, matching, transition, or budget semantics.
+    ///
+    /// # Errors
+    /// Returns the same typed semantic/snapshot error used by Preview when
+    /// the frozen version or selected Seeds are inconsistent.
+    pub fn for_frozen_snapshot(
+        snapshot: CrawlerSemanticSnapshot,
+        selected_seed_ids: Vec<SeedId>,
+        limits: erabi_domain::EffectiveDiscoveryPreviewLimits,
+        provider: Arc<dyn DiscoveryPreviewProvider>,
+        clock: Arc<dyn PreviewClock>,
+    ) -> Result<Self, DiscoveryPreviewError> {
+        let context = PreviewContext::from_snapshot(snapshot, limits)?;
+        let selected_seeds = select_seeds(&context, &selected_seed_ids)?;
+        let mut traversal = Self::new(
+            context,
+            selected_seed_ids,
+            provider,
+            clock.clone(),
+            clock.now_millis(),
+        );
+        traversal.admit_roots(&selected_seeds)?;
+        Ok(traversal)
+    }
+
+    /// Runs this bounded semantic traversal to completion and returns the
+    /// common decision/provenance report consumed by Preview and Production.
+    ///
+    /// # Errors
+    /// Returns a stable provider-contract, semantic snapshot, or arithmetic
+    /// error; ordinary page-local failures stay in the returned report.
+    pub async fn execute(mut self) -> Result<DiscoveryPreviewResult, DiscoveryPreviewError> {
+        self.traverse().await?;
+        Ok(self.finish())
     }
 
     fn admit_roots(&mut self, seeds: &[Seed]) -> Result<(), DiscoveryPreviewError> {
@@ -556,7 +620,7 @@ impl PreviewRun {
                     self.queued.insert(
                         canonical_url.clone(),
                         QueueEntry {
-                            requested_url: seed.original_url.to_string(),
+                            requested_url: fragment_free_url(&seed.original_url),
                             canonical_url: canonical_url.clone(),
                             depth: 0,
                             seed_ids: vec![seed.id],
@@ -831,22 +895,66 @@ impl PreviewRun {
             diagnostic: None,
             budget_hits: page_budget_hits.clone(),
         });
-        if self.elapsed_millis() >= self.context.limits.max_duration_ms {
-            self.hit_time_budget();
-            self.urls_discovered = self
-                .urls_discovered
-                .saturating_add(observation.discovered_links.len() as u64);
-            self.push_diagnostic(PreviewDiagnostic {
-                code: "PREVIEW_TIME_BUDGET_LINKS_NOT_EXPANDED".to_owned(),
-                message: "Links from the completed observation were counted but not expanded after the time cap.".to_owned(),
-                observed: Some(observation.discovered_links.len() as u64),
-                threshold: Some(0),
-            });
-        } else if page_budget_hits.is_empty()
-            && is_in_scope(scope.as_ref())
+        let targetful_pagination_count = observation
+            .pagination_observations
+            .iter()
+            .filter(|pagination| pagination.target_url.is_some())
+            .count();
+        let targetless_pagination_count = observation
+            .pagination_observations
+            .iter()
+            .filter(|pagination| pagination.target_url.is_none())
+            .count();
+        let source_can_expand = is_in_scope(scope.as_ref())
             && page_match
                 .as_ref()
-                .is_some_and(|item| item.decision == PageTypeMatchStatus::Matched)
+                .is_some_and(|item| item.decision == PageTypeMatchStatus::Matched);
+        if source_can_expand && targetless_pagination_count > 0 {
+            self.record_pagination_truncation(
+                targetless_pagination_count as u64,
+                "Observed pagination did not provide a usable target URL.",
+                "PREVIEW_PAGINATION_TARGET_UNAVAILABLE",
+            );
+        }
+        if self.elapsed_millis() >= self.context.limits.max_duration_ms {
+            self.hit_time_budget();
+            let regular_work = !observation.discovered_links.is_empty();
+            let pagination_work = targetful_pagination_count > 0 || targetless_pagination_count > 0;
+            if source_can_expand && targetful_pagination_count > 0 {
+                self.record_pagination_truncation(
+                    targetful_pagination_count as u64,
+                    "Observed pagination was not expanded before the duration boundary.",
+                    "PREVIEW_PAGINATION_NOT_EXPANDED",
+                );
+            }
+            self.duration_work_not_expanded =
+                self.duration_work_not_expanded || regular_work || pagination_work;
+            self.urls_discovered = self
+                .urls_discovered
+                .saturating_add(observation.discovered_links.len() as u64)
+                .saturating_add(targetful_pagination_count as u64);
+            if regular_work || pagination_work {
+                self.push_diagnostic(PreviewDiagnostic {
+                    code: "PREVIEW_TIME_BUDGET_LINKS_NOT_EXPANDED".to_owned(),
+                    message: "Observed links or pagination were not expanded after the duration boundary.".to_owned(),
+                    observed: Some(
+                        observation.discovered_links.len() as u64
+                            + targetful_pagination_count as u64,
+                    ),
+                    threshold: Some(0),
+                });
+            }
+        } else if source_can_expand
+            && targetful_pagination_count > 0
+            && !page_budget_hits.is_empty()
+        {
+            self.record_pagination_truncation(
+                targetful_pagination_count as u64,
+                "Observed pagination was not expanded because the observed page reached a bounded PageType limit.",
+                "PREVIEW_PAGINATION_NOT_EXPANDED",
+            );
+        } else if page_budget_hits.is_empty()
+            && source_can_expand
             && !self.expanded.contains(&canonical_url)
         {
             if let Some(source_match) = page_match.as_ref() {
@@ -881,17 +989,64 @@ impl PreviewRun {
         let base = source.final_url.unwrap_or(source.requested);
         let base_url =
             url::Url::parse(base).map_err(|_| DiscoveryPreviewError::ProviderObservationInvalid)?;
-        let mut links = observation.discovered_links.clone();
+        let mut links = observation
+            .discovered_links
+            .iter()
+            .cloned()
+            .map(|link| TraversalObservedLink {
+                link,
+                is_pagination: false,
+            })
+            .collect::<Vec<_>>();
+        // Pagination observations are provider evidence for the same bounded
+        // discovery pipeline.  A repeated regular href is coalesced here,
+        // while a pagination-only target receives the identical resolution,
+        // scope, matching, transition, and budget treatment.
+        links.extend(
+            observation
+                .pagination_observations
+                .iter()
+                .filter_map(|pagination| {
+                    pagination
+                        .target_url
+                        .as_ref()
+                        .map(|target_url| TraversalObservedLink {
+                            link: ObservedLink {
+                                raw_href: target_url.clone(),
+                                selector: pagination.selector.clone(),
+                            },
+                            is_pagination: true,
+                        })
+                }),
+        );
         links.sort_by(|left, right| {
-            left.raw_href
-                .cmp(&right.raw_href)
-                .then(left.selector.cmp(&right.selector))
+            left.link
+                .raw_href
+                .cmp(&right.link.raw_href)
+                .then(left.link.selector.cmp(&right.link.selector))
+        });
+        links.dedup_by(|left, right| {
+            if left.link.raw_href == right.link.raw_href
+                && left.link.selector == right.link.selector
+            {
+                left.is_pagination |= right.is_pagination;
+                true
+            } else {
+                false
+            }
         });
         let mut new_from_page = 0_u64;
         let mut provenance_truncated = false;
         for link in links {
             self.urls_discovered = self.urls_discovered.saturating_add(1);
             if self.paths.len() >= MAX_PREVIEW_PROVENANCE_EDGES {
+                if link.is_pagination {
+                    self.record_pagination_truncation(
+                        1,
+                        "Observed pagination exceeded the bounded provenance retention limit.",
+                        "PREVIEW_PAGINATION_NOT_EXPANDED",
+                    );
+                }
                 if !provenance_truncated {
                     self.record_budget(PreviewBudgetHit {
                         kind: PreviewBudgetKind::ProvenanceRetention,
@@ -910,15 +1065,15 @@ impl PreviewRun {
                 }
                 continue;
             }
-            let resolved = base_url.join(&link.raw_href).ok();
+            let resolved = base_url.join(&link.link.raw_href).ok();
             let Some(resolved_url) = resolved else {
                 self.paths
-                    .push(self.invalid_path(entry, source, source_match, &link)?);
+                    .push(self.invalid_path(entry, source, source_match, &link.link)?);
                 continue;
             };
             if resolved_url.to_string().chars().count() > MAX_PREVIEW_URL_CHARS {
                 self.paths
-                    .push(self.invalid_path(entry, source, source_match, &link)?);
+                    .push(self.invalid_path(entry, source, source_match, &link.link)?);
                 continue;
             }
             let canonicalization = self
@@ -930,7 +1085,7 @@ impl PreviewRun {
                 .ok();
             let Some(canonicalization_result) = canonicalization else {
                 self.paths
-                    .push(self.invalid_path(entry, source, source_match, &link)?);
+                    .push(self.invalid_path(entry, source, source_match, &link.link)?);
                 continue;
             };
             let canonical_url = canonicalization_result.canonical_url.to_string();
@@ -952,7 +1107,7 @@ impl PreviewRun {
                     entry,
                     source,
                     source_match,
-                    &link,
+                    &link.link,
                     Some(resolved_url.to_string()),
                     Some(canonical_url),
                     Some(canonicalization_result),
@@ -974,7 +1129,7 @@ impl PreviewRun {
                     let depth = self.queued_duplicate_prospective_depth(
                         entry,
                         source_match,
-                        &link,
+                        &link.link,
                         &canonical_url,
                     )?;
                     self.merge_queued_duplicate_provenance(&canonical_url, &entry.seed_ids, depth);
@@ -984,7 +1139,7 @@ impl PreviewRun {
                     entry,
                     source,
                     source_match,
-                    &link,
+                    &link.link,
                     Some(resolved_url.to_string()),
                     Some(canonical_url.clone()),
                     Some(canonicalization_result),
@@ -1008,7 +1163,7 @@ impl PreviewRun {
             let mut eligible = Vec::new();
             for transition in self.sorted_transitions_for(source_page_type_id) {
                 let selector_eligible =
-                    link.selector.as_deref() == Some(transition.link_selector.as_str());
+                    link.link.selector.as_deref() == Some(transition.link_selector.as_str());
                 let target_page_type_eligible = target_match.decision
                     == PageTypeMatchStatus::Matched
                     && target_match.winner.as_ref().is_some_and(|winner| {
@@ -1083,7 +1238,7 @@ impl PreviewRun {
                     diagnostic,
                 });
             }
-            let state = match target_match.decision {
+            let mut state = match target_match.decision {
                 PageTypeMatchStatus::Ambiguous => PreviewUrlState::AmbiguousPageType,
                 PageTypeMatchStatus::Unmatched => PreviewUrlState::Unmatched,
                 PageTypeMatchStatus::Matched
@@ -1097,28 +1252,20 @@ impl PreviewRun {
                 PageTypeMatchStatus::Matched => PreviewUrlState::InScopeMatched,
             };
             let prospective_depth = eligible.iter().map(|(_, depth)| *depth).min();
-            let mut path = self.path_base(
-                entry,
-                source,
-                source_match,
-                &link,
-                Some(resolved_url.to_string()),
-                Some(canonical_url.clone()),
-                Some(canonicalization_result),
-                scope,
-                state,
-                Some(target_match.clone()),
-                None,
-                evaluations,
-                Vec::new(),
-            )?;
-            path.prospective_depth = prospective_depth;
-            self.paths.push(path);
+            let mut path_budget_hits = evaluations
+                .iter()
+                .flat_map(|evaluation| evaluation.budget_hits.iter().cloned())
+                .collect::<Vec<_>>();
+            let mut admission_allowed = false;
+            let mut admission_depth = None;
+            let mut admission_page_type_id = None;
             if let Some((_, depth)) = eligible.iter().min_by(|left, right| left.1.cmp(&right.1)) {
                 let target_page_type_id = target_match
                     .winner
                     .as_ref()
                     .map(|winner| winner.page_type_id);
+                admission_depth = Some(*depth);
+                admission_page_type_id = target_page_type_id;
                 if let Some(winner) = target_match.winner.as_ref() {
                     let page_count = self
                         .page_type_scheduled
@@ -1135,26 +1282,57 @@ impl PreviewRun {
                     let allowed_by_page_budget =
                         configured_page_limit.is_none_or(|limit| page_count < limit);
                     if !allowed_by_page_budget {
-                        self.record_budget(PreviewBudgetHit {
+                        let hit = PreviewBudgetHit {
                             kind: PreviewBudgetKind::PageTypePageBudget,
                             transition_id: None,
                             page_type_id: Some(winner.page_type_id),
                             observed: page_count,
                             limit: configured_page_limit.unwrap_or(page_count),
-                        });
-                        continue;
+                        };
+                        self.record_budget(hit.clone());
+                        path_budget_hits.push(hit);
+                        state = PreviewUrlState::BudgetExcluded;
+                    } else if self.admitted.len() as u64 >= self.context.limits.max_pages {
+                        let hit = PreviewBudgetHit {
+                            kind: PreviewBudgetKind::MaxPages,
+                            transition_id: None,
+                            page_type_id: None,
+                            observed: self.admitted.len() as u64,
+                            limit: self.context.limits.max_pages,
+                        };
+                        self.record_budget(hit.clone());
+                        path_budget_hits.push(hit);
+                        state = PreviewUrlState::BudgetExcluded;
+                    } else {
+                        admission_allowed = true;
                     }
                 }
-                if self.admitted.len() as u64 >= self.context.limits.max_pages {
-                    self.record_budget(PreviewBudgetHit {
-                        kind: PreviewBudgetKind::MaxPages,
-                        transition_id: None,
-                        page_type_id: None,
-                        observed: self.admitted.len() as u64,
-                        limit: self.context.limits.max_pages,
-                    });
-                    continue;
-                }
+            }
+            if link.is_pagination && state == PreviewUrlState::BudgetExcluded {
+                self.record_pagination_truncation(
+                    1,
+                    "Observed pagination was rejected by a bounded admission limit.",
+                    "PREVIEW_PAGINATION_NOT_EXPANDED",
+                );
+            }
+            let mut path = self.path_base(
+                entry,
+                source,
+                source_match,
+                &link.link,
+                Some(resolved_url.to_string()),
+                Some(canonical_url.clone()),
+                Some(canonicalization_result),
+                scope,
+                state,
+                Some(target_match.clone()),
+                None,
+                evaluations,
+                path_budget_hits,
+            )?;
+            path.prospective_depth = prospective_depth;
+            self.paths.push(path);
+            if admission_allowed {
                 self.admitted.insert(canonical_url.clone());
                 if let Some(winner) = target_match.winner.as_ref() {
                     *self
@@ -1168,9 +1346,9 @@ impl PreviewRun {
                     QueueEntry {
                         requested_url: canonical_url.clone(),
                         canonical_url,
-                        depth: *depth,
+                        depth: admission_depth.ok_or(DiscoveryPreviewError::BudgetOverflow)?,
                         seed_ids: entry.seed_ids.clone(),
-                        target_page_type_id,
+                        target_page_type_id: admission_page_type_id,
                         order,
                     },
                 );
@@ -1623,6 +1801,19 @@ impl PreviewRun {
         }
     }
 
+    fn record_pagination_truncation(&mut self, count: u64, message: &str, code: &str) {
+        if count == 0 {
+            return;
+        }
+        self.pagination_truncation_count = self.pagination_truncation_count.saturating_add(count);
+        self.push_diagnostic(PreviewDiagnostic {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            observed: Some(count),
+            threshold: Some(0),
+        });
+    }
+
     fn hit_time_budget(&mut self) {
         if self.time_budget_hit {
             return;
@@ -1743,6 +1934,8 @@ impl PreviewRun {
                 budget_hit_counts,
                 frontier_remaining,
                 newly_enqueued_urls: self.newly_enqueued_urls,
+                pagination_truncation_count: self.pagination_truncation_count,
+                duration_work_not_expanded: self.duration_work_not_expanded,
             },
             growth_indicators: indicators,
             growth_warnings,
@@ -1842,6 +2035,12 @@ fn map_provider_error(error: DiscoveryPreviewProviderError) -> DiscoveryPreviewE
     match error {
         DiscoveryPreviewProviderError::Unavailable => DiscoveryPreviewError::ProviderUnavailable,
     }
+}
+
+fn fragment_free_url(url: &url::Url) -> String {
+    let mut fetch_url = url.clone();
+    fetch_url.set_fragment(None);
+    fetch_url.to_string()
 }
 
 fn map_crawler_error(error: CrawlerRepositoryError) -> DiscoveryPreviewError {
@@ -1969,7 +2168,7 @@ fn query_variant_groups(urls: &BTreeSet<String>) -> Vec<PreviewQueryVariantGroup
 }
 
 fn growth_warnings(
-    run: &PreviewRun,
+    run: &SemanticTraversal,
     counts: &[PreviewTransitionCount],
     total: u64,
     dominant: Option<&PreviewTransitionCount>,
@@ -2079,7 +2278,7 @@ fn reaches_budget_pressure(observed: u64, limit: u64) -> bool {
 }
 
 fn has_budget_pressure_utilization(
-    run: &PreviewRun,
+    run: &SemanticTraversal,
     counts: &[PreviewTransitionCount],
     total: u64,
 ) -> bool {
@@ -2151,7 +2350,7 @@ fn has_transition_total_budget_pressure(
     })
 }
 
-impl PreviewRun {
+impl SemanticTraversal {
     fn count_scope(&mut self, state: PreviewUrlState) {
         match state {
             PreviewUrlState::External => {
