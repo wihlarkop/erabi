@@ -12,14 +12,19 @@ erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 fs4 = { version = "1", default-features = false, features = ["sync"] }
-futures-util = "0.3.31"
+futures-util = "0.3.34"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
 url = "2.5.8"
-uuid = { version = "1.25.0", features = ["v7"] }
+uuid = { version = "1.26.0", features = ["v7"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { version = "1.53.1", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+  "time",
+] }
