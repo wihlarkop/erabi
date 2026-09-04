@@ -11,8 +11,8 @@ workspace = true
 [dependencies]
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
-reqwest = { version = "0.12.23", default-features = false, features = [
-  "rustls-tls",
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "rustls",
   "stream",
 ] }
 serde_json = "1.0.151"

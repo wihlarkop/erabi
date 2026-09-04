@@ -10,9 +10,9 @@ workspace = true
 [dependencies]
 base64 = "0.23.1"
 erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
-reqwest = { version = "0.12.23", default-features = false, features = [
+reqwest = { version = "0.13.4", default-features = false, features = [
   "json",
-  "rustls-tls",
+  "rustls",
   "stream",
 ] }
 secrecy = "0.10.3"
