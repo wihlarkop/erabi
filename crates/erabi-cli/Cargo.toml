@@ -17,9 +17,17 @@ erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }
 secrecy = "0.10.3"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 url = "2.5.8"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt", "test-util", "time"] }
-turso = "0.7.2"
+turso = { version = "0.7.2", default-features = false }

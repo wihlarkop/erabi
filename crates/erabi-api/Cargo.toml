@@ -28,4 +28,4 @@ uuid = { version = "1.25.0", features = ["v7"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
-turso = "0.7.2"
+turso = { version = "0.7.2", default-features = false }
