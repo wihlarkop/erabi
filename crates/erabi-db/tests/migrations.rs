@@ -7,7 +7,10 @@ async fn empty_database_applies_the_complete_migration_chain()
     let runner = MigrationRunner::default();
 
     let report = runner.apply(&database).await?;
-    assert_eq!(report.applied, ["0001", "0002", "0003", "0004", "0005"]);
+    assert_eq!(
+        report.applied,
+        ["0001", "0002", "0003", "0004", "0005", "0006"]
+    );
     assert_eq!(
         runner
             .status(&database)
@@ -15,7 +18,7 @@ async fn empty_database_applies_the_complete_migration_chain()
             .into_iter()
             .map(|version| version.version)
             .collect::<Vec<_>>(),
-        ["0001", "0002", "0003", "0004", "0005"]
+        ["0001", "0002", "0003", "0004", "0005", "0006"]
     );
     Ok(())
 }
@@ -32,7 +35,7 @@ async fn supported_0001_baseline_migrates_to_the_current_schema()
     );
     assert_eq!(
         runner.apply(&database).await?.applied,
-        ["0002", "0003", "0004", "0005"]
+        ["0002", "0003", "0004", "0005", "0006"]
     );
     Ok(())
 }
@@ -87,7 +90,8 @@ fn migration_directory_contains_the_historical_chain_and_task_3_migration()
             "0002_crawler_core.sql",
             "0003_runs.sql",
             "0004_jobs.sql",
-            "0005_crawl_execution.sql"
+            "0005_crawl_execution.sql",
+            "0006_crawl_traversal_state.sql"
         ]
     );
     Ok(())

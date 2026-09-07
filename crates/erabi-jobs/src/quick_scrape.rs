@@ -7,18 +7,21 @@ use std::{
 };
 
 use erabi_crawler::{
-    AdmissionError, CrawlerAdapter, CrawlerAdapterError, CrawlerArtifactEvidence,
-    CrawlerArtifactKind, CrawlerEvidencePolicy, CrawlerExecuteRequest, CrawlerResultCompleteness,
-    NetworkTargetPolicy, OriginKey, PacingCancellation, PacingOutcome, PacingService,
-    RenderingRequirement, RobotsAdmissionDecision, RobotsPolicyError, RobotsPolicyService,
-    ScreenshotPolicy, quick_scrape_snapshot_target,
+    AdmissionError, CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
+    CrawlerArtifactEvidence, CrawlerArtifactKind, CrawlerEvidencePolicy, CrawlerExecuteRequest,
+    CrawlerResultCompleteness, NetworkTargetPolicy, OriginKey, PacingCancellation, PacingOutcome,
+    PacingService, RenderingRequirement, RobotsAdmissionDecision, RobotsPolicyError,
+    RobotsPolicyService, ScreenshotPolicy, quick_scrape_snapshot_target,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase,
     repositories::{
-        ArtifactRepository, CrawlExecutionArtifact, CrawlExecutionArtifactKind,
-        CrawlExecutionRecord, CrawlExecutionRepository, CrawlExecutionRepositoryError,
-        CrawlExecutionSummary, CrawlRunRepository, JobRepository, SourceRepository,
+        ArtifactRepository, CrawlAdmissionState, CrawlExecutionArtifact,
+        CrawlExecutionArtifactKind, CrawlExecutionRecord, CrawlExecutionRepository,
+        CrawlExecutionRepositoryError, CrawlExecutionSummary, CrawlRecoveryActionKind,
+        CrawlRunRepository, CrawlTraversalControl, CrawlTraversalRepository,
+        CrawlTraversalRepositoryError, CrawlUrlStateRecord, CrawlWorkState, JobRepository,
+        SourceRepository,
     },
 };
 use erabi_domain::{
@@ -31,6 +34,11 @@ use crate::{
     JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent, ProgressAttemptId,
     ProgressKey, ProgressLiveHub, ProgressMetadata, ProgressService, ProgressTerminalState,
 };
+
+/// A Quick Scrape root performs its initial attempt and one automatic retry.
+/// Further configured attempt budget remains available to an explicit durable
+/// Retry child, preserving the operator-visible generation boundary.
+const QUICK_SCRAPE_AUTOMATIC_MAX_ATTEMPTS: u32 = 2;
 
 /// Focused Plan 06 handler wired into the existing generic durable runtime.
 /// The adapter remains provider-neutral; no `Crawl4AI` DTO or handle enters this
@@ -78,6 +86,10 @@ impl QuickScrapeJobHandler {
         }
     }
 
+    pub(crate) fn database(&self) -> &ErabiDatabase {
+        &self.database
+    }
+
     #[must_use]
     pub fn with_progress_live_hub(mut self, progress_live_hub: ProgressLiveHub) -> Self {
         self.progress_live_hub = Some(progress_live_hub);
@@ -89,13 +101,22 @@ impl QuickScrapeJobHandler {
     // makes RAII release and crash boundaries auditable.
     #[allow(clippy::too_many_lines)]
     async fn execute_inner(&self, context: JobExecutionContext) -> Result<(), ()> {
-        if !matches!(context.kind().as_str(), "QUICK_SCRAPE" | "RETRY") {
+        if !matches!(
+            context.kind().as_str(),
+            "QUICK_SCRAPE"
+                | "RETRY"
+                | "RETRY_FAILED_PARTS"
+                | "RESUME_CHECKPOINT"
+                | "RERUN_FULL_CRAWL"
+                | "RESTART_FROM_BEGINNING"
+        ) {
             return Err(());
         }
         let job = JobRepository::new(&self.database)
             .job(context.job_id())
             .await
             .map_err(|_| ())?;
+        let terminal_attempt = quick_scrape_terminal_attempt(&context, &job);
         let stored_run_id = job.crawl_run_id.as_deref().ok_or(())?;
         let run_id = parse_run_id(stored_run_id)?;
         let snapshot = CrawlRunRepository::new(&self.database)
@@ -111,22 +132,144 @@ impl QuickScrapeJobHandler {
         if source.canonical_url != target.target_url {
             return Err(());
         }
-        let execution_id = execution_id_for_job(context.job_id().as_str())?;
+        let latest_checkpoint = if matches!(
+            context.kind().as_str(),
+            "RERUN_FULL_CRAWL" | "RESTART_FROM_BEGINNING"
+        ) {
+            None
+        } else {
+            JobRepository::new(&self.database)
+                .latest_checkpoint_for_lineage(context.job_id())
+                .await
+                .map_err(|_| ())?
+        };
+        if let Some(record) = latest_checkpoint.as_ref() {
+            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id)
+                .map_err(|_| ())?;
+        }
+        let recovery_kind = match context.kind().as_str() {
+            "RETRY" => Some(CrawlRecoveryActionKind::Retry),
+            "RETRY_FAILED_PARTS" => Some(CrawlRecoveryActionKind::RetryFailedParts),
+            "RESTART_FROM_BEGINNING" => Some(CrawlRecoveryActionKind::RestartFromBeginning),
+            _ => None,
+        };
+        if let Some(kind) = recovery_kind {
+            // Persist a compact action marker before mutating logical
+            // generation state. This keeps an action child replayable if the
+            // process dies between action preparation and its next ordinary
+            // checkpoint. A fresh Restart action may have no prior checkpoint;
+            // its marker still remains bounded and is followed by the normal
+            // initialization checkpoint when the durable state is created.
+            let action_checkpoint = latest_checkpoint
+                .as_ref()
+                .map(|record| record.checkpoint.clone())
+                .unwrap_or(
+                    CrawlCheckpointV2::new(run_id, &snapshot, CrawlRecoveryPhase::Traversing)
+                        .map_err(|_| ())?
+                        .to_envelope()
+                        .map_err(|_| ())?,
+                );
+            context
+                .checkpoint(&action_checkpoint)
+                .await
+                .map_err(|_| ())?;
+            CrawlTraversalRepository::new(&self.database)
+                .prepare_recovery_action(
+                    context.job_id(),
+                    context.attempt_id(),
+                    run_id,
+                    kind,
+                    context.ownership_now(),
+                )
+                .await
+                .map_err(|_| ())?;
+        }
+        let durable_state = match CrawlTraversalRepository::new(&self.database)
+            .reconstruct_recovery_state(run_id)
+            .await
+        {
+            Ok(state) => Some(state),
+            Err(CrawlTraversalRepositoryError::CrawlRunNotFound) => None,
+            Err(_) => return Err(()),
+        };
+        let current_work_completed = durable_state.as_ref().is_some_and(|state| {
+            state.work.iter().any(|work| {
+                work.id == quick_url_state_id(run_id)
+                    && work.admission_state == CrawlAdmissionState::Admitted
+                    && work.current_work_state == Some(CrawlWorkState::Completed)
+            })
+        });
+        if current_work_completed {
+            return self
+                .finish_recovered_execution(&context, run_id, snapshot, CrawlRunStatus::Running)
+                .await;
+        }
+        let mut execution_id = execution_id_for_job(context.job_id().as_str())?;
         let executions = CrawlExecutionRepository::new(&self.database);
         match executions.read(execution_id).await {
             Ok(existing) => {
-                return self
-                    .finish_recovered_execution(&context, run_id, existing)
-                    .await;
+                if existing.outcome == CrawlExecutionOutcome::Completed {
+                    return Err(());
+                }
+                execution_id = CrawlExecutionId::new();
             }
             Err(CrawlExecutionRepositoryError::NotFound) => {}
             Err(_) => return Err(()),
         }
-        CrawlRunRepository::new(&self.database)
-            .transition_execution_status(run_id, CrawlRunStatus::Running)
+        let run_repository = CrawlRunRepository::new(&self.database);
+        if let Some(CrawlRecoveryActionKind::RestartFromBeginning) = recovery_kind {
+            run_repository
+                .transition_restart_status(run_id)
+                .await
+                .map_err(|_| ())?;
+        } else if recovery_kind.is_some() {
+            run_repository
+                .transition_recovery_status(run_id)
+                .await
+                .map_err(|_| ())?;
+        } else {
+            run_repository
+                .transition_execution_status(run_id, CrawlRunStatus::Running)
+                .await
+                .map_err(|_| ())?;
+        }
+        self.progress(&context, "STARTED", None).await?;
+        if latest_checkpoint.is_none() {
+            if durable_state.is_none() {
+                self.initialize_quick_work(run_id, target.target_url.as_str())
+                    .await?;
+            }
+            self.save_quick_checkpoint(
+                &context,
+                &snapshot,
+                run_id,
+                CrawlRecoveryPhase::Initialized,
+            )
+            .await?;
+        }
+        if context.cancellation().is_cancelled() {
+            return self
+                .finish_recovered_execution(&context, run_id, snapshot, CrawlRunStatus::Cancelled)
+                .await;
+        }
+        if context.storage_pressure().is_signalled() {
+            return Ok(());
+        }
+        let expected_work_generation = CrawlTraversalRepository::new(&self.database)
+            .read_work_generation(run_id, &quick_url_state_id(run_id))
             .await
             .map_err(|_| ())?;
-        self.progress(&context, "STARTED", None).await?;
+        CrawlExecutionRepository::new(&self.database)
+            .activate_current_work(
+                run_id,
+                &quick_url_state_id(run_id),
+                context.job_id(),
+                context.attempt_id(),
+                expected_work_generation,
+                context.ownership_now(),
+            )
+            .await
+            .map_err(|_| ())?;
 
         // A confident Task 4 FileAsset classification is a durable completed
         // Quick Scrape without an HTML-provider request or Plan 08 download.
@@ -151,14 +294,13 @@ impl QuickScrapeJobHandler {
                 provider_elapsed_ms: None,
                 artifacts: Vec::new(),
             };
-            self.persist_success(run_id, &record, false).await?;
-            self.progress(
-                &context,
-                "COMPLETED",
-                Some(ProgressTerminalState::Succeeded),
-            )
-            .await?;
-            return Ok(());
+            self.persist_record(&record, &context, Some(expected_work_generation))
+                .await?;
+            self.save_quick_checkpoint(&context, &snapshot, run_id, CrawlRecoveryPhase::Finalizing)
+                .await?;
+            return self
+                .finish_recovered_execution(&context, run_id, snapshot, CrawlRunStatus::Running)
+                .await;
         }
 
         let origin = OriginKey::from_url(&target.target_url).map_err(|_| ())?;
@@ -168,14 +310,14 @@ impl QuickScrapeJobHandler {
             Ok(registration) => registration,
             Err(AdmissionError::Cancelled) => {
                 context.cancellation().cancel();
-                let _ = self
-                    .progress(
+                return self
+                    .finish_recovered_execution(
                         &context,
-                        "CANCELLED",
-                        Some(ProgressTerminalState::Cancelled),
+                        run_id,
+                        snapshot.clone(),
+                        CrawlRunStatus::Cancelled,
                     )
                     .await;
-                return Err(());
             }
             Err(error) => {
                 return self
@@ -189,7 +331,8 @@ impl QuickScrapeJobHandler {
                             error_code: CrawlExecutionErrorCode::RemoteFailure,
                             http_status: None,
                             retryable: pacing_failure_is_retryable(error),
-                            terminal_attempt: job.current_attempt >= job.max_attempts,
+                            terminal_attempt,
+                            expected_work_generation,
                         },
                     )
                     .await;
@@ -198,24 +341,34 @@ impl QuickScrapeJobHandler {
         let pacing_cancellation = PacingCancellation::new();
         let robots = tokio::select! {
             value = self.robots.evaluate(&target.target_url, &snapshot, &pacing_cancellation) => value,
+            () = context.storage_pressure().signalled() => {
+                pacing_cancellation.cancel();
+                return Ok(());
+            }
             () = context.cancellation().cancelled() => {
                 pacing_cancellation.cancel();
-                let _ = self.progress(&context, "CANCELLED", Some(ProgressTerminalState::Cancelled)).await;
-                return Err(());
+                return self
+                    .finish_recovered_execution(
+                        &context,
+                        run_id,
+                        snapshot.clone(),
+                        CrawlRunStatus::Cancelled,
+                    )
+                    .await;
             }
         };
         let robots = match robots {
             Ok(robots) => robots,
             Err(RobotsPolicyError::Admission(AdmissionError::Cancelled)) => {
                 context.cancellation().cancel();
-                let _ = self
-                    .progress(
+                return self
+                    .finish_recovered_execution(
                         &context,
-                        "CANCELLED",
-                        Some(ProgressTerminalState::Cancelled),
+                        run_id,
+                        snapshot.clone(),
+                        CrawlRunStatus::Cancelled,
                     )
                     .await;
-                return Err(());
             }
             Err(error) => {
                 return self
@@ -229,7 +382,8 @@ impl QuickScrapeJobHandler {
                             error_code: CrawlExecutionErrorCode::RemoteFailure,
                             http_status: None,
                             retryable: robots_failure_is_retryable(&error),
-                            terminal_attempt: job.current_attempt >= job.max_attempts,
+                            terminal_attempt,
+                            expected_work_generation,
                         },
                     )
                     .await;
@@ -248,30 +402,41 @@ impl QuickScrapeJobHandler {
                         http_status: None,
                         retryable: false,
                         terminal_attempt: true,
+                        expected_work_generation,
                     },
                 )
                 .await;
         }
         let permit = tokio::select! {
             value = registration.acquire(&robots, &pacing_cancellation) => value,
+            () = context.storage_pressure().signalled() => {
+                pacing_cancellation.cancel();
+                return Ok(());
+            }
             () = context.cancellation().cancelled() => {
                 pacing_cancellation.cancel();
-                let _ = self.progress(&context, "CANCELLED", Some(ProgressTerminalState::Cancelled)).await;
-                return Err(());
+                return self
+                    .finish_recovered_execution(
+                        &context,
+                        run_id,
+                        snapshot.clone(),
+                        CrawlRunStatus::Cancelled,
+                    )
+                    .await;
             }
         };
         let permit = match permit {
             Ok(permit) => permit,
             Err(AdmissionError::Cancelled) => {
                 context.cancellation().cancel();
-                let _ = self
-                    .progress(
+                return self
+                    .finish_recovered_execution(
                         &context,
-                        "CANCELLED",
-                        Some(ProgressTerminalState::Cancelled),
+                        run_id,
+                        snapshot.clone(),
+                        CrawlRunStatus::Cancelled,
                     )
                     .await;
-                return Err(());
             }
             Err(error) => {
                 return self
@@ -285,7 +450,8 @@ impl QuickScrapeJobHandler {
                             error_code: CrawlExecutionErrorCode::RemoteFailure,
                             http_status: None,
                             retryable: pacing_failure_is_retryable(error),
-                            terminal_attempt: job.current_attempt >= job.max_attempts,
+                            terminal_attempt,
+                            expected_work_generation,
                         },
                     )
                     .await;
@@ -315,10 +481,20 @@ impl QuickScrapeJobHandler {
         .map_err(|_| ())?;
         let provider = tokio::select! {
             value = self.adapter.execute(request) => value,
+            () = context.storage_pressure().signalled() => {
+                pacing_cancellation.cancel();
+                return Ok(());
+            }
             () = context.cancellation().cancelled() => {
                 pacing_cancellation.cancel();
-                let _ = self.progress(&context, "CANCELLED", Some(ProgressTerminalState::Cancelled)).await;
-                return Err(());
+                return self
+                    .finish_recovered_execution(
+                        &context,
+                        run_id,
+                        snapshot.clone(),
+                        CrawlRunStatus::Cancelled,
+                    )
+                    .await;
             }
         };
         let result = match provider {
@@ -332,14 +508,14 @@ impl QuickScrapeJobHandler {
                 let _ = permit.record_outcome(PacingOutcome::from_adapter_error(&error));
                 if matches!(error, CrawlerAdapterError::Cancelled) {
                     context.cancellation().cancel();
-                    let _ = self
-                        .progress(
+                    return self
+                        .finish_recovered_execution(
                             &context,
-                            "CANCELLED",
-                            Some(ProgressTerminalState::Cancelled),
+                            run_id,
+                            snapshot.clone(),
+                            CrawlRunStatus::Cancelled,
                         )
                         .await;
-                    return Err(());
                 }
                 return self
                     .terminal_failure(
@@ -352,7 +528,8 @@ impl QuickScrapeJobHandler {
                             error_code: adapter_error_code(&error),
                             http_status: adapter_error_status(&error),
                             retryable: adapter_error_is_retryable(&error),
-                            terminal_attempt: job.current_attempt >= job.max_attempts,
+                            terminal_attempt,
+                            expected_work_generation,
                         },
                     )
                     .await;
@@ -374,6 +551,7 @@ impl QuickScrapeJobHandler {
                                 http_status: None,
                                 retryable: false,
                                 terminal_attempt: true,
+                                expected_work_generation,
                             },
                         )
                         .await;
@@ -398,6 +576,7 @@ impl QuickScrapeJobHandler {
                                 http_status: None,
                                 retryable: false,
                                 terminal_attempt: true,
+                                expected_work_generation,
                             },
                         )
                         .await;
@@ -439,94 +618,216 @@ impl QuickScrapeJobHandler {
             provider_elapsed_ms: response.provider_elapsed_ms(),
             artifacts,
         };
-        self.persist_success(run_id, &record, partial).await?;
-        self.progress(
-            &context,
-            if partial {
-                "PARTIAL_RESULT"
-            } else {
-                "COMPLETED"
-            },
-            Some(ProgressTerminalState::Succeeded),
-        )
-        .await?;
-        Ok(())
+        self.persist_record(&record, &context, Some(expected_work_generation))
+            .await?;
+        self.save_quick_checkpoint(&context, &snapshot, run_id, CrawlRecoveryPhase::Finalizing)
+            .await?;
+        self.finish_recovered_execution(&context, run_id, snapshot, CrawlRunStatus::Running)
+            .await
     }
 
     async fn finish_recovered_execution(
         &self,
         context: &JobExecutionContext,
         run_id: CrawlRunId,
-        record: CrawlExecutionRecord,
+        snapshot: erabi_domain::CrawlRunSnapshot,
+        current_status: CrawlRunStatus,
     ) -> Result<(), ()> {
-        match record.outcome {
-            CrawlExecutionOutcome::Completed => {
-                CrawlExecutionRepository::new(&self.database)
-                    .save_summary(&CrawlExecutionSummary {
-                        crawl_run_id: run_id,
-                        in_scope_pages_planned: 1,
-                        in_scope_pages_completed: 1,
-                        pagination_truncation_count: 0,
-                        unresolved_partial_work_count: 0,
-                        page_type_ambiguity_count: 0,
-                    })
-                    .await
-                    .map_err(|_| ())?;
-                CrawlRunRepository::new(&self.database)
-                    .transition_execution_status(run_id, CrawlRunStatus::Succeeded)
-                    .await
-                    .map_err(|_| ())?;
-                let _ = self
-                    .progress(context, "COMPLETED", Some(ProgressTerminalState::Succeeded))
-                    .await;
-                Ok(())
-            }
-            CrawlExecutionOutcome::Partial => {
-                CrawlExecutionRepository::new(&self.database)
-                    .save_summary(&CrawlExecutionSummary {
-                        crawl_run_id: run_id,
-                        in_scope_pages_planned: 1,
-                        in_scope_pages_completed: 1,
-                        pagination_truncation_count: 0,
-                        unresolved_partial_work_count: 1,
-                        page_type_ambiguity_count: 0,
-                    })
-                    .await
-                    .map_err(|_| ())?;
-                CrawlRunRepository::new(&self.database)
-                    .transition_execution_status(run_id, CrawlRunStatus::PartialResult)
-                    .await
-                    .map_err(|_| ())?;
-                let _ = self
-                    .progress(
-                        context,
-                        "PARTIAL_RESULT",
-                        Some(ProgressTerminalState::Succeeded),
-                    )
-                    .await;
-                Ok(())
-            }
-            CrawlExecutionOutcome::Failed => {
-                CrawlExecutionRepository::new(&self.database)
-                    .save_summary(&CrawlExecutionSummary {
-                        crawl_run_id: run_id,
-                        in_scope_pages_planned: 1,
-                        in_scope_pages_completed: 0,
-                        pagination_truncation_count: 0,
-                        unresolved_partial_work_count: 1,
-                        page_type_ambiguity_count: 0,
-                    })
-                    .await
-                    .map_err(|_| ())?;
-                CrawlRunRepository::new(&self.database)
-                    .transition_execution_status(run_id, CrawlRunStatus::Failed)
-                    .await
-                    .map_err(|_| ())?;
-                context.mark_terminal_failure();
-                Err(())
-            }
-            CrawlExecutionOutcome::Cancelled => Err(()),
+        let executions = CrawlExecutionRepository::new(&self.database)
+            .list_for_run(run_id)
+            .await
+            .map_err(|_| ())?;
+        let discovered = CrawlRunRepository::new(&self.database)
+            .discovered_urls(run_id)
+            .await
+            .map_err(|_| ())?;
+        let checkpoint = JobRepository::new(&self.database)
+            .latest_checkpoint_for_lineage(context.job_id())
+            .await
+            .map_err(|_| ())?;
+        let _checkpoint = checkpoint
+            .as_ref()
+            .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id))
+            .transpose()
+            .map_err(|_| ())?;
+        let durable = CrawlTraversalRepository::new(&self.database)
+            .reconstruct_recovery_state(run_id)
+            .await
+            .map_err(|_| ())?;
+        let authoritative_status = durable
+            .work
+            .iter()
+            .find(|work| work.id == quick_url_state_id(run_id))
+            .and_then(|work| work.current_work_state)
+            .map_or(current_status, |work_state| match work_state {
+                CrawlWorkState::Failed
+                    if matches!(
+                        current_status,
+                        CrawlRunStatus::Queued | CrawlRunStatus::Running
+                    ) =>
+                {
+                    CrawlRunStatus::Failed
+                }
+                CrawlWorkState::Cancelled
+                    if matches!(
+                        current_status,
+                        CrawlRunStatus::Queued | CrawlRunStatus::Running
+                    ) =>
+                {
+                    CrawlRunStatus::Cancelled
+                }
+                CrawlWorkState::Partial
+                    if matches!(
+                        current_status,
+                        CrawlRunStatus::Queued | CrawlRunStatus::Running
+                    ) =>
+                {
+                    CrawlRunStatus::PartialResult
+                }
+                _ => current_status,
+            });
+        let finalization = erabi_crawler::finalize_durable_state_with_traversal(
+            &snapshot,
+            authoritative_status,
+            &executions,
+            &discovered,
+            None,
+            Some(&durable.control),
+            Some(&durable.work),
+        )
+        .map_err(|_| ())?;
+        let summary = CrawlExecutionSummary {
+            crawl_run_id: run_id,
+            in_scope_pages_planned: finalization.structural_input.in_scope_pages_planned,
+            in_scope_pages_completed: finalization.structural_input.in_scope_pages_completed,
+            pagination_truncation_count: finalization.structural_input.pagination_truncation_count,
+            unresolved_partial_work_count: finalization
+                .structural_input
+                .unresolved_partial_work_count,
+            page_type_ambiguity_count: finalization.structural_input.page_type_ambiguity_count,
+        };
+        CrawlExecutionRepository::new(&self.database)
+            .finalize(&summary, finalization.status)
+            .await
+            .map_err(|_| ())?;
+        if finalization.status == CrawlRunStatus::Cancelled {
+            let _ = self
+                .progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
+                .await;
         }
+        let _ = self.progress(context, "FINALIZATION_COMPLETED", None).await;
+        let (key, terminal) = match finalization.status {
+            CrawlRunStatus::Failed => ("FAILED", ProgressTerminalState::Failed),
+            CrawlRunStatus::Cancelled => ("CANCELLED", ProgressTerminalState::Cancelled),
+            CrawlRunStatus::PartialResult => ("PARTIAL_RESULT", ProgressTerminalState::Succeeded),
+            CrawlRunStatus::Succeeded => ("COMPLETED", ProgressTerminalState::Succeeded),
+            CrawlRunStatus::Queued | CrawlRunStatus::Running => return Err(()),
+        };
+        let _ = self.progress(context, key, Some(terminal)).await;
+        Ok(())
+    }
+
+    async fn save_quick_checkpoint(
+        &self,
+        context: &JobExecutionContext,
+        snapshot: &erabi_domain::CrawlRunSnapshot,
+        run_id: CrawlRunId,
+        phase: CrawlRecoveryPhase,
+    ) -> Result<(), ()> {
+        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, phase).map_err(|_| ())?;
+        context
+            .checkpoint(&checkpoint.to_envelope().map_err(|_| ())?)
+            .await
+            .map_err(|_| ())?;
+        self.progress(context, "CHECKPOINT_SAVED", None).await
+    }
+
+    async fn initialize_quick_work(&self, run_id: CrawlRunId, target_url: &str) -> Result<(), ()> {
+        let state = CrawlUrlStateRecord {
+            id: quick_url_state_id(run_id),
+            crawl_run_id: run_id,
+            canonical_url: target_url.to_owned(),
+            first_discovered_url_id: None,
+            requested_url: target_url.to_owned(),
+            parent_url_state_id: None,
+            parent_discovered_url_id: None,
+            admission_state: CrawlAdmissionState::Admitted,
+            preserve_reason: None,
+            resolved_to_url_state_id: None,
+            admission_sequence: Some(0),
+            depth: Some(0),
+            target_page_type_id: None,
+            transition_id: None,
+            pagination: false,
+            final_canonical_url: None,
+            current_work_state: Some(CrawlWorkState::Pending),
+            work_generation: 0,
+            current_execution_id: None,
+            seed_provenance: Vec::new(),
+            seen: true,
+            sampled: false,
+            expanded: false,
+            in_scope: false,
+            page_type_match_state: None,
+        };
+        let control = CrawlTraversalControl {
+            crawl_run_id: run_id,
+            consumed_bytes: 0,
+            raw_link_count: 0,
+            duplicate_count: 0,
+            robots_excluded_count: 0,
+            provider_error_count: 0,
+            external_url_count: 0,
+            blocked_url_count: 0,
+            peak_expansion_count: 0,
+            elapsed_millis: 0,
+            time_budget_hit: false,
+            duration_work_not_expanded: false,
+            pagination_truncation_count: 0,
+            next_admission_sequence: 1,
+        };
+        CrawlTraversalRepository::new(&self.database)
+            .initialize_run_state(run_id, &[state], &control)
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn persist_record(
+        &self,
+        record: &CrawlExecutionRecord,
+        context: &JobExecutionContext,
+        expected_work_generation: Option<u64>,
+    ) -> Result<(), ()> {
+        let state = match record.outcome {
+            CrawlExecutionOutcome::Completed => CrawlWorkState::Completed,
+            CrawlExecutionOutcome::Partial => CrawlWorkState::Partial,
+            CrawlExecutionOutcome::Failed => CrawlWorkState::Failed,
+            CrawlExecutionOutcome::Cancelled => CrawlWorkState::Cancelled,
+        };
+        let executions = CrawlExecutionRepository::new(&self.database);
+        let expected_work_generation = match expected_work_generation {
+            Some(generation) => generation,
+            None => CrawlTraversalRepository::new(&self.database)
+                .read_work_generation(
+                    record.crawl_run_id,
+                    &quick_url_state_id(record.crawl_run_id),
+                )
+                .await
+                .map_err(|_| ())?,
+        };
+        executions
+            .persist_current_work(
+                record,
+                &quick_url_state_id(record.crawl_run_id),
+                context.job_id(),
+                context.attempt_id(),
+                state,
+                expected_work_generation,
+                context.ownership_now(),
+            )
+            .await
+            .or_else(duplicate_execution_is_ok)
+            .map_err(|_| ())
     }
 
     async fn terminal_failure(
@@ -534,9 +835,52 @@ impl QuickScrapeJobHandler {
         context: &JobExecutionContext,
         failure: &FailureContext<'_>,
     ) -> Result<(), ()> {
-        if failure.retryable && !failure.terminal_attempt {
-            self.progress(context, "RETRY_SCHEDULED", None).await?;
-            return Err(());
+        if context.storage_pressure().is_signalled() {
+            return Ok(());
+        }
+        if context.cancellation().is_cancelled() {
+            let snapshot = CrawlRunRepository::new(&self.database)
+                .snapshot(failure.run_id)
+                .await
+                .map_err(|_| ())?;
+            self.persist_record(
+                &CrawlExecutionRecord {
+                    id: failure.execution_id,
+                    crawl_run_id: failure.run_id,
+                    requested_url: failure.target_url.to_string(),
+                    canonical_url: failure.target_url.to_string(),
+                    observed_final_url: None,
+                    source_id: Some(failure.source_id),
+                    page_type_id: None,
+                    transition_id: None,
+                    discovered_url_id: None,
+                    outcome: CrawlExecutionOutcome::Cancelled,
+                    error_code: Some(CrawlExecutionErrorCode::Cancelled),
+                    http_status: failure.http_status,
+                    media_type: None,
+                    content_length_bytes: None,
+                    provider_elapsed_ms: None,
+                    artifacts: Vec::new(),
+                },
+                context,
+                Some(failure.expected_work_generation),
+            )
+            .await?;
+            self.save_quick_checkpoint(
+                context,
+                &snapshot,
+                failure.run_id,
+                CrawlRecoveryPhase::Finalizing,
+            )
+            .await?;
+            return self
+                .finish_recovered_execution(
+                    context,
+                    failure.run_id,
+                    snapshot,
+                    CrawlRunStatus::Cancelled,
+                )
+                .await;
         }
         let record = CrawlExecutionRecord {
             id: failure.execution_id,
@@ -556,34 +900,32 @@ impl QuickScrapeJobHandler {
             provider_elapsed_ms: None,
             artifacts: Vec::new(),
         };
-        CrawlExecutionRepository::new(&self.database)
-            .persist(&record)
-            .await
-            .or_else(duplicate_execution_is_ok)
-            .map_err(|_| ())?;
-        CrawlExecutionRepository::new(&self.database)
-            .save_summary(&CrawlExecutionSummary {
-                crawl_run_id: failure.run_id,
-                in_scope_pages_planned: 1,
-                in_scope_pages_completed: 0,
-                pagination_truncation_count: 0,
-                unresolved_partial_work_count: 1,
-                page_type_ambiguity_count: 0,
-            })
-            .await
-            .map_err(|_| ())?;
-        CrawlRunRepository::new(&self.database)
-            .transition_execution_status(failure.run_id, CrawlRunStatus::Failed)
-            .await
-            .map_err(|_| ())?;
-        self.progress(context, "FAILED", Some(ProgressTerminalState::Failed))
+        self.persist_record(&record, context, Some(failure.expected_work_generation))
             .await?;
-        if !failure.retryable {
+        let snapshot = CrawlRunRepository::new(&self.database)
+            .snapshot(failure.run_id)
+            .await
+            .map_err(|_| ())?;
+        self.save_quick_checkpoint(
+            context,
+            &snapshot,
+            failure.run_id,
+            CrawlRecoveryPhase::Traversing,
+        )
+        .await?;
+        if failure.retryable && !failure.terminal_attempt {
+            self.progress(context, "RETRY_SCHEDULED", None).await?;
+            return Err(());
+        }
+        self.finish_recovered_execution(context, failure.run_id, snapshot, CrawlRunStatus::Failed)
+            .await?;
+        if !failure.retryable || failure.terminal_attempt {
             context.mark_terminal_failure();
         }
         Err(())
     }
 
+    #[allow(dead_code)]
     async fn persist_success(
         &self,
         run_id: CrawlRunId,
@@ -702,6 +1044,7 @@ struct FailureContext<'url> {
     http_status: Option<u16>,
     retryable: bool,
     terminal_attempt: bool,
+    expected_work_generation: u64,
 }
 
 impl JobHandler for QuickScrapeJobHandler {
@@ -710,12 +1053,16 @@ impl JobHandler for QuickScrapeJobHandler {
         context: JobExecutionContext,
     ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
         let handler = self.clone();
-        async move {
+        // The handler owns provider/artifact response values and now the
+        // compact durable-work transaction. Keep that state off Tokio's
+        // default worker stack; this is an execution-boundary allocation, not
+        // a change to retry or recovery semantics.
+        Box::pin(async move {
             handler
                 .execute_inner(context)
                 .await
                 .map_err(|()| JobExecutionError)
-        }
+        })
     }
 }
 
@@ -738,6 +1085,10 @@ fn execution_id_for_job(value: &str) -> Result<CrawlExecutionId, ()> {
         .ok()
         .and_then(CrawlExecutionId::from_uuid)
         .ok_or(())
+}
+
+fn quick_url_state_id(run_id: CrawlRunId) -> String {
+    format!("quick:{run_id}")
 }
 
 fn adapter_error_code(error: &CrawlerAdapterError) -> CrawlExecutionErrorCode {
@@ -781,6 +1132,12 @@ fn adapter_error_is_retryable(error: &CrawlerAdapterError) -> bool {
 
 fn robots_failure_is_retryable(error: &RobotsPolicyError) -> bool {
     matches!(error, RobotsPolicyError::Unavailable(_))
+}
+
+fn quick_scrape_terminal_attempt(context: &JobExecutionContext, job: &crate::JobRecord) -> bool {
+    job.current_attempt >= job.max_attempts
+        || (context.kind().as_str() == "QUICK_SCRAPE"
+            && job.current_attempt >= job.max_attempts.min(QUICK_SCRAPE_AUTOMATIC_MAX_ATTEMPTS))
 }
 
 fn pacing_failure_is_retryable(error: AdmissionError) -> bool {

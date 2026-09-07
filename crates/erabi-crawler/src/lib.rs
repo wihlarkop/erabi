@@ -4,8 +4,10 @@
 //! do not accumulate in this crate-root surface.
 
 mod adapter;
+mod checkpoint;
 mod content_probe;
 mod discovery_preview;
+mod finalization;
 mod mock_adapter;
 mod network_policy;
 mod observation;
@@ -21,8 +23,10 @@ mod test_lab;
 mod robots_pacing_tests;
 
 pub use adapter::*;
+pub use checkpoint::*;
 pub use content_probe::*;
 pub use discovery_preview::*;
+pub use finalization::*;
 pub use mock_adapter::*;
 pub use network_policy::*;
 pub use pacing::*;

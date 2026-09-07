@@ -682,6 +682,7 @@ dependencies = [
  "erabi-domain",
  "httpdate",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

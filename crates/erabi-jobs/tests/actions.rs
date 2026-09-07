@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use erabi_crawler::{
-    PRODUCTION_ROOT_MAX_ATTEMPTS, ProductionRunSubmissionRequest, ProductionRunSubmissionService,
+    CrawlCheckpoint, CrawlCheckpointUnit, CrawlCheckpointUnitState, PRODUCTION_ROOT_MAX_ATTEMPTS,
+    ProductionRunSubmissionRequest, ProductionRunSubmissionService, SemanticTraversalCheckpoint,
 };
 use erabi_db::repositories::{
-    CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, CrawlExecutionRecord,
-    CrawlExecutionRepository, CrawlRunRepository, CrawlerRepository, JobFailureCode, JobId,
-    JobKind, JobRepository, JobState, NewJob, ProgressReplayRequest, ProgressRepository,
+    CheckpointEnvelope, CheckpointIdentity, CrawlExecutionRecord, CrawlExecutionRepository,
+    CrawlExecutionSummary, CrawlRunRepository, CrawlerRepository, JobFailureCode, JobId, JobKind,
+    JobRepository, JobState, NewJob, ProgressReplayRequest, ProgressRepository,
     ProgressTerminalState,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
@@ -253,11 +254,57 @@ fn compatible_checkpoint(
     run_id: CrawlRunId,
     snapshot: &CrawlRunSnapshot,
 ) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
-    Ok(CheckpointEnvelope::new(CheckpointIdentity::new(
-        run_id.to_string(),
-        snapshot.snapshot_hash(),
-        snapshot.checkpoint_compatibility_hash(),
-    )?))
+    Ok(CrawlCheckpoint::new(
+        run_id,
+        snapshot,
+        SemanticTraversalCheckpoint::empty(snapshot.selected_seed_ids().to_vec()),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )?
+    .to_envelope()?)
+}
+
+fn checkpoint_unit(label: &str, state: CrawlCheckpointUnitState) -> CrawlCheckpointUnit {
+    CrawlCheckpointUnit {
+        state,
+        requested_url: format!("https://example.test/{label}"),
+        canonical_url: format!("https://example.test/{label}"),
+        discovered_url_id: None,
+        depth: 0,
+        page_type_id: None,
+        transition_id: None,
+        parent_canonical_url: None,
+        final_canonical_url: None,
+        pagination: false,
+        seed_ids: Vec::new(),
+        execution_ids: Vec::new(),
+    }
+}
+
+fn checkpoint_with_units(
+    run_id: CrawlRunId,
+    snapshot: &CrawlRunSnapshot,
+) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
+    Ok(CrawlCheckpoint::new(
+        run_id,
+        snapshot,
+        SemanticTraversalCheckpoint::empty(snapshot.selected_seed_ids().to_vec()),
+        vec![checkpoint_unit(
+            "success-1",
+            CrawlCheckpointUnitState::Completed,
+        )],
+        Vec::new(),
+        vec![checkpoint_unit(
+            "failed-1",
+            CrawlCheckpointUnitState::Failed,
+        )],
+        Vec::new(),
+        Vec::new(),
+    )?
+    .to_envelope()?)
 }
 
 #[tokio::test]
@@ -315,7 +362,7 @@ async fn retry_preserves_attempt_history_and_creates_a_new_attempt()
 }
 
 #[tokio::test]
-async fn production_recovery_actions_are_unavailable_until_frontier_reconstruction()
+async fn production_recovery_actions_fail_closed_without_a_frontier_checkpoint()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
     let (job_id, run_id) = production_root_job(&database).await?;
@@ -335,26 +382,24 @@ async fn production_recovery_actions_are_unavailable_until_frontier_reconstructi
 
     assert!(matches!(
         service.retry(&job_id, 3).await,
-        Err(JobActionError::IllegalLifecycleState)
+        Err(JobActionError::CheckpointMissing)
     ));
     assert!(matches!(
         service.retry_failed_parts(&job_id, 3).await,
-        Err(JobActionError::IllegalLifecycleState)
+        Err(JobActionError::CheckpointMissing)
     ));
     assert!(matches!(
         service.resume(&job_id, 3).await,
-        Err(JobActionError::IllegalLifecycleState)
+        Err(JobActionError::CheckpointMissing)
     ));
     assert!(matches!(
         service.restart_from_beginning(&job_id, 3).await,
         Err(JobActionError::IllegalLifecycleState)
     ));
-    assert!(matches!(
-        service
-            .rerun_full_crawl(&job_id, 3, RerunFullCrawlInput::default())
-            .await,
-        Err(JobActionError::IllegalLifecycleState)
-    ));
+    let rerun = service
+        .rerun_full_crawl(&job_id, 3, RerunFullCrawlInput::default())
+        .await?;
+    assert_ne!(rerun.crawl_run_id, Some(run_id.to_string()));
     assert_eq!(
         JobRepository::new(&database).attempts(&job_id).await?.len(),
         1
@@ -434,6 +479,95 @@ async fn stale_single_attempt_production_root_is_terminal_and_never_requeues()
             .await?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_running_job_reconciles_each_terminal_crawl_run_status_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            CrawlRunStatus::Succeeded,
+            JobState::Succeeded,
+            ProgressTerminalState::Succeeded,
+        ),
+        (
+            CrawlRunStatus::PartialResult,
+            JobState::Succeeded,
+            ProgressTerminalState::Succeeded,
+        ),
+        (
+            CrawlRunStatus::Failed,
+            JobState::Failed,
+            ProgressTerminalState::Failed,
+        ),
+        (
+            CrawlRunStatus::Cancelled,
+            JobState::Cancelled,
+            ProgressTerminalState::Cancelled,
+        ),
+    ];
+    for (terminal_run_status, expected_job_state, expected_terminal) in cases {
+        let database = database().await?;
+        let (job_id, run_id) = production_root_job(&database).await?;
+        let repository = JobRepository::new(&database);
+        let acquired = repository
+            .acquire_next("terminal-reconciliation-worker", 0, 2)
+            .await?
+            .ok_or("terminal reconciliation job was not acquired")?;
+        CrawlExecutionRepository::new(&database)
+            .finalize(
+                &CrawlExecutionSummary {
+                    crawl_run_id: run_id,
+                    in_scope_pages_planned: 0,
+                    in_scope_pages_completed: 0,
+                    pagination_truncation_count: 0,
+                    unresolved_partial_work_count: 0,
+                    page_type_ambiguity_count: 0,
+                },
+                terminal_run_status,
+            )
+            .await?;
+        assert_eq!(
+            CrawlRunRepository::new(&database).status(run_id).await?,
+            terminal_run_status
+        );
+
+        let first = repository.recover_stale_jobs(2).await?;
+        assert_eq!(first.requeued, 0);
+        assert_eq!(repository.job(&job_id).await?.state, expected_job_state);
+        assert_eq!(
+            CrawlRunRepository::new(&database).status(run_id).await?,
+            terminal_run_status
+        );
+        let progress = ProgressRepository::new(&database)
+            .replay(&job_id, ProgressReplayRequest::new(None, 32)?)
+            .await?;
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| event.terminal == Some(expected_terminal))
+                .count(),
+            1
+        );
+
+        let second = repository.recover_stale_jobs(3).await?;
+        assert_eq!(second.requeued, 0);
+        assert_eq!(second.failed, 0);
+        let progress_after_replay = ProgressRepository::new(&database)
+            .replay(&job_id, ProgressReplayRequest::new(None, 32)?)
+            .await?;
+        assert_eq!(
+            progress_after_replay
+                .events
+                .iter()
+                .filter(|event| event.terminal == Some(expected_terminal))
+                .count(),
+            1
+        );
+        let _ = acquired;
+    }
     Ok(())
 }
 
@@ -671,24 +805,22 @@ async fn retry_failed_parts_preserves_successful_checkpoint_evidence()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
     let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
-    let mut checkpoint = compatible_checkpoint(run_id, &snapshot)?;
-    checkpoint
-        .completed_units
-        .push(CheckpointUnitId::new("success-1")?);
-    checkpoint
-        .failed_units
-        .push(CheckpointUnitId::new("failed-1")?);
+    let checkpoint = checkpoint_with_units(run_id, &snapshot)?;
     cancel_active(&database, &job, Some(checkpoint)).await?;
     let service = JobActionService::new(database.clone(), CancellationController::default());
     let result = service.retry_failed_parts(&job.id, 3).await?;
     assert_eq!(result.failed_part_count, Some(1));
     assert_eq!(result.crawl_run_id, job.crawl_run_id);
     let records = JobRepository::new(&database).checkpoints(&job.id).await?;
+    let typed = CrawlCheckpoint::from_envelope(&records[0].checkpoint, &snapshot, run_id)?;
     assert_eq!(
-        records[0].checkpoint.completed_units[0].as_str(),
-        "success-1"
+        typed.completed_units[0].canonical_url,
+        "https://example.test/success-1"
     );
-    assert_eq!(records[0].checkpoint.failed_units[0].as_str(), "failed-1");
+    assert_eq!(
+        typed.failed_units[0].canonical_url,
+        "https://example.test/failed-1"
+    );
     Ok(())
 }
 
@@ -834,10 +966,10 @@ async fn retry_continuation_cannot_reset_budget_from_a_terminal_ancestor()
     let lease = acquired.job.lease.clone().ok_or("lease missing")?;
     repository.cancel(&child.job_id, &lease, 4).await?;
 
-    assert!(matches!(
-        service.retry(&source.id, 5).await,
-        Err(JobActionError::RetryAlreadyContinued)
-    ));
+    let second_retry = service.retry(&source.id, 5).await?;
+    let second_retry_record = repository.job(&second_retry.job_id).await?;
+    assert_eq!(second_retry_record.parent_job_id, Some(source.id.clone()));
+    assert_eq!(second_retry_record.max_attempts, 2);
     let grandchild = service.retry(&child.job_id, 5).await?;
     let grandchild_record = repository.job(&grandchild.job_id).await?;
     assert_eq!(grandchild_record.parent_job_id, Some(child.job_id));

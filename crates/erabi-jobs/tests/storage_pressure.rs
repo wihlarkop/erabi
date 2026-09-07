@@ -10,9 +10,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use erabi_crawler::{
+    CrawlCheckpoint, CrawlCheckpointUnit, CrawlCheckpointUnitState, SemanticTraversalCheckpoint,
+};
 use erabi_db::repositories::{
-    CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, CrawlRunRepository, JobFailureCode,
-    JobKind, JobRepository, JobRepositoryError, JobState, NewJob,
+    CheckpointEnvelope, CrawlRunRepository, JobFailureCode, JobKind, JobRepository,
+    JobRepositoryError, JobState, NewJob,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
@@ -41,16 +44,32 @@ fn checkpoint(
     run_id: &str,
     snapshot: &CrawlRunSnapshot,
 ) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
-    let identity = CheckpointIdentity::new(
-        run_id,
-        snapshot.snapshot_hash(),
-        snapshot.checkpoint_compatibility_hash(),
-    )?;
-    let mut checkpoint = CheckpointEnvelope::new(identity);
-    checkpoint
-        .completed_units
-        .push(CheckpointUnitId::new("unit-1")?);
-    Ok(checkpoint)
+    let crawl_run_id = CrawlRunId::from_uuid(uuid::Uuid::parse_str(run_id)?)
+        .ok_or_else(|| std::io::Error::other("checkpoint run id is not UUIDv7"))?;
+    Ok(CrawlCheckpoint::new(
+        crawl_run_id,
+        snapshot,
+        SemanticTraversalCheckpoint::empty(snapshot.selected_seed_ids().to_vec()),
+        vec![CrawlCheckpointUnit {
+            state: CrawlCheckpointUnitState::Completed,
+            requested_url: "https://example.test/unit-1".to_owned(),
+            canonical_url: "https://example.test/unit-1".to_owned(),
+            discovered_url_id: None,
+            depth: 0,
+            page_type_id: None,
+            transition_id: None,
+            parent_canonical_url: None,
+            final_canonical_url: None,
+            pagination: false,
+            seed_ids: Vec::new(),
+            execution_ids: Vec::new(),
+        }],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )?
+    .to_envelope()?)
 }
 
 fn snapshot() -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {

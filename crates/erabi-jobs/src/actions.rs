@@ -1,11 +1,13 @@
 //! Explicit retry, recovery, cancellation, and queue actions.
 
+use erabi_crawler::{CrawlCheckpoint, CrawlCheckpointV2};
 use erabi_db::{
     ErabiDatabase,
     repositories::{
         ActionRunAssociation, CheckpointCompatibility, CheckpointIdentity,
-        CheckpointRepositoryError, CrawlRunRepository, CrawlRunRepositoryError, JobId, JobKind,
-        JobRecord, JobRepository, JobRepositoryError, JobState,
+        CheckpointRepositoryError, CrawlRunRepository, CrawlRunRepositoryError,
+        CrawlTraversalRepository, CrawlWorkState, JobId, JobKind, JobRecord, JobRepository,
+        JobRepositoryError, JobState,
     },
 };
 use erabi_domain::{
@@ -106,9 +108,22 @@ impl JobActionService {
     /// Returns a typed lifecycle, attempt, lineage, or persistence error.
     pub async fn retry(&self, job_id: &JobId, now: i64) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
-        self.reject_production_recovery(&source).await?;
         if source.current_attempt == 0 {
             return Err(JobActionError::IllegalLifecycleState);
+        }
+        if self.is_production(&source).await? {
+            self.compatible_checkpoint(&source).await?;
+            let job = JobRepository::new(&self.database)
+                .enqueue_action_child(
+                    job_id,
+                    action_kind(JobAction::Retry)?,
+                    now,
+                    same_run_association(&source),
+                    Some(source.max_attempts.max(1)),
+                )
+                .await
+                .map_err(action_repository_error)?;
+            return Ok(result(JobAction::Retry, job, None));
         }
         if source.current_attempt >= source.max_attempts {
             return Err(JobActionError::AttemptsExhausted);
@@ -141,8 +156,8 @@ impl JobActionService {
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
-        self.reject_production_recovery(&source).await?;
-        if source.current_attempt >= source.max_attempts {
+        let production = self.is_production(&source).await?;
+        if source.current_attempt >= source.max_attempts && !production {
             return Err(JobActionError::AttemptsExhausted);
         }
         let (_snapshot, failed_part_count) = self.compatible_checkpoint(&source).await?;
@@ -155,7 +170,11 @@ impl JobActionService {
                 action_kind(JobAction::RetryFailedParts)?,
                 now,
                 ActionRunAssociation::SameSourceRun,
-                Some(source.max_attempts - source.current_attempt),
+                Some(if production {
+                    source.max_attempts.max(1)
+                } else {
+                    source.max_attempts - source.current_attempt
+                }),
             )
             .await
             .map_err(action_repository_error)?;
@@ -178,7 +197,6 @@ impl JobActionService {
         input: RerunFullCrawlInput,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.terminal_source(job_id).await?;
-        self.reject_production_recovery(&source).await?;
         let snapshot = self
             .snapshot_for(&source)
             .await?
@@ -208,7 +226,7 @@ impl JobActionService {
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
         let source = self.recoverable_source(job_id).await?;
-        self.reject_production_recovery(&source).await?;
+        let production = self.is_production(&source).await?;
         let (_snapshot, _) = self.compatible_checkpoint(&source).await?;
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
@@ -216,7 +234,7 @@ impl JobActionService {
                 action_kind(JobAction::ResumeCheckpoint)?,
                 now,
                 ActionRunAssociation::SameSourceRun,
-                None,
+                production.then_some(source.max_attempts.max(1)),
             )
             .await
             .map_err(action_repository_error)?;
@@ -233,9 +251,24 @@ impl JobActionService {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobActionResult, JobActionError> {
-        let source = self.recoverable_source(job_id).await?;
-        self.reject_production_recovery(&source).await?;
-        self.snapshot_for(&source).await?;
+        let source = self.terminal_source(job_id).await?;
+        let snapshot = self.snapshot_for(&source).await?;
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.run_type() == CrawlRunType::ProductionRun)
+        {
+            // Replaying an old Production root from Seeds is unsafe. The
+            // explicit independent full rerun action is the supported way to
+            // restart a Production crawl.
+            return Err(JobActionError::IllegalLifecycleState);
+        }
+        let quick_scrape_root = source.kind.as_str() == "QUICK_SCRAPE"
+            && snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.run_type() == CrawlRunType::QuickScrape);
+        if !quick_scrape_root && !matches!(source.state, JobState::Failed | JobState::Cancelled) {
+            return Err(JobActionError::IllegalLifecycleState);
+        }
         let job = JobRepository::new(&self.database)
             .enqueue_action_child(
                 job_id,
@@ -339,17 +372,11 @@ impl JobActionService {
         Ok(job)
     }
 
-    /// Production recovery actions require the durable frontier owned by Task
-    /// 9.  Do not create an action child that would restart the frozen run
-    /// from Seeds (or let a generic RETRY be dispatched as Quick Scrape).
-    async fn reject_production_recovery(&self, source: &JobRecord) -> Result<(), JobActionError> {
-        let Some(snapshot) = self.snapshot_for(source).await? else {
-            return Ok(());
-        };
-        if snapshot.run_type() == CrawlRunType::ProductionRun {
-            return Err(JobActionError::IllegalLifecycleState);
-        }
-        Ok(())
+    async fn is_production(&self, source: &JobRecord) -> Result<bool, JobActionError> {
+        Ok(self
+            .snapshot_for(source)
+            .await?
+            .is_some_and(|snapshot| snapshot.run_type() == CrawlRunType::ProductionRun))
     }
 
     async fn snapshot_for(
@@ -386,7 +413,7 @@ impl JobActionService {
         )
         .map_err(|_| JobActionError::CheckpointUnsafe)?;
         let checkpoint = JobRepository::new(&self.database)
-            .latest_checkpoint(&source.id)
+            .latest_checkpoint_for_lineage(&source.id)
             .await
             .map_err(checkpoint_error)?
             .ok_or(JobActionError::CheckpointMissing)?;
@@ -395,8 +422,62 @@ impl JobActionService {
         {
             return Err(JobActionError::CheckpointIncompatible);
         }
-        Ok((snapshot, checkpoint.checkpoint.failed_units.len()))
+        let parsed_run_id = parse_run_id(run_id).ok_or(JobActionError::CheckpointIncompatible)?;
+        let unsafe_checkpoint = |error: erabi_crawler::CrawlCheckpointError| match error {
+            erabi_crawler::CrawlCheckpointError::IncompatibleIdentity => {
+                JobActionError::CheckpointIncompatible
+            }
+            erabi_crawler::CrawlCheckpointError::Envelope(_)
+            | erabi_crawler::CrawlCheckpointError::MalformedPayload
+            | erabi_crawler::CrawlCheckpointError::InvalidUnit
+            | erabi_crawler::CrawlCheckpointError::DuplicateUnit
+            | erabi_crawler::CrawlCheckpointError::Identity
+            | erabi_crawler::CrawlCheckpointError::Serialization
+            | erabi_crawler::CrawlCheckpointError::UnsupportedRunType => {
+                JobActionError::CheckpointUnsafe
+            }
+        };
+        let compact_checkpoint = checkpoint
+            .checkpoint
+            .payload
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .and_then(|payload| {
+                payload
+                    .get("payload_version")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            == Some(2);
+        let failed_part_count =
+            if snapshot.run_type() == CrawlRunType::ProductionRun || compact_checkpoint {
+                CrawlCheckpointV2::from_envelope(&checkpoint.checkpoint, &snapshot, parsed_run_id)
+                    .map_err(unsafe_checkpoint)?;
+                CrawlTraversalRepository::new(&self.database)
+                    .reconstruct_recovery_state(parsed_run_id)
+                    .await
+                    .map_err(|_| JobActionError::CheckpointUnsafe)?
+                    .work
+                    .iter()
+                    .filter(|work| {
+                        matches!(
+                            work.current_work_state,
+                            Some(CrawlWorkState::Failed | CrawlWorkState::Partial)
+                        )
+                    })
+                    .count()
+            } else {
+                CrawlCheckpoint::from_envelope(&checkpoint.checkpoint, &snapshot, parsed_run_id)
+                    .map_err(unsafe_checkpoint)?;
+                checkpoint.checkpoint.failed_units.len()
+            };
+        Ok((snapshot, failed_part_count))
     }
+}
+
+fn parse_run_id(value: &str) -> Option<erabi_domain::CrawlRunId> {
+    uuid::Uuid::parse_str(value)
+        .ok()
+        .and_then(erabi_domain::CrawlRunId::from_uuid)
 }
 
 fn same_run_association(source: &JobRecord) -> ActionRunAssociation<'static> {

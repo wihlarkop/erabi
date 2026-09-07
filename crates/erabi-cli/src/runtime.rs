@@ -475,7 +475,7 @@ fn spawn_crawl_root_worker(
         loop {
             tokio::select! {
                 _ = polling.tick() => {
-                    let _ = runtime.execute_next_at(&handler, startup_epoch_seconds()).await;
+                    let _ = Box::pin(runtime.execute_next_at(&handler, startup_epoch_seconds())).await;
                 }
                 changed = stop_receiver.changed() => {
                     if changed.is_err() || *stop_receiver.borrow() {

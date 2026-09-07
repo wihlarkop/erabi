@@ -206,6 +206,9 @@ pub struct DiscoveryPreviewSeed {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct DiscoveryPreviewPage {
     pub requested_url: String,
+    /// Canonical identity of the queued logical work before provider
+    /// observation. A redirect may make this differ from `canonical_url`.
+    pub requested_canonical_url: String,
     pub final_url: Option<String>,
     pub canonical_url: Option<String>,
     pub depth: u32,

@@ -758,9 +758,9 @@ impl<'database> JobRepository<'database> {
         }
     }
 
-    /// Atomically fails a Production root's active attempt, Job, owning Crawl
-    /// Run, and progress stream. This is deliberately narrower than the
-    /// generic terminal failure boundary because only Production owns the
+    /// Atomically fails a Production crawl job's active attempt, Job, owning
+    /// Crawl Run, and progress stream. This is deliberately narrower than the
+    /// generic terminal failure boundary because only crawl jobs own the
     /// paired Crawl Run lifecycle contract.
     ///
     /// # Errors
@@ -785,7 +785,24 @@ impl<'database> JobRepository<'database> {
         let result = async {
             let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
             if job.kind.as_str() != "PRODUCTION_CRAWL" {
-                return Err(JobRepositoryError::QueueInvariant);
+                let run_id = job
+                    .crawl_run_id
+                    .as_deref()
+                    .ok_or(JobRepositoryError::QueueInvariant)?;
+                let mut rows = transaction
+                    .query("SELECT run_type FROM crawl_runs WHERE id = ?1", [run_id])
+                    .await
+                    .map_err(JobRepositoryError::database)?;
+                let run_type = rows
+                    .next()
+                    .await
+                    .map_err(JobRepositoryError::database)?
+                    .ok_or(JobRepositoryError::QueueInvariant)?
+                    .get::<String>(0)
+                    .map_err(JobRepositoryError::database)?;
+                if run_type != "PRODUCTION_RUN" {
+                    return Err(JobRepositoryError::QueueInvariant);
+                }
             }
             finish_attempt_in_transaction(
                 &transaction,
@@ -815,7 +832,7 @@ impl<'database> JobRepository<'database> {
             if changed != 1 {
                 return Err(JobRepositoryError::LeaseLost);
             }
-            finalize_production_failure_in_transaction(&transaction, &job, now).await
+            finalize_crawl_failure_in_transaction(&transaction, &job, now).await
         }
         .await;
         match result {
@@ -915,6 +932,51 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::database)?;
         let result = async {
             let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+            if let Some(run_id) = job.crawl_run_id.as_deref() {
+                let run_status = select_crawl_run_status(&transaction, run_id).await?;
+                if matches!(run_status.as_deref(), Some("SUCCEEDED" | "PARTIAL_RESULT")) {
+                    finish_attempt_in_transaction(
+                        &transaction,
+                        job_id,
+                        lease,
+                        now,
+                        AttemptOutcome::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    finish_job_after_terminal_run(
+                        &transaction,
+                        job_id,
+                        lease,
+                        now,
+                        JobState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if run_status.as_deref() == Some("FAILED") {
+                    finish_attempt_in_transaction(
+                        &transaction,
+                        job_id,
+                        lease,
+                        now,
+                        AttemptOutcome::Failed,
+                        Some(JobFailureCode::HandlerFailed),
+                    )
+                    .await?;
+                    finish_job_after_terminal_run(
+                        &transaction,
+                        job_id,
+                        lease,
+                        now,
+                        JobState::Failed,
+                        Some(JobFailureCode::HandlerFailed),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             finish_attempt_in_transaction(
                 &transaction,
                 job_id,
@@ -1211,10 +1273,11 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::Checkpoint)
     }
 
-    /// Commits a pressure-interrupted attempt without mutating run snapshots
-    /// or cancelling the associated run. Requeueing requires a checkpoint
-    /// durably attached to the current attempt; without it the job is failed
-    /// with typed pressure evidence rather than advertised as resumable.
+    /// Commits a pressure-interrupted attempt. Requeueing requires a
+    /// checkpoint durably attached to the current attempt; without it, or
+    /// after the total attempt budget is exhausted, the job and its associated
+    /// crawl run are failed together with typed pressure evidence rather than
+    /// advertised as resumable.
     ///
     /// # Errors
     /// Returns an ownership or durable transition error.
@@ -1235,6 +1298,18 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::database)?;
         let result = async {
             let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+            if let Some(run_id) = job.crawl_run_id.as_deref()
+                && let Some(state) = finish_after_terminal_crawl_run(
+                    &transaction,
+                    job_id,
+                    lease,
+                    run_id,
+                    now,
+                )
+                .await?
+            {
+                return Ok(state);
+            }
             let has_current_attempt_checkpoint =
                 has_checkpoint_for_current_attempt(&transaction, job_id, lease).await?;
             let next_state = if has_current_attempt_checkpoint && job.current_attempt < job.max_attempts {
@@ -1268,6 +1343,9 @@ impl<'database> JobRepository<'database> {
                 .map_err(JobRepositoryError::database)?;
             if changed != 1 {
                 return Err(JobRepositoryError::LeaseLost);
+            }
+            if next_state == JobState::Failed && job.crawl_run_id.is_some() {
+                finalize_crawl_failure_in_transaction(&transaction, &job, now).await?;
             }
             Ok(next_state)
         }
@@ -1314,6 +1392,39 @@ impl<'database> JobRepository<'database> {
             .map_err(JobRepositoryError::Checkpoint)
     }
 
+    /// Returns the newest checkpoint owned by the nearest descendant in the
+    /// same action lineage. A recovery child therefore supersedes its source's
+    /// frontier as soon as it has appended one, while a child with no evidence
+    /// still falls back to its parent. The checkpoint repository remains the
+    /// sole decoder and validator for every row.
+    ///
+    /// # Errors
+    /// Returns a typed queue/checkpoint error when the parent chain or any
+    /// checkpoint row is malformed.
+    pub async fn latest_checkpoint_for_lineage(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Option<CheckpointRecord>, JobRepositoryError> {
+        let mut lineage = Vec::new();
+        let mut current = Some(job_id.clone());
+        while let Some(id) = current.take() {
+            let job = self.job(&id).await?;
+            current.clone_from(&job.parent_job_id);
+            lineage.push(id);
+        }
+        let repository = CheckpointRepository::new(self.database);
+        for id in lineage {
+            if let Some(record) = repository
+                .latest(&id)
+                .await
+                .map_err(JobRepositoryError::Checkpoint)?
+            {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     /// Inspects every expired running lease and only requeues work when bounded
     /// total attempts allow another execution. It never repairs corruption.
     ///
@@ -1324,10 +1435,6 @@ impl<'database> JobRepository<'database> {
         &self,
         now: i64,
     ) -> Result<StaleJobRecovery, JobRepositoryError> {
-        let checkpoint_assessments = CheckpointRepository::new(self.database)
-            .assess_stale_jobs(now)
-            .await
-            .map_err(JobRepositoryError::Checkpoint)?;
         let mut connection = self
             .database
             .connection()
@@ -1343,25 +1450,11 @@ impl<'database> JobRepository<'database> {
         }
         .await;
         match result {
-            Ok(mut recovery) => {
+            Ok(recovery) => {
                 transaction
                     .commit()
                     .await
                     .map_err(JobRepositoryError::database)?;
-                for assessment in checkpoint_assessments {
-                    match assessment.disposition {
-                        super::checkpoint::CheckpointRecoveryDisposition::Recoverable => {
-                            recovery.recoverable = recovery.recoverable.saturating_add(1);
-                        }
-                        super::checkpoint::CheckpointRecoveryDisposition::RestartRequired => {
-                            recovery.restart_required = recovery.restart_required.saturating_add(1);
-                        }
-                        super::checkpoint::CheckpointRecoveryDisposition::Unsafe => {
-                            recovery.unsafe_checkpoints =
-                                recovery.unsafe_checkpoints.saturating_add(1);
-                        }
-                    }
-                }
                 Ok(recovery)
             }
             Err(error) => {
@@ -1534,11 +1627,6 @@ async fn validate_action_child_lineage(
     if matches!(source.state, JobState::Queued | JobState::Running) {
         return Err(JobRepositoryError::IllegalTransition);
     }
-    if action_kind.as_str() == "RETRY"
-        && action_child_exists(connection, source_job_id, "kind = 'RETRY'").await?
-    {
-        return Err(JobRepositoryError::RetryAlreadyContinued);
-    }
     if active_equivalent_action_child(connection, source_job_id, action_kind).await? {
         return Err(JobRepositoryError::ActionAlreadyActive);
     }
@@ -1677,6 +1765,27 @@ async fn has_checkpoint_for_current_attempt(
         .map_err(JobRepositoryError::database)
 }
 
+async fn has_any_checkpoint(
+    connection: &Connection,
+    job_id: &JobId,
+) -> Result<bool, JobRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM job_checkpoints WHERE job_id = ?1)",
+            [job_id.as_str()],
+        )
+        .await
+        .map_err(JobRepositoryError::database)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(JobRepositoryError::database)?
+        .ok_or(JobRepositoryError::QueueInvariant)?;
+    row.get::<i64>(0)
+        .map(|exists| exists != 0)
+        .map_err(JobRepositoryError::database)
+}
+
 async fn lease_queued_job(
     connection: &Connection,
     job_id: &JobId,
@@ -1796,6 +1905,7 @@ async fn finish_attempt_in_transaction(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn recover_expired_in_transaction(
     connection: &Connection,
     now: i64,
@@ -1823,6 +1933,53 @@ async fn recover_expired_in_transaction(
         if lease.expires_at > now {
             continue;
         }
+        // A handler can atomically finalize its CrawlRun summary/status and
+        // crash before the generic runtime closes the leased Job.  The run is
+        // authoritative at that point: reconcile this Job rather than trying
+        // to force the terminal run through the generic failure transition.
+        if let Some(run_id) = job.crawl_run_id.as_deref()
+            && finish_after_terminal_crawl_run(connection, &id, &lease, run_id, now)
+                .await?
+                .is_some()
+        {
+            continue;
+        }
+        let has_checkpoint = has_any_checkpoint(connection, &id).await?;
+        let disposition = if job.crawl_run_id.is_some() || has_checkpoint {
+            Some(
+                super::checkpoint::assess_one_stale_job(
+                    connection,
+                    &id,
+                    job.crawl_run_id.as_deref(),
+                )
+                .await
+                .map_err(JobRepositoryError::Checkpoint)?,
+            )
+        } else {
+            None
+        };
+        let checkpoint_allows_recovery = !matches!(
+            disposition,
+            Some(
+                super::checkpoint::CheckpointRecoveryDisposition::RestartRequired
+                    | super::checkpoint::CheckpointRecoveryDisposition::Unsafe
+            )
+        );
+        match disposition {
+            Some(super::checkpoint::CheckpointRecoveryDisposition::Recoverable) => {
+                recovery.recoverable = recovery.recoverable.saturating_add(1);
+            }
+            Some(super::checkpoint::CheckpointRecoveryDisposition::RestartRequired) => {
+                recovery.restart_required = recovery.restart_required.saturating_add(1);
+            }
+            Some(super::checkpoint::CheckpointRecoveryDisposition::Unsafe) => {
+                recovery.unsafe_checkpoints = recovery.unsafe_checkpoints.saturating_add(1);
+            }
+            None => {}
+        }
+        // Assess while the expired attempt still owns the RUNNING lease. The
+        // checkpoint repository deliberately requires that ownership proof;
+        // only after the decision is made is the attempt closed below.
         finish_attempt_in_transaction(
             connection,
             &id,
@@ -1832,7 +1989,7 @@ async fn recover_expired_in_transaction(
             Some(JobFailureCode::LeaseExpired),
         )
         .await?;
-        let next_state = if job.current_attempt < job.max_attempts {
+        let next_state = if checkpoint_allows_recovery && job.current_attempt < job.max_attempts {
             recovery.requeued = recovery.requeued.saturating_add(1);
             JobState::Queued
         } else {
@@ -1856,14 +2013,14 @@ async fn recover_expired_in_transaction(
         if changed != 1 {
             return Err(JobRepositoryError::LeaseLost);
         }
-        if next_state == JobState::Failed && job.kind.as_str() == "PRODUCTION_CRAWL" {
-            finalize_production_failure_in_transaction(connection, &job, now).await?;
+        if next_state == JobState::Failed && job.crawl_run_id.is_some() {
+            finalize_crawl_failure_in_transaction(connection, &job, now).await?;
         }
     }
     Ok(recovery)
 }
 
-async fn finalize_production_failure_in_transaction(
+async fn finalize_crawl_failure_in_transaction(
     connection: &Connection,
     job: &JobRecord,
     now: i64,
@@ -1903,6 +2060,133 @@ async fn cancel_related_run(
         )
         .await
         .map_err(JobRepositoryError::database)?;
+    Ok(())
+}
+
+async fn select_crawl_run_status(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<String>, JobRepositoryError> {
+    let mut rows = connection
+        .query("SELECT status FROM crawl_runs WHERE id = ?1", [run_id])
+        .await
+        .map_err(JobRepositoryError::database)?;
+    rows.next()
+        .await
+        .map_err(JobRepositoryError::database)?
+        .map(|row| row.get::<String>(0).map_err(JobRepositoryError::database))
+        .transpose()
+}
+
+async fn finish_after_terminal_crawl_run(
+    connection: &Connection,
+    job_id: &JobId,
+    lease: &JobLease,
+    run_id: &str,
+    now: i64,
+) -> Result<Option<JobState>, JobRepositoryError> {
+    let Some(run_status) = select_crawl_run_status(connection, run_id).await? else {
+        return Ok(None);
+    };
+    let (state, outcome, failure, terminal) = match run_status.as_str() {
+        "SUCCEEDED" | "PARTIAL_RESULT" => (
+            JobState::Succeeded,
+            AttemptOutcome::Succeeded,
+            None,
+            ProgressTerminalState::Succeeded,
+        ),
+        "FAILED" => (
+            JobState::Failed,
+            AttemptOutcome::Failed,
+            Some(JobFailureCode::HandlerFailed),
+            ProgressTerminalState::Failed,
+        ),
+        "CANCELLED" => (
+            JobState::Cancelled,
+            AttemptOutcome::Failed,
+            Some(JobFailureCode::Cancelled),
+            ProgressTerminalState::Cancelled,
+        ),
+        _ => return Ok(None),
+    };
+    finish_attempt_in_transaction(connection, job_id, lease, now, outcome, failure).await?;
+    finish_job_after_terminal_run(connection, job_id, lease, now, state, failure).await?;
+    append_terminal_progress_if_missing(connection, job_id, terminal, now).await?;
+    Ok(Some(state))
+}
+
+/// Completes a progress stream exactly once while stale-job reconciliation is
+/// repairing a terminal CrawlRun/active Job crash window. A different prior
+/// terminal state is durable corruption rather than a state to overwrite.
+async fn append_terminal_progress_if_missing(
+    connection: &Connection,
+    job_id: &JobId,
+    terminal: ProgressTerminalState,
+    now: i64,
+) -> Result<(), JobRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT payload_json FROM job_progress_events WHERE job_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            [job_id.as_str()],
+        )
+        .await
+        .map_err(JobRepositoryError::database)?;
+    let existing = rows
+        .next()
+        .await
+        .map_err(JobRepositoryError::database)?
+        .map(|row| row.get::<String>(0).map_err(JobRepositoryError::database))
+        .transpose()?;
+    if let Some(payload) = existing {
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|_| JobRepositoryError::QueueInvariant)?;
+        if let Some(value) = payload.get("terminal") {
+            let expected = match terminal {
+                ProgressTerminalState::Succeeded => "SUCCEEDED",
+                ProgressTerminalState::Failed => "FAILED",
+                ProgressTerminalState::Cancelled => "CANCELLED",
+            };
+            if value.as_str() != Some(expected) {
+                return Err(JobRepositoryError::QueueInvariant);
+            }
+            return Ok(());
+        }
+    }
+    let event = NewProgressEvent::terminal(job_id.clone(), terminal, ProgressMetadata::default())
+        .map_err(|_| JobRepositoryError::QueueInvariant)?;
+    append_in_transaction(connection, &event, now)
+        .await
+        .map(|_| ())
+        .map_err(|_| JobRepositoryError::QueueInvariant)
+}
+
+async fn finish_job_after_terminal_run(
+    connection: &Connection,
+    job_id: &JobId,
+    lease: &JobLease,
+    now: i64,
+    state: JobState,
+    failure: Option<JobFailureCode>,
+) -> Result<(), JobRepositoryError> {
+    let changed = connection
+        .execute(
+            "UPDATE jobs SET state = ?1, lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = ?2, updated_at = ?3 WHERE id = ?4 AND state = 'RUNNING' AND lease_id = ?5 AND lease_owner = ?6 AND lease_generation = ?7",
+            (
+                state.as_sql(),
+                failure.map(JobFailureCode::as_sql),
+                now,
+                job_id.as_str(),
+                lease.id.as_str(),
+                lease.owner.as_str(),
+                i64::try_from(lease.generation)
+                    .map_err(|_| JobRepositoryError::QueueInvariant)?,
+            ),
+        )
+        .await
+        .map_err(JobRepositoryError::database)?;
+    if changed != 1 {
+        return Err(JobRepositoryError::LeaseLost);
+    }
     Ok(())
 }
 

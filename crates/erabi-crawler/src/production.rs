@@ -20,8 +20,8 @@ use erabi_domain::{
 };
 
 const PRODUCTION_CRAWL_JOB_KIND: &str = "PRODUCTION_CRAWL";
-/// Task 8 deliberately permits one total root execution only. Task 9 will
-/// introduce durable frontier reconstruction before Production can re-enter.
+/// Root jobs remain bounded to one total attempt. Explicit recovery actions
+/// create checkpoint-backed child jobs rather than silently re-running a root.
 pub const PRODUCTION_ROOT_MAX_ATTEMPTS: u32 = 1;
 
 /// Validated inputs for one fresh Production Run. The API resolves operational

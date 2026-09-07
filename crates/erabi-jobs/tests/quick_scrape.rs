@@ -18,15 +18,19 @@ use erabi_crawler::{
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase, MigrationRunner,
-    repositories::{CrawlExecutionRepository, CrawlRunRepository, JobRepository},
+    repositories::{
+        ActionRunAssociation, CrawlExecutionRepository, CrawlRunRepository,
+        CrawlTraversalRepository, CrawlWorkState, JobKind, JobRepository,
+    },
 };
 use erabi_domain::{
     CrawlExecutionErrorCode, CrawlExecutionOutcome, ResolvedValue, RobotsAudit, SettingSource,
     SnapshotOperationalSettings,
 };
 use erabi_jobs::{
-    CancellationController, JobRuntime, QuickScrapeJobHandler, StoragePressureMonitor,
-    StoragePressurePolicy, StorageProbe, StorageProbeError, WorkerPolicy, WorkerTurn,
+    CancellationController, JobActionService, JobRuntime, QuickScrapeJobHandler,
+    StoragePressureMonitor, StoragePressurePolicy, StorageProbe, StorageProbeError, WorkerPolicy,
+    WorkerTurn,
 };
 
 #[derive(Clone)]
@@ -357,7 +361,7 @@ async fn provider_unavailability_retries_same_run_then_preserves_terminal_failur
         "unexpected first worker turn: {first_turn:?}; job before: {before_first:?}; job after: {after_first:?}; adapter calls: {}",
         calls.load(Ordering::SeqCst),
     );
-    let second_turn = runtime.execute_next_at(&handler, 105).await?;
+    let second_turn = runtime.execute_next_at(&handler, 110).await?;
     let job = jobs.job(&job_id).await?;
     assert!(
         matches!(second_turn, WorkerTurn::Failed { .. }),
@@ -377,6 +381,264 @@ async fn provider_unavailability_retries_same_run_then_preserves_terminal_failur
         Some(CrawlExecutionErrorCode::ProviderUnavailable)
     );
     assert_eq!(snapshot.robots().actor(), "operator");
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_quick_retry_advances_current_generation_once_and_reuses_current_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 3).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let failing_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Unavailable,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+    );
+    let failing_runtime = runtime(&database, "quick-explicit-retry-failing")?;
+    let root_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    assert!(matches!(
+        failing_runtime
+            .execute_next_at(&failing_handler, 100)
+            .await?,
+        WorkerTurn::RetryScheduled { .. }
+    ));
+    assert!(matches!(
+        failing_runtime
+            .execute_next_at(&failing_handler, 110)
+            .await?,
+        WorkerTurn::Failed { .. }
+    ));
+
+    let action = JobActionService::new(database.clone(), CancellationController::default())
+        .retry(&root_id, 120)
+        .await?;
+    let successful_temporary = tempfile::tempdir()?;
+    let successful_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(successful_temporary.path())?,
+    );
+    let successful_runtime = runtime(&database, "quick-explicit-retry-success")?;
+    assert!(matches!(
+        successful_runtime
+            .execute_next_at(&successful_handler, 120)
+            .await?,
+        WorkerTurn::Succeeded { job_id } if job_id == action.job_id
+    ));
+    let durable = CrawlTraversalRepository::new(&database)
+        .reconstruct_recovery_state(accepted.run_id)
+        .await?;
+    let root = durable
+        .work
+        .iter()
+        .find(|work| work.id == format!("quick:{}", accepted.run_id))
+        .ok_or("Quick Scrape logical root missing")?;
+    assert_eq!(root.work_generation, 1);
+    assert_eq!(root.current_work_state, Some(CrawlWorkState::Completed));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .status(accepted.run_id)
+            .await?,
+        erabi_domain::CrawlRunStatus::Succeeded
+    );
+    let summary = CrawlExecutionRepository::new(&database)
+        .summary(accepted.run_id)
+        .await?;
+    assert_eq!(summary.unresolved_partial_work_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn quick_recovery_skips_completed_current_work_from_a_stale_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 1).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let root_temporary = tempfile::tempdir()?;
+    let root_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(root_temporary.path())?,
+    );
+    let root_runtime = runtime(&database, "quick-stale-checkpoint-root")?;
+    assert!(matches!(
+        root_runtime.execute_next_at(&root_handler, 100).await?,
+        WorkerTurn::Succeeded { .. }
+    ));
+
+    let root_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    let action = JobRepository::new(&database)
+        .enqueue_action_child(
+            &root_id,
+            JobKind::new("RESUME_CHECKPOINT")?,
+            120,
+            ActionRunAssociation::SameSourceRun,
+            Some(1),
+        )
+        .await?;
+    let action_temporary = tempfile::tempdir()?;
+    let action_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Unavailable,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(action_temporary.path())?,
+    );
+    let action_runtime = runtime(&database, "quick-stale-checkpoint-recovery")?;
+    assert!(matches!(
+        action_runtime
+            .execute_next_at(&action_handler, 120)
+            .await?,
+        WorkerTurn::Succeeded { job_id } if job_id == action.id
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .status(accepted.run_id)
+            .await?,
+        erabi_domain::CrawlRunStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quick_restart_finalizes_current_failure_over_historical_success()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 1).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let root_temporary = tempfile::tempdir()?;
+    let root_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(root_temporary.path())?,
+    );
+    let root_runtime = runtime(&database, "quick-current-state-root")?;
+    assert!(matches!(
+        root_runtime.execute_next_at(&root_handler, 100).await?,
+        WorkerTurn::Succeeded { .. }
+    ));
+
+    let root_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    let action = JobActionService::new(database.clone(), CancellationController::default())
+        .restart_from_beginning(&root_id, 120)
+        .await?;
+    let action_temporary = tempfile::tempdir()?;
+    let action_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Unavailable,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(action_temporary.path())?,
+    );
+    let action_runtime = runtime(&database, "quick-current-state-failure")?;
+    assert!(matches!(
+        action_runtime
+            .execute_next_at(&action_handler, 120)
+            .await?,
+        WorkerTurn::Failed { job_id, .. } if job_id == action.job_id
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let durable = CrawlTraversalRepository::new(&database)
+        .reconstruct_recovery_state(accepted.run_id)
+        .await?;
+    let root = durable
+        .work
+        .iter()
+        .find(|work| work.id == format!("quick:{}", accepted.run_id))
+        .ok_or("Quick Scrape logical root missing")?;
+    assert_eq!(root.work_generation, 1);
+    assert_eq!(root.current_work_state, Some(CrawlWorkState::Failed));
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .status(accepted.run_id)
+            .await?,
+        erabi_domain::CrawlRunStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quick_restart_finalizes_current_success_over_historical_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 1).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failing_temporary = tempfile::tempdir()?;
+    let failing_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Unavailable,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(failing_temporary.path())?,
+    );
+    let failing_runtime = runtime(&database, "quick-current-state-failure-root")?;
+    assert!(matches!(
+        failing_runtime
+            .execute_next_at(&failing_handler, 100)
+            .await?,
+        WorkerTurn::Failed { .. }
+    ));
+
+    let root_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    let action = JobActionService::new(database.clone(), CancellationController::default())
+        .restart_from_beginning(&root_id, 120)
+        .await?;
+    let successful_temporary = tempfile::tempdir()?;
+    let successful_handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(successful_temporary.path())?,
+    );
+    let successful_runtime = runtime(&database, "quick-current-state-success")?;
+    assert!(matches!(
+        successful_runtime
+            .execute_next_at(&successful_handler, 120)
+            .await?,
+        WorkerTurn::Succeeded { job_id } if job_id == action.job_id
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let durable = CrawlTraversalRepository::new(&database)
+        .reconstruct_recovery_state(accepted.run_id)
+        .await?;
+    let root = durable
+        .work
+        .iter()
+        .find(|work| work.id == format!("quick:{}", accepted.run_id))
+        .ok_or("Quick Scrape logical root missing")?;
+    assert_eq!(root.work_generation, 1);
+    assert_eq!(root.current_work_state, Some(CrawlWorkState::Completed));
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .status(accepted.run_id)
+            .await?,
+        erabi_domain::CrawlRunStatus::Succeeded
+    );
+    let summary = CrawlExecutionRepository::new(&database)
+        .summary(accepted.run_id)
+        .await?;
+    assert_eq!(summary.unresolved_partial_work_count, 0);
     Ok(())
 }
 

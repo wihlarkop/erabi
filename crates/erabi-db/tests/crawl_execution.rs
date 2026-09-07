@@ -3,9 +3,12 @@ use std::collections::BTreeMap;
 use erabi_db::{
     ErabiDatabase, MigrationRunner,
     repositories::{
-        ArtifactRepository, CrawlExecutionArtifact, CrawlExecutionArtifactKind,
-        CrawlExecutionRecord, CrawlExecutionRepository, CrawlExecutionRepositoryError,
-        CrawlExecutionSummary, CrawlRunRepository, CrawlerRepository,
+        ArtifactRepository, CheckpointEnvelope, CheckpointIdentity, CrawlAdmissionState,
+        CrawlExecutionArtifact, CrawlExecutionArtifactKind, CrawlExecutionRecord,
+        CrawlExecutionRepository, CrawlExecutionRepositoryError, CrawlExecutionSummary,
+        CrawlRecoveryActionKind, CrawlRunRepository, CrawlTraversalControl,
+        CrawlTraversalRepository, CrawlTraversalSemanticProjection, CrawlUrlStateRecord,
+        CrawlWorkState, CrawlerRepository, DiscoveredUrlRecord, JobKind, JobRepository, NewJob,
     },
 };
 use erabi_domain::{
@@ -378,7 +381,7 @@ async fn existing_0001_through_0004_database_upgrades_and_preserves_snapshots()
         .create(run_id, CrawlRunStatus::Queued, &snapshot)
         .await?;
 
-    assert_eq!(runner.apply(&database).await?.applied, ["0005"]);
+    assert_eq!(runner.apply(&database).await?.applied, ["0005", "0006"]);
     assert_eq!(
         runner
             .status(&database)
@@ -386,7 +389,7 @@ async fn existing_0001_through_0004_database_upgrades_and_preserves_snapshots()
             .into_iter()
             .map(|version| version.version)
             .collect::<Vec<_>>(),
-        ["0001", "0002", "0003", "0004", "0005"]
+        ["0001", "0002", "0003", "0004", "0005", "0006"]
     );
     assert_eq!(
         CrawlRunRepository::new(&database).snapshot(run_id).await?,
@@ -419,6 +422,48 @@ async fn existing_0001_through_0004_database_upgrades_and_preserves_snapshots()
         CrawlRunRepository::new(&database).snapshot(run_id).await?,
         snapshot
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn traversal_state_schema_enforces_canonical_identity_and_finite_work_contracts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = ErabiDatabase::open_local(directory.path().join("erabi.db")).await?;
+    MigrationRunner::default().apply(&database).await?;
+    let run_id = CrawlRunId::new();
+    CrawlRunRepository::new(&database)
+        .create(
+            run_id,
+            CrawlRunStatus::Queued,
+            &quick_snapshot("https://example.test/root")?,
+        )
+        .await?;
+    let connection = raw_connection(&directory).await?;
+    connection.execute(
+        "INSERT INTO crawl_traversal_control (crawl_run_id, next_admission_sequence) VALUES (?1, 1)",
+        [run_id.to_string()],
+    ).await?;
+    connection.execute(
+        "INSERT INTO crawl_url_state (id, crawl_run_id, canonical_url, requested_url, admission_state, admission_sequence, depth, current_work_state) VALUES ('state-1', ?1, 'https://example.test/a', 'https://example.test/a', 'ADMITTED', 0, 0, 'PENDING')",
+        [run_id.to_string()],
+    ).await?;
+    assert!(connection.execute(
+        "INSERT INTO crawl_url_state (id, crawl_run_id, canonical_url, requested_url, admission_state, admission_sequence, depth, current_work_state) VALUES ('state-2', ?1, 'https://example.test/a', 'https://example.test/b', 'ADMITTED', 1, 0, 'PENDING')",
+        [run_id.to_string()],
+    ).await.is_err());
+    assert!(connection.execute(
+        "INSERT INTO crawl_url_state (id, crawl_run_id, canonical_url, requested_url, admission_state, admission_sequence, depth, current_work_state) VALUES ('state-3', ?1, 'https://example.test/c', 'https://example.test/c', 'ADMITTED', 0, 0, 'PENDING')",
+        [run_id.to_string()],
+    ).await.is_err());
+    assert!(connection.execute(
+        "INSERT INTO crawl_url_state (id, crawl_run_id, canonical_url, requested_url, admission_state, preserve_reason) VALUES ('state-4', ?1, 'https://example.test/d', 'https://example.test/d', 'PRESERVE_ONLY', NULL)",
+        [run_id.to_string()],
+    ).await.is_err());
+    assert!(connection.execute(
+        "INSERT INTO crawl_url_state (id, crawl_run_id, canonical_url, requested_url, admission_state, admission_sequence, depth, current_work_state) VALUES ('state-5', ?1, 'https://example.test/e', 'https://example.test/e', 'ADMITTED', 2, 0, 'UNKNOWN')",
+        [run_id.to_string()],
+    ).await.is_err());
     Ok(())
 }
 
@@ -1095,6 +1140,589 @@ async fn source_status_and_artifact_repository_contracts_remain_separate()
     Ok(())
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn traversal_reconstruction_uses_persisted_order_parent_and_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, database, run_id) = quick_setup("https://example.test/root").await?;
+    let control = CrawlTraversalControl {
+        crawl_run_id: run_id,
+        consumed_bytes: 17,
+        raw_link_count: 2,
+        duplicate_count: 0,
+        robots_excluded_count: 0,
+        provider_error_count: 0,
+        external_url_count: 0,
+        blocked_url_count: 0,
+        peak_expansion_count: 2,
+        elapsed_millis: 3,
+        time_budget_hit: false,
+        duration_work_not_expanded: false,
+        pagination_truncation_count: 0,
+        next_admission_sequence: 10,
+    };
+    let root = CrawlUrlStateRecord {
+        id: "work-root".to_owned(),
+        crawl_run_id: run_id,
+        canonical_url: "https://example.test/root".to_owned(),
+        first_discovered_url_id: None,
+        requested_url: "https://example.test/root".to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(8),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Pending),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let child = CrawlUrlStateRecord {
+        id: "work-child".to_owned(),
+        crawl_run_id: run_id,
+        canonical_url: "https://example.test/child".to_owned(),
+        first_discovered_url_id: None,
+        requested_url: "https://example.test/child".to_owned(),
+        parent_url_state_id: Some(root.id.clone()),
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(3),
+        depth: Some(1),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: true,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Failed),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let repository = CrawlTraversalRepository::new(&database);
+    repository
+        .initialize_run_state(run_id, &[root.clone(), child], &control)
+        .await?;
+
+    let reconstructed = repository.reconstruct_recovery_state(run_id).await?;
+    assert_eq!(reconstructed.control, control);
+    assert_eq!(
+        reconstructed
+            .work
+            .iter()
+            .map(|state| state.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["work-root", "work-child"]
+    );
+    assert_eq!(
+        reconstructed.work[1].parent_url_state_id.as_deref(),
+        Some("work-root")
+    );
+    assert!(reconstructed.work[1].pagination);
+
+    let mut source_job = NewJob::new(JobKind::new("PRODUCTION_CRAWL")?, 0, 0, 1)?;
+    source_job.crawl_run_id = Some(run_id.to_string());
+    JobRepository::new(&database)
+        .enqueue(&source_job, 0)
+        .await?;
+    let source_acquired = JobRepository::new(&database)
+        .acquire_next("recovery-action-source", 0, 30)
+        .await?
+        .ok_or("source job was not acquired")?;
+    let source_lease = source_acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("source lease missing")?;
+    JobRepository::new(&database)
+        .cancel(&source_job.id, &source_lease, 1)
+        .await?;
+    let action_job = JobRepository::new(&database)
+        .enqueue_action_child(
+            &source_job.id,
+            JobKind::new("RETRY_FAILED_PARTS")?,
+            2,
+            erabi_db::repositories::ActionRunAssociation::SameSourceRun,
+            Some(1),
+        )
+        .await?;
+    let action_acquired = JobRepository::new(&database)
+        .acquire_next("recovery-action-worker", 2, 30)
+        .await?
+        .ok_or("action job was not acquired")?;
+    let selection = repository
+        .prepare_recovery_action(
+            &action_job.id,
+            &action_acquired.attempt.id,
+            run_id,
+            CrawlRecoveryActionKind::RetryFailedParts,
+            2,
+        )
+        .await?;
+    assert_eq!(selection.state_ids, vec!["work-child"]);
+    let replay = repository
+        .prepare_recovery_action(
+            &action_job.id,
+            &action_acquired.attempt.id,
+            run_id,
+            CrawlRecoveryActionKind::RetryFailedParts,
+            2,
+        )
+        .await?;
+    assert_eq!(replay, selection);
+    let retried = repository.reconstruct_recovery_state(run_id).await?;
+    assert_eq!(retried.work[0].work_generation, 0);
+    assert_eq!(
+        retried.work[0].current_work_state,
+        Some(CrawlWorkState::Pending)
+    );
+    assert_eq!(retried.work[1].work_generation, 1);
+    assert_eq!(
+        retried.work[1].current_work_state,
+        Some(CrawlWorkState::Pending)
+    );
+
+    let action_lease = action_acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("action lease missing")?;
+    JobRepository::new(&database)
+        .cancel(&action_job.id, &action_lease, 3)
+        .await?;
+    let generic_action = JobRepository::new(&database)
+        .enqueue_action_child(
+            &source_job.id,
+            JobKind::new("RETRY")?,
+            4,
+            erabi_db::repositories::ActionRunAssociation::SameSourceRun,
+            Some(1),
+        )
+        .await?;
+    let generic_acquired = JobRepository::new(&database)
+        .acquire_next("generic-recovery-action-worker", 4, 30)
+        .await?
+        .ok_or("generic action job was not acquired")?;
+    let generic = repository
+        .prepare_recovery_action(
+            &generic_action.id,
+            &generic_acquired.attempt.id,
+            run_id,
+            CrawlRecoveryActionKind::Retry,
+            4,
+        )
+        .await?;
+    assert_eq!(generic.state_ids, vec!["work-root", "work-child"]);
+    let generic_replay = repository
+        .prepare_recovery_action(
+            &generic_action.id,
+            &generic_acquired.attempt.id,
+            run_id,
+            CrawlRecoveryActionKind::Retry,
+            4,
+        )
+        .await?;
+    assert_eq!(generic_replay, generic);
+    let distinct_retry_state = repository.reconstruct_recovery_state(run_id).await?;
+    assert_eq!(distinct_retry_state.work[0].work_generation, 1);
+    assert_eq!(distinct_retry_state.work[1].work_generation, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_evidence_replay_is_idempotent_and_conflicts_fail()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, database, run_id) = quick_setup("https://example.test/replay").await?;
+    let control = CrawlTraversalControl {
+        crawl_run_id: run_id,
+        consumed_bytes: 0,
+        raw_link_count: 1,
+        duplicate_count: 0,
+        robots_excluded_count: 0,
+        provider_error_count: 0,
+        external_url_count: 0,
+        blocked_url_count: 0,
+        peak_expansion_count: 0,
+        elapsed_millis: 0,
+        time_budget_hit: false,
+        duration_work_not_expanded: false,
+        pagination_truncation_count: 0,
+        next_admission_sequence: 1,
+    };
+    let root = CrawlUrlStateRecord {
+        id: "replay-root".to_owned(),
+        crawl_run_id: run_id,
+        canonical_url: "https://example.test/replay".to_owned(),
+        first_discovered_url_id: None,
+        requested_url: "https://example.test/replay".to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(0),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Pending),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let repository = CrawlTraversalRepository::new(&database);
+    repository
+        .initialize_run_state(run_id, &[root], &control)
+        .await?;
+    let evidence = DiscoveredUrlRecord {
+        id: uuid::Uuid::now_v7().to_string(),
+        crawl_run_id: run_id,
+        source_id: None,
+        raw_href: Some("/child".to_owned()),
+        original_url: "https://example.test/child".to_owned(),
+        canonical_url: "https://example.test/child".to_owned(),
+        status: "ADMITTED".to_owned(),
+        discovered_at: "unix:1".to_owned(),
+        detail: serde_json::json!({"origin":"DISCOVERY_PATH","stable":true}),
+    };
+    repository
+        .apply_discovery_delta_with_evidence(
+            run_id,
+            std::slice::from_ref(&evidence),
+            &[],
+            &control,
+            &[],
+        )
+        .await?;
+    repository
+        .apply_discovery_delta_with_evidence(
+            run_id,
+            std::slice::from_ref(&evidence),
+            &[],
+            &control,
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .discovered_urls(run_id)
+            .await?
+            .len(),
+        1
+    );
+
+    let mut conflicting = evidence;
+    conflicting.status = "PRESERVE_ONLY".to_owned();
+    assert!(
+        repository
+            .apply_discovery_delta_with_evidence(
+                run_id,
+                std::slice::from_ref(&conflicting),
+                &[],
+                &control,
+                &[],
+            )
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, database, run_id) = quick_setup("https://example.test/seed").await?;
+    let snapshot = CrawlRunRepository::new(&database).snapshot(run_id).await?;
+    let mut job = NewJob::new(JobKind::new("QUICK_SCRAPE")?, 0, 0, 1)?;
+    job.crawl_run_id = Some(run_id.to_string());
+    let jobs = JobRepository::new(&database);
+    jobs.enqueue(&job, 0).await?;
+    let acquired = jobs
+        .acquire_next("initialization-worker", 0, 30)
+        .await?
+        .ok_or("initialization job was not acquired")?;
+    let lease = acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("initialization lease missing")?;
+    let evidence_id = uuid::Uuid::now_v7().to_string();
+    let root = CrawlUrlStateRecord {
+        id: "seed-root".to_owned(),
+        crawl_run_id: run_id,
+        canonical_url: "https://example.test/seed".to_owned(),
+        first_discovered_url_id: Some(evidence_id.clone()),
+        requested_url: "https://example.test/seed".to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(0),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Pending),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let control = CrawlTraversalControl {
+        crawl_run_id: run_id,
+        consumed_bytes: 0,
+        raw_link_count: 0,
+        duplicate_count: 0,
+        robots_excluded_count: 0,
+        provider_error_count: 0,
+        external_url_count: 0,
+        blocked_url_count: 0,
+        peak_expansion_count: 0,
+        elapsed_millis: 0,
+        time_budget_hit: false,
+        duration_work_not_expanded: false,
+        pagination_truncation_count: 0,
+        next_admission_sequence: 1,
+    };
+    let evidence = DiscoveredUrlRecord {
+        id: evidence_id,
+        crawl_run_id: run_id,
+        source_id: None,
+        raw_href: None,
+        original_url: "https://example.test/seed".to_owned(),
+        canonical_url: "https://example.test/seed".to_owned(),
+        status: "ADMITTED".to_owned(),
+        discovered_at: "unix:1".to_owned(),
+        detail: serde_json::json!({"origin":"SEED","seed_ids":[]}),
+    };
+    let checkpoint = CheckpointEnvelope::new(CheckpointIdentity::new(
+        run_id.to_string(),
+        snapshot.snapshot_hash(),
+        snapshot.checkpoint_compatibility_hash(),
+    )?);
+    let projection = CrawlTraversalSemanticProjection {
+        url_states: Vec::new(),
+        page_type_counts: Vec::new(),
+    };
+    let repository = CrawlTraversalRepository::new(&database);
+    repository
+        .initialize_run_state_with_checkpoint_and_evidence(
+            run_id,
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&evidence),
+            &control,
+            &projection,
+            &job.id,
+            &acquired.attempt.id,
+            &lease,
+            &checkpoint,
+            1,
+        )
+        .await?;
+    repository
+        .initialize_run_state_with_checkpoint_and_evidence(
+            run_id,
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&evidence),
+            &control,
+            &projection,
+            &job.id,
+            &acquired.attempt.id,
+            &lease,
+            &checkpoint,
+            2,
+        )
+        .await?;
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .discovered_urls(run_id)
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(jobs.checkpoints(&job.id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn current_execution_write_requires_current_generation_and_attempt_owner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, database, run_id) = quick_setup("https://example.test/generation").await?;
+    let control = CrawlTraversalControl {
+        crawl_run_id: run_id,
+        consumed_bytes: 0,
+        raw_link_count: 0,
+        duplicate_count: 0,
+        robots_excluded_count: 0,
+        provider_error_count: 0,
+        external_url_count: 0,
+        blocked_url_count: 0,
+        peak_expansion_count: 0,
+        elapsed_millis: 0,
+        time_budget_hit: false,
+        duration_work_not_expanded: false,
+        pagination_truncation_count: 0,
+        next_admission_sequence: 1,
+    };
+    let root = CrawlUrlStateRecord {
+        id: "generation-root".to_owned(),
+        crawl_run_id: run_id,
+        canonical_url: "https://example.test/generation".to_owned(),
+        first_discovered_url_id: None,
+        requested_url: "https://example.test/generation".to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(0),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Pending),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let traversal = CrawlTraversalRepository::new(&database);
+    traversal
+        .initialize_run_state(run_id, &[root], &control)
+        .await?;
+
+    let mut source = NewJob::new(JobKind::new("QUICK_SCRAPE")?, 0, 0, 2)?;
+    source.crawl_run_id = Some(run_id.to_string());
+    let jobs = JobRepository::new(&database);
+    jobs.enqueue(&source, 0).await?;
+    let source_acquired = jobs
+        .acquire_next("generation-source-worker", 0, 30)
+        .await?
+        .ok_or("source job was not acquired")?;
+    let source_lease = source_acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("source lease missing")?;
+    jobs.cancel(&source.id, &source_lease, 1).await?;
+    let action = jobs
+        .enqueue_action_child(
+            &source.id,
+            JobKind::new("RETRY")?,
+            2,
+            erabi_db::repositories::ActionRunAssociation::SameSourceRun,
+            Some(1),
+        )
+        .await?;
+    let action_acquired = jobs
+        .acquire_next("generation-action-worker", 2, 30)
+        .await?
+        .ok_or("action job was not acquired")?;
+    traversal
+        .prepare_recovery_action(
+            &action.id,
+            &action_acquired.attempt.id,
+            run_id,
+            CrawlRecoveryActionKind::Retry,
+            2,
+        )
+        .await?;
+
+    let execution_repository = CrawlExecutionRepository::new(&database);
+    let stale_record = record(
+        CrawlExecutionId::new(),
+        run_id,
+        "https://example.test/generation",
+        "https://example.test/generation",
+        None,
+        CrawlExecutionOutcome::Completed,
+        None,
+    );
+    assert!(matches!(
+        execution_repository
+            .persist_current_work(
+                &stale_record,
+                "generation-root",
+                &source.id,
+                &source_acquired.attempt.id,
+                CrawlWorkState::Completed,
+                1,
+                2,
+            )
+            .await,
+        Err(CrawlExecutionRepositoryError::InvalidReference)
+    ));
+    let current_record = record(
+        CrawlExecutionId::new(),
+        run_id,
+        "https://example.test/generation",
+        "https://example.test/generation",
+        None,
+        CrawlExecutionOutcome::Completed,
+        None,
+    );
+    execution_repository
+        .persist_current_work(
+            &current_record,
+            "generation-root",
+            &action.id,
+            &action_acquired.attempt.id,
+            CrawlWorkState::Completed,
+            1,
+            2,
+        )
+        .await?;
+    let durable = traversal.reconstruct_recovery_state(run_id).await?;
+    let current = durable
+        .work
+        .iter()
+        .find(|state| state.id == "generation-root")
+        .ok_or("generation state missing")?;
+    let current_execution_id = current_record.id.to_string();
+    assert_eq!(current.work_generation, 1);
+    assert_eq!(current.current_work_state, Some(CrawlWorkState::Completed));
+    assert_eq!(
+        current.current_execution_id.as_deref(),
+        Some(current_execution_id.as_str())
+    );
+    Ok(())
+}
+
 #[test]
 fn historical_migrations_have_not_changed() -> Result<(), Box<dyn std::error::Error>> {
     let expected = [
@@ -1113,6 +1741,10 @@ fn historical_migrations_have_not_changed() -> Result<(), Box<dyn std::error::Er
         (
             "../../migrations/0004_jobs.sql",
             "3588E77F17936E1A231555C785669F99B6C8F79746F37275317910F398427608",
+        ),
+        (
+            "../../migrations/0005_crawl_execution.sql",
+            "28D347FAFA9886D82DD502FA619322270FDF15989EE6D15D0CDA48BC2772EC5E",
         ),
     ];
     for (relative_path, expected_hash) in expected {

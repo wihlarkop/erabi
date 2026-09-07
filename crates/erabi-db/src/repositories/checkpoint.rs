@@ -3,7 +3,10 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use turso::{Connection, transaction::TransactionBehavior};
+use turso::{
+    Connection,
+    transaction::{Transaction, TransactionBehavior},
+};
 use uuid::Uuid;
 
 use super::job::{JobId, JobLease};
@@ -189,6 +192,11 @@ impl CheckpointArtifactReference {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointEnvelope {
     pub schema_version: u16,
+    /// Monotonic append position assigned by this repository for one job.
+    /// This is persisted in the existing JSON column so recovery does not
+    /// infer checkpoint order from row order or UUID lexical order.
+    #[serde(default)]
+    pub sequence: u64,
     pub identity: CheckpointIdentity,
     pub completed_units: Vec<CheckpointUnitId>,
     pub pending_units: Vec<CheckpointUnitId>,
@@ -196,6 +204,12 @@ pub struct CheckpointEnvelope {
     pub discovery_position: Option<CheckpointPosition>,
     pub artifact_references: Vec<CheckpointArtifactReference>,
     pub extraction: ExtractionResumeState,
+    /// Optional bounded plan-specific state. The generic queue owns the
+    /// envelope and lineage validation; the owning plan validates this JSON
+    /// before interpreting it. Large bodies and secrets are never accepted as
+    /// a substitute for a typed plan payload.
+    #[serde(default)]
+    pub payload: Option<String>,
 }
 
 impl CheckpointEnvelope {
@@ -204,6 +218,7 @@ impl CheckpointEnvelope {
     pub fn new(identity: CheckpointIdentity) -> Self {
         Self {
             schema_version: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+            sequence: 0,
             identity,
             completed_units: Vec::new(),
             pending_units: Vec::new(),
@@ -211,6 +226,7 @@ impl CheckpointEnvelope {
             discovery_position: None,
             artifact_references: Vec::new(),
             extraction: ExtractionResumeState::not_started(),
+            payload: None,
         }
     }
 
@@ -244,6 +260,13 @@ impl CheckpointEnvelope {
             return Err(CheckpointRepositoryError::InvalidEnvelope);
         }
         self.identity.validate()?;
+        if self
+            .payload
+            .as_deref()
+            .is_some_and(|payload| payload.is_empty() || payload.len() > MAX_CHECKPOINT_BYTES)
+        {
+            return Err(CheckpointRepositoryError::InvalidEnvelope);
+        }
         let total_units = self
             .completed_units
             .len()
@@ -387,7 +410,6 @@ impl<'database> CheckpointRepository<'database> {
         if attempt_id.is_empty() || attempt_id.len() > MAX_ATTEMPT_ID_BYTES {
             return Err(CheckpointRepositoryError::InvalidEnvelope);
         }
-        let encoded = checkpoint.encode()?;
         let mut connection = self
             .database
             .connection()
@@ -397,24 +419,14 @@ impl<'database> CheckpointRepository<'database> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(CheckpointRepositoryError::database)?;
-        let result = async {
-            ensure_owned_attempt(&transaction, job_id, attempt_id, lease, created_at).await?;
-            let id = Uuid::now_v7().to_string();
-            transaction
-                .execute(
-                    "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (id.as_str(), job_id.as_str(), attempt_id, encoded.as_str(), created_at),
-                )
-                .await
-                .map_err(CheckpointRepositoryError::database)?;
-            Ok(CheckpointRecord {
-                id,
-                job_id: job_id.clone(),
-                attempt_id: Some(attempt_id.to_owned()),
-                checkpoint: checkpoint.clone(),
-                created_at,
-            })
-        }
+        let result = append_in_transaction(
+            &transaction,
+            job_id,
+            attempt_id,
+            lease,
+            checkpoint,
+            created_at,
+        )
         .await;
         match result {
             Ok(record) => transaction
@@ -510,8 +522,44 @@ impl<'database> CheckpointRepository<'database> {
     }
 }
 
+/// Appends generic checkpoint evidence inside a caller-owned immediate
+/// transaction. Task 9 uses this only to couple first durable crawl work with
+/// the compatible compact control checkpoint; ownership is still verified
+/// against the active attempt and lease before inserting anything.
+pub(crate) async fn append_in_transaction(
+    transaction: &Transaction<'_>,
+    job_id: &JobId,
+    attempt_id: &str,
+    lease: &JobLease,
+    checkpoint: &CheckpointEnvelope,
+    created_at: i64,
+) -> Result<CheckpointRecord, CheckpointRepositoryError> {
+    if attempt_id.is_empty() || attempt_id.len() > MAX_ATTEMPT_ID_BYTES {
+        return Err(CheckpointRepositoryError::InvalidEnvelope);
+    }
+    ensure_owned_attempt(transaction, job_id, attempt_id, lease, created_at).await?;
+    let mut stored_checkpoint = checkpoint.clone();
+    stored_checkpoint.sequence = next_checkpoint_sequence(transaction, job_id).await?;
+    let encoded = stored_checkpoint.encode()?;
+    let id = Uuid::now_v7().to_string();
+    transaction
+        .execute(
+            "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (id.as_str(), job_id.as_str(), attempt_id, encoded.as_str(), created_at),
+        )
+        .await
+        .map_err(CheckpointRepositoryError::database)?;
+    Ok(CheckpointRecord {
+        id,
+        job_id: job_id.clone(),
+        attempt_id: Some(attempt_id.to_owned()),
+        checkpoint: stored_checkpoint,
+        created_at,
+    })
+}
+
 async fn ensure_owned_attempt(
-    connection: &Connection,
+    connection: &Transaction<'_>,
     job_id: &JobId,
     attempt_id: &str,
     lease: &JobLease,
@@ -566,7 +614,7 @@ async fn ensure_owned_attempt(
     Ok(())
 }
 
-async fn assess_one_stale_job(
+pub(crate) async fn assess_one_stale_job(
     connection: &Connection,
     job_id: &JobId,
     run_id: Option<&str>,
@@ -642,7 +690,7 @@ async fn records_from_connection(
 ) -> Result<Vec<CheckpointRecord>, CheckpointRepositoryError> {
     let mut rows = connection
         .query(
-            "SELECT checkpoint.id, checkpoint.job_id, checkpoint.attempt_id, checkpoint.checkpoint_json, checkpoint.created_at, length(checkpoint.checkpoint_json), attempt.job_id FROM job_checkpoints AS checkpoint LEFT JOIN job_attempts AS attempt ON attempt.id = checkpoint.attempt_id WHERE checkpoint.job_id = ?1 ORDER BY checkpoint.created_at, checkpoint.id",
+            "SELECT checkpoint.id, checkpoint.job_id, checkpoint.attempt_id, checkpoint.checkpoint_json, checkpoint.created_at, length(checkpoint.checkpoint_json), attempt.job_id FROM job_checkpoints AS checkpoint LEFT JOIN job_attempts AS attempt ON attempt.id = checkpoint.attempt_id WHERE checkpoint.job_id = ?1",
             [job_id.as_str()],
         )
         .await
@@ -655,7 +703,48 @@ async fn records_from_connection(
     {
         records.push(record_from_row(&row)?);
     }
+    records.sort_by(|left, right| {
+        left.checkpoint
+            .sequence
+            .cmp(&right.checkpoint.sequence)
+            .then(left.created_at.cmp(&right.created_at))
+            .then_with(|| {
+                let left_payload = left.checkpoint.encode().unwrap_or_default();
+                let right_payload = right.checkpoint.encode().unwrap_or_default();
+                left_payload.cmp(&right_payload)
+            })
+    });
     Ok(records)
+}
+
+async fn next_checkpoint_sequence(
+    connection: &Transaction<'_>,
+    job_id: &JobId,
+) -> Result<u64, CheckpointRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT checkpoint_json FROM job_checkpoints WHERE job_id = ?1",
+            [job_id.as_str()],
+        )
+        .await
+        .map_err(CheckpointRepositoryError::database)?;
+    let mut maximum = None;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(CheckpointRepositoryError::database)?
+    {
+        let encoded: String = row.get(0).map_err(CheckpointRepositoryError::database)?;
+        let checkpoint: CheckpointEnvelope =
+            serde_json::from_str(&encoded).map_err(|_| CheckpointRepositoryError::Malformed)?;
+        maximum = Some(maximum.map_or(checkpoint.sequence, |value: u64| {
+            value.max(checkpoint.sequence)
+        }));
+    }
+    maximum
+        .unwrap_or(0)
+        .checked_add(u64::from(maximum.is_some()))
+        .ok_or(CheckpointRepositoryError::InvalidEnvelope)
 }
 
 fn record_from_row(row: &turso::Row) -> Result<CheckpointRecord, CheckpointRepositoryError> {

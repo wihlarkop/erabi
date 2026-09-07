@@ -4,6 +4,7 @@ mod artifact;
 mod checkpoint;
 mod configuration;
 mod crawl_execution;
+mod crawl_traversal;
 mod crawler;
 mod identity;
 mod job;
@@ -24,6 +25,14 @@ pub use configuration::ConfigurationRepository;
 pub use crawl_execution::{
     CrawlExecutionArtifact, CrawlExecutionArtifactKind, CrawlExecutionRecord,
     CrawlExecutionRepository, CrawlExecutionRepositoryError, CrawlExecutionSummary,
+};
+pub use crawl_traversal::{
+    CrawlAdmissionState, CrawlInFlightWork, CrawlPageTypeMatchState, CrawlRecoveryActionKind,
+    CrawlRecoveryActionSelection, CrawlRedirectReconciliation, CrawlTransitionSourceCount,
+    CrawlTraversalControl, CrawlTraversalPageTypeCounts, CrawlTraversalRepository,
+    CrawlTraversalRepositoryError, CrawlTraversalSemanticProjection,
+    CrawlTraversalUrlSemanticState, CrawlUrlStateRecord, CrawlWorkState,
+    ReconstructedTraversalState,
 };
 pub use crawler::{
     CrawlerAuditMetadata, CrawlerEvaluationSnapshot, CrawlerPointers, CrawlerRepository,

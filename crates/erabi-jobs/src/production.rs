@@ -1,36 +1,43 @@
-//! Bounded normal-path execution for one frozen Production Crawl Run.
+//! Bounded execution for one frozen Production Crawl Run.
 //!
-//! Task 8 deliberately has no durable frontier checkpoint or recovery payload.
 //! It delegates discovery semantics to `erabi_crawler::SemanticTraversal` and
-//! owns only provider execution, durable evidence, progress, and normal status.
-//! Task 9 owns durable reconstruction and re-entry.
+//! owns provider execution, durable evidence, progress, checkpoint-backed
+//! recovery, and final status.
 
+use serde::de::DeserializeOwned;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use erabi_crawler::{
-    CrawlerAdapter, CrawlerAdapterError, CrawlerArtifactEvidence, CrawlerArtifactKind,
-    CrawlerEvidencePolicy, CrawlerExecuteRequest, CrawlerResultCompleteness,
-    DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider, DiscoveryPreviewProviderError,
-    DiscoveryPreviewProviderOutcome, NetworkTargetPolicy, OriginKey, PacingCancellation,
-    PacingOutcome, PacingService, PreviewClock, RenderingRequirement, RobotsAdmissionDecision,
-    RobotsPolicyService, ScreenshotPolicy, SemanticTraversal, load_frozen_production_semantics,
+    CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
+    CrawlerArtifactEvidence, CrawlerArtifactKind, CrawlerEvidencePolicy, CrawlerExecuteRequest,
+    CrawlerResultCompleteness, DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider,
+    DiscoveryPreviewProviderError, DiscoveryPreviewProviderOutcome, NetworkTargetPolicy, OriginKey,
+    PacingCancellation, PacingOutcome, PacingService, PreviewClock, RenderingRequirement,
+    RobotsAdmissionDecision, RobotsPolicyService, ScreenshotPolicy, SemanticTraversal,
+    SemanticTraversalCheckpoint, SemanticTraversalQueueEntry, SemanticTraversalStep,
+    SemanticTraversalTransitionState, load_frozen_production_semantics,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase,
     repositories::{
-        ArtifactRepository, CrawlExecutionArtifact, CrawlExecutionArtifactKind,
-        CrawlExecutionRecord, CrawlExecutionRepository, CrawlExecutionSummary, CrawlRunRepository,
-        DiscoveredUrlRecord, JobRepository,
+        ArtifactRepository, CrawlAdmissionState, CrawlExecutionArtifact,
+        CrawlExecutionArtifactKind, CrawlExecutionRecord, CrawlExecutionRepository,
+        CrawlExecutionRepositoryError, CrawlExecutionSummary, CrawlInFlightWork,
+        CrawlPageTypeMatchState, CrawlRedirectReconciliation, CrawlRunRepository,
+        CrawlTransitionSourceCount, CrawlTraversalControl, CrawlTraversalPageTypeCounts,
+        CrawlTraversalRepository, CrawlTraversalSemanticProjection, CrawlTraversalUrlSemanticState,
+        CrawlUrlStateRecord, CrawlWorkState, DiscoveredUrlRecord, JobRepository,
     },
 };
 use erabi_domain::{
     CrawlExecutionErrorCode, CrawlExecutionId, CrawlExecutionOutcome, CrawlRunId, CrawlRunSnapshot,
-    CrawlRunStatus, DiscoveryPreviewResult, DiscoveryTransitionId, EffectiveDiscoveryPreviewLimits,
+    CrawlRunStatus, DiscoveryPath, DiscoveryPreviewPage, DiscoveryPreviewResult,
+    DiscoveryPreviewSeed, DiscoveryTransitionId, EffectiveDiscoveryPreviewLimits,
     EffectiveTransitionPreviewTotalLimit, PageTypeId, PreviewBudgetKind, PreviewUrlState,
     TestDiagnostic,
 };
@@ -44,8 +51,100 @@ use crate::{
 
 const PRODUCTION_CRAWL_JOB_KIND: &str = "PRODUCTION_CRAWL";
 
+fn is_production_job_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        PRODUCTION_CRAWL_JOB_KIND
+            | "RETRY"
+            | "RETRY_FAILED_PARTS"
+            | "RESUME_CHECKPOINT"
+            | "RERUN_FULL_CRAWL"
+    )
+}
+
 type ExecutionProvenanceKey = (String, String);
 type ExecutionProvenanceIds = BTreeMap<ExecutionProvenanceKey, String>;
+
+fn transition_source_counts(
+    run_id: CrawlRunId,
+    traversal: &SemanticTraversal,
+) -> Vec<CrawlTransitionSourceCount> {
+    traversal
+        .checkpoint_state()
+        .transition_page_counts
+        .into_iter()
+        .map(
+            |(transition_id, source_canonical_url, eligible_edge_count)| {
+                CrawlTransitionSourceCount {
+                    transition_id: transition_id.to_string(),
+                    source_url_state_id: crawl_url_state_id(run_id, &source_canonical_url),
+                    eligible_edge_count: u64::from(eligible_edge_count),
+                }
+            },
+        )
+        .collect()
+}
+
+fn semantic_projection(state: &SemanticTraversalCheckpoint) -> CrawlTraversalSemanticProjection {
+    let mut urls = BTreeSet::new();
+    for values in [
+        &state.admitted_canonical_urls,
+        &state.seen_canonical_urls,
+        &state.sampled_canonical_urls,
+        &state.expanded_canonical_urls,
+        &state.matching_canonical_urls,
+        &state.unmatched_canonical_urls,
+        &state.ambiguous_canonical_urls,
+        &state.in_scope_canonical_urls,
+    ] {
+        urls.extend(values.iter().cloned());
+    }
+    let url_states = urls
+        .into_iter()
+        .map(|canonical_url| CrawlTraversalUrlSemanticState {
+            sampled: state.sampled_canonical_urls.contains(&canonical_url),
+            expanded: state.expanded_canonical_urls.contains(&canonical_url),
+            in_scope: state.in_scope_canonical_urls.contains(&canonical_url),
+            page_type_match_state: if state.ambiguous_canonical_urls.contains(&canonical_url) {
+                Some(CrawlPageTypeMatchState::Ambiguous)
+            } else if state.unmatched_canonical_urls.contains(&canonical_url) {
+                Some(CrawlPageTypeMatchState::Unmatched)
+            } else if state.matching_canonical_urls.contains(&canonical_url) {
+                Some(CrawlPageTypeMatchState::Matched)
+            } else {
+                None
+            },
+            canonical_url,
+        })
+        .collect();
+    let mut page_type_counts = BTreeMap::<String, (u64, u64)>::new();
+    for (page_type_id, count) in &state.page_type_sampled {
+        page_type_counts
+            .entry(page_type_id.to_string())
+            .or_default()
+            .0 = *count;
+    }
+    for (page_type_id, count) in &state.page_type_discovered {
+        page_type_counts
+            .entry(page_type_id.to_string())
+            .or_default()
+            .1 = *count;
+    }
+    let page_type_counts = page_type_counts
+        .into_iter()
+        .map(
+            |(page_type_id, (sampled_count, discovered_count))| CrawlTraversalPageTypeCounts {
+                page_type_id,
+                sampled_count,
+                discovered_count,
+            },
+        )
+        .collect();
+    CrawlTraversalSemanticProjection {
+        url_states,
+        page_type_counts,
+    }
+}
 
 /// Runtime dependencies are injected by the process composition root. In
 /// particular, `pacing` is the one process-wide Task 5 service also used by
@@ -100,7 +199,7 @@ impl ProductionCrawlJobHandler {
 
     #[allow(clippy::too_many_lines)]
     async fn execute_inner(&self, context: JobExecutionContext) -> Result<(), ()> {
-        if context.kind().as_str() != PRODUCTION_CRAWL_JOB_KIND {
+        if !is_production_job_kind(context.kind().as_str()) {
             return Err(());
         }
         let job = JobRepository::new(&self.database)
@@ -125,13 +224,77 @@ impl ProductionCrawlJobHandler {
             self.clock.now_millis(),
             limits.max_duration_ms,
         );
-
-        CrawlRunRepository::new(&self.database)
-            .transition_execution_status(run_id, CrawlRunStatus::Running)
+        let executions = CrawlExecutionRepository::new(&self.database)
+            .list_for_run(run_id)
             .await
             .map_err(|_| ())?;
-        self.progress(&context, "PRODUCTION_STARTED", None).await?;
-        self.progress(&context, "FRONTIER_PLANNED", None).await?;
+        let discovered = CrawlRunRepository::new(&self.database)
+            .discovered_urls(run_id)
+            .await
+            .map_err(|_| ())?;
+        let checkpoint = if context.kind().as_str() == "RERUN_FULL_CRAWL" {
+            None
+        } else {
+            JobRepository::new(&self.database)
+                .latest_checkpoint_for_lineage(context.job_id())
+                .await
+                .map_err(|_| ())?
+        };
+
+        if checkpoint.is_none() && (!executions.is_empty() || !discovered.is_empty()) {
+            if !durable_production_completion_without_checkpoint(&executions, &discovered) {
+                // Durable discovery without a compatible recovery frontier is
+                // not permission to rediscover Seeds.  This is an interrupted
+                // run and must fail closed.
+                return Err(());
+            }
+            let current_status = CrawlRunRepository::new(&self.database)
+                .status(run_id)
+                .await
+                .map_err(|_| ())?;
+            let final_status = self
+                .finalize_durable_run(&context, &snapshot, run_id, current_status)
+                .await?;
+            self.progress(&context, "FINALIZATION_COMPLETED", None)
+                .await?;
+            return self
+                .progress(
+                    &context,
+                    if final_status == CrawlRunStatus::PartialResult {
+                        "PRODUCTION_PARTIAL_RESULT"
+                    } else {
+                        "PRODUCTION_BOUNDED_COMPLETE"
+                    },
+                    Some(ProgressTerminalState::Succeeded),
+                )
+                .await;
+        }
+
+        let run_repository = CrawlRunRepository::new(&self.database);
+        if matches!(
+            context.kind().as_str(),
+            "RETRY" | "RETRY_FAILED_PARTS" | "RESUME_CHECKPOINT"
+        ) {
+            run_repository
+                .transition_recovery_status(run_id)
+                .await
+                .map_err(|_| ())?;
+        } else {
+            run_repository
+                .transition_execution_status(run_id, CrawlRunStatus::Running)
+                .await
+                .map_err(|_| ())?;
+        }
+        self.progress(
+            &context,
+            if checkpoint.is_some() {
+                "RECOVERY_ACCEPTED"
+            } else {
+                "PRODUCTION_STARTED"
+            },
+            None,
+        )
+        .await?;
 
         let provider = Arc::new(ProductionTraversalProvider::new(
             self.clone(),
@@ -139,67 +302,266 @@ impl ProductionCrawlJobHandler {
             snapshot.clone(),
             deadline,
         ));
-        let traversal = SemanticTraversal::for_frozen_snapshot(
-            semantic,
-            snapshot.selected_seed_ids().to_vec(),
-            limits,
-            provider.clone(),
-            self.clock.clone(),
-        )
-        .map_err(|_| ())?;
-        let result = traversal.execute().await.map_err(|_| ())?;
-        if context.cancellation().is_cancelled() {
-            return Err(());
-        }
+        let mut provenance = self.load_provenance_ids(run_id).await?;
+        let mut traversal = if let Some(record) = checkpoint.as_ref() {
+            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id)
+                .map_err(|_| ())?;
+            // A provider result can be durably committed immediately before a
+            // process crash and before the following checkpoint append.  The
+            // immutable execution rows win over that stale work partition.
+            let recovery_selection = match context.kind().as_str() {
+                "RETRY" | "RETRY_FAILED_PARTS" => {
+                    // Make the action child recoverable before its durable
+                    // generation selection. If the process dies after the
+                    // selection transaction commits but before the next
+                    // checkpoint, queue recovery can replay this same action
+                    // instead of exhausting the child as checkpoint-less.
+                    context
+                        .checkpoint(&record.checkpoint)
+                        .await
+                        .map_err(|_| ())?;
+                    let action_kind = if context.kind().as_str() == "RETRY" {
+                        erabi_db::repositories::CrawlRecoveryActionKind::Retry
+                    } else {
+                        erabi_db::repositories::CrawlRecoveryActionKind::RetryFailedParts
+                    };
+                    Some(
+                        CrawlTraversalRepository::new(&self.database)
+                            .prepare_recovery_action(
+                                context.job_id(),
+                                context.attempt_id(),
+                                run_id,
+                                action_kind,
+                                context.ownership_now(),
+                            )
+                            .await
+                            .map_err(|_| ())?,
+                    )
+                }
+                _ => None,
+            };
+            let selected_state_ids = recovery_selection
+                .as_ref()
+                .map(|selection| selection.state_ids.iter().cloned().collect::<BTreeSet<_>>());
+            let (durable, recovery_entries) = self
+                .reconstruct_traversal_checkpoint(
+                    run_id,
+                    &snapshot,
+                    &semantic,
+                    selected_state_ids.as_ref(),
+                )
+                .await?;
+            if recovery_selection.is_some() {
+                SemanticTraversal::restore_for_recovery(
+                    semantic,
+                    snapshot.selected_seed_ids().to_vec(),
+                    limits,
+                    provider.clone(),
+                    self.clock.clone(),
+                    durable,
+                    recovery_entries,
+                )
+                .map_err(|_| ())?
+            } else {
+                SemanticTraversal::restore_from_checkpoint(
+                    semantic,
+                    snapshot.selected_seed_ids().to_vec(),
+                    limits,
+                    provider.clone(),
+                    self.clock.clone(),
+                    durable,
+                )
+                .map_err(|_| ())?
+            }
+        } else {
+            if !executions.is_empty()
+                || !discovered.is_empty()
+                || !matches!(
+                    context.kind().as_str(),
+                    PRODUCTION_CRAWL_JOB_KIND | "RERUN_FULL_CRAWL"
+                )
+            {
+                return Err(());
+            }
+            SemanticTraversal::for_frozen_snapshot(
+                semantic,
+                snapshot.selected_seed_ids().to_vec(),
+                limits,
+                provider.clone(),
+                self.clock.clone(),
+            )
+            .map_err(|_| ())?
+        };
 
-        let mut attempts = provider.take_attempts().await;
-        let discovered_ids = self
-            .persist_discovery_paths(run_id, &result, &attempts)
-            .await?;
-        let pagination_truncation_count = result.summary.pagination_truncation_count;
-        let page_type_ambiguity_count = count_ambiguities(&result);
-        let duration_incomplete = duration_left_known_incomplete(&result);
-        let page_attempts = self
-            .persist_page_attempts(
-                run_id,
-                &snapshot,
-                &result,
-                &discovered_ids,
-                &mut attempts,
+        // Initialization atomically commits the exact root evidence, logical
+        // work, traversal control, and compact checkpoint before dispatch.
+        let mut seeds_persisted = checkpoint.is_some();
+        if checkpoint.is_some() {
+            self.synchronize_traversal_state(run_id, &traversal).await?;
+            self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
+                .await?;
+        } else {
+            self.initialize_traversal_state(
                 &context,
+                &snapshot,
+                run_id,
+                &traversal,
+                &mut provenance,
             )
             .await?;
-        let pending = result.summary.frontier_remaining;
-        let unresolved_partial_work_count = page_attempts
-            .unresolved_partial_work
-            .saturating_add(page_type_ambiguity_count)
-            .saturating_add(pagination_truncation_count)
-            .saturating_add(pending)
-            .saturating_add(u64::from(duration_incomplete));
-        let summary = CrawlExecutionSummary {
-            crawl_run_id: run_id,
-            in_scope_pages_planned: page_attempts.attempted.saturating_add(pending),
-            in_scope_pages_completed: page_attempts.completed,
-            pagination_truncation_count,
-            unresolved_partial_work_count,
-            page_type_ambiguity_count,
-        };
-        CrawlExecutionRepository::new(&self.database)
-            .save_summary(&summary)
+            seeds_persisted = true;
+        }
+
+        loop {
+            let pending_canonical_url = traversal
+                .next_pending_canonical_url()
+                .map(ToOwned::to_owned);
+            let expected_work_generation = if let Some(canonical_url) =
+                pending_canonical_url.as_deref()
+            {
+                Some(
+                    CrawlTraversalRepository::new(&self.database)
+                        .read_work_generation(run_id, &crawl_url_state_id(run_id, canonical_url))
+                        .await
+                        .map_err(|_| ())?,
+                )
+            } else {
+                None
+            };
+            match traversal.step().await.map_err(|_| ())? {
+                SemanticTraversalStep::Processed {
+                    pages,
+                    discovery_paths,
+                } => {
+                    let attempts = provider.take_attempts().await;
+                    let seeds = if seeds_persisted {
+                        Vec::new()
+                    } else {
+                        traversal.seed_evidence()
+                    };
+                    let evidence = self.collect_discovery_delta(
+                        run_id,
+                        &seeds,
+                        &discovery_paths,
+                        &pages,
+                        &attempts,
+                        expected_work_generation.unwrap_or(0),
+                        &mut provenance,
+                    )?;
+                    self.synchronize_traversal_state_with_evidence(
+                        run_id,
+                        &traversal,
+                        &evidence,
+                        &pages,
+                        expected_work_generation,
+                    )
+                    .await?;
+                    seeds_persisted = true;
+                    self.persist_page_delta(
+                        run_id,
+                        &snapshot,
+                        &pages,
+                        &discovery_paths,
+                        &provenance,
+                        attempts,
+                        expected_work_generation,
+                        &context,
+                    )
+                    .await?;
+                    self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
+                        .await?;
+                    if context.cancellation().is_cancelled() {
+                        return self
+                            .cancellation_boundary(&context, &snapshot, run_id)
+                            .await;
+                    }
+                    if context.storage_pressure().is_signalled() {
+                        return Ok(());
+                    }
+                }
+                SemanticTraversalStep::Interrupted(reason) => {
+                    if !seeds_persisted {
+                        let seeds = traversal.seed_evidence();
+                        let evidence = self.collect_discovery_delta(
+                            run_id,
+                            &seeds,
+                            &[],
+                            &[],
+                            &BTreeMap::new(),
+                            0,
+                            &mut provenance,
+                        )?;
+                        self.synchronize_traversal_state_with_evidence(
+                            run_id,
+                            &traversal,
+                            &evidence,
+                            &[],
+                            None,
+                        )
+                        .await?;
+                    }
+                    // The interruption itself can advance durable traversal
+                    // control (notably duration/pagination structural
+                    // evidence) even when it produces no page delta. Persist
+                    // that semantic result before the compact checkpoint.
+                    self.synchronize_traversal_state(run_id, &traversal).await?;
+                    self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
+                        .await?;
+                    match reason {
+                        erabi_crawler::DiscoveryPreviewInterruption::Cancelled => {
+                            return self
+                                .cancellation_boundary(&context, &snapshot, run_id)
+                                .await;
+                        }
+                        erabi_crawler::DiscoveryPreviewInterruption::StoragePressure => {
+                            return Ok(());
+                        }
+                    }
+                }
+                SemanticTraversalStep::Complete => {
+                    if !seeds_persisted {
+                        let seeds = traversal.seed_evidence();
+                        let evidence = self.collect_discovery_delta(
+                            run_id,
+                            &seeds,
+                            &[],
+                            &[],
+                            &BTreeMap::new(),
+                            0,
+                            &mut provenance,
+                        )?;
+                        self.synchronize_traversal_state_with_evidence(
+                            run_id,
+                            &traversal,
+                            &evidence,
+                            &[],
+                            None,
+                        )
+                        .await?;
+                    }
+                    // Completion may follow a budget decision with no further
+                    // page delta. The scalar control row, not the compact
+                    // checkpoint, owns those final traversal facts.
+                    self.synchronize_traversal_state(run_id, &traversal).await?;
+                    self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
+                        .await?;
+                    break;
+                }
+            }
+        }
+
+        let current_status = CrawlRunRepository::new(&self.database)
+            .status(run_id)
             .await
             .map_err(|_| ())?;
-        let status = if unresolved_partial_work_count > 0 {
-            CrawlRunStatus::PartialResult
-        } else {
-            CrawlRunStatus::Succeeded
-        };
-        CrawlRunRepository::new(&self.database)
-            .transition_execution_status(run_id, status)
-            .await
-            .map_err(|_| ())?;
+        let final_status = self
+            .finalize_durable_run(&context, &snapshot, run_id, current_status)
+            .await?;
+        self.progress(&context, "FINALIZATION_COMPLETED", None)
+            .await?;
         self.progress(
             &context,
-            if status == CrawlRunStatus::PartialResult {
+            if final_status == CrawlRunStatus::PartialResult {
                 "PRODUCTION_PARTIAL_RESULT"
             } else {
                 "PRODUCTION_BOUNDED_COMPLETE"
@@ -209,7 +571,1047 @@ impl ProductionCrawlJobHandler {
         .await
     }
 
+    async fn cancellation_boundary(
+        &self,
+        context: &JobExecutionContext,
+        snapshot: &CrawlRunSnapshot,
+        run_id: CrawlRunId,
+    ) -> Result<(), ()> {
+        self.finalize_durable_run(context, snapshot, run_id, CrawlRunStatus::Cancelled)
+            .await?;
+        self.progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
+            .await?;
+        self.progress(
+            context,
+            "PRODUCTION_CANCELLED",
+            Some(ProgressTerminalState::Cancelled),
+        )
+        .await?;
+        Err(())
+    }
+
+    async fn finalize_durable_run(
+        &self,
+        context: &JobExecutionContext,
+        snapshot: &CrawlRunSnapshot,
+        run_id: CrawlRunId,
+        current_status: CrawlRunStatus,
+    ) -> Result<CrawlRunStatus, ()> {
+        let executions = CrawlExecutionRepository::new(&self.database)
+            .list_for_run(run_id)
+            .await
+            .map_err(|_| ())?;
+        let discovered = CrawlRunRepository::new(&self.database)
+            .discovered_urls(run_id)
+            .await
+            .map_err(|_| ())?;
+        let latest = JobRepository::new(&self.database)
+            .latest_checkpoint_for_lineage(context.job_id())
+            .await
+            .map_err(|_| ())?;
+        let _checkpoint = latest
+            .as_ref()
+            .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, snapshot, run_id))
+            .transpose()
+            .map_err(|_| ())?;
+        let durable = CrawlTraversalRepository::new(&self.database)
+            .reconstruct_recovery_state(run_id)
+            .await
+            .map_err(|_| ())?;
+        let finalization = erabi_crawler::finalize_durable_state_with_traversal(
+            snapshot,
+            current_status,
+            &executions,
+            &discovered,
+            None,
+            Some(&durable.control),
+            Some(&durable.work),
+        )
+        .map_err(|_| ())?;
+        let summary = CrawlExecutionSummary {
+            crawl_run_id: run_id,
+            in_scope_pages_planned: finalization.structural_input.in_scope_pages_planned,
+            in_scope_pages_completed: finalization.structural_input.in_scope_pages_completed,
+            pagination_truncation_count: finalization.structural_input.pagination_truncation_count,
+            unresolved_partial_work_count: finalization
+                .structural_input
+                .unresolved_partial_work_count,
+            page_type_ambiguity_count: finalization.structural_input.page_type_ambiguity_count,
+        };
+        CrawlExecutionRepository::new(&self.database)
+            .finalize(&summary, finalization.status)
+            .await
+            .map_err(|_| ())?;
+        Ok(finalization.status)
+    }
+
+    async fn load_provenance_ids(&self, run_id: CrawlRunId) -> Result<ExecutionProvenanceIds, ()> {
+        let mut latest = BTreeMap::<ExecutionProvenanceKey, (u64, String)>::new();
+        let records = CrawlRunRepository::new(&self.database)
+            .discovered_urls(run_id)
+            .await
+            .map_err(|_| ())?;
+        for record in records {
+            if matches!(record.status.as_str(), "ADMITTED" | "EXECUTION_RECONCILED")
+                || record
+                    .detail
+                    .get("origin")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("SEED")
+            {
+                let generation = record
+                    .detail
+                    .get("work_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let key = (record.original_url, record.canonical_url);
+                if latest
+                    .get(&key)
+                    .is_none_or(|(known_generation, _)| generation >= *known_generation)
+                {
+                    latest.insert(key, (generation, record.id));
+                }
+            }
+        }
+        Ok(latest.into_iter().map(|(key, (_, id))| (key, id)).collect())
+    }
+
+    /// Persists only facts already decided by the one `SemanticTraversal`. The
+    /// DB sees queue ordering/provenance; it never re-evaluates selectors,
+    /// canonicalization, scope, or transition eligibility.
+    async fn synchronize_traversal_state(
+        &self,
+        run_id: CrawlRunId,
+        traversal: &SemanticTraversal,
+    ) -> Result<(), ()> {
+        let (work, control) = Self::durable_traversal_snapshot(run_id, traversal);
+        let semantic_state = semantic_projection(&traversal.checkpoint_state());
+        let transition_source_counts = transition_source_counts(run_id, traversal);
+        let repository = CrawlTraversalRepository::new(&self.database);
+        match repository.read_traversal_control(run_id).await {
+            Ok(_) => repository
+                .apply_discovery_delta_with_projection(
+                    run_id,
+                    &[],
+                    &work,
+                    &control,
+                    &transition_source_counts,
+                    &semantic_state,
+                    &[],
+                    &[],
+                )
+                .await
+                .map_err(|_| ()),
+            // A checkpoint without its coupled traversal-control row is an
+            // interrupted or pre-Task-9 state, not proof that initialization
+            // completed. Do not recreate roots here: that would allow
+            // recovery to proceed without the atomic Seed evidence phase.
+            Err(_) => Err(()),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn synchronize_traversal_state_with_evidence(
+        &self,
+        run_id: CrawlRunId,
+        traversal: &SemanticTraversal,
+        evidence: &[DiscoveredUrlRecord],
+        pages: &[DiscoveryPreviewPage],
+        expected_work_generation: Option<u64>,
+    ) -> Result<(), ()> {
+        let (mut work, control) = Self::durable_traversal_snapshot(run_id, traversal);
+        for state in &mut work {
+            for record in evidence.iter().filter(|record| {
+                record.status == "ADMITTED" && record.canonical_url == state.canonical_url
+            }) {
+                if state.first_discovered_url_id.is_none() {
+                    state.first_discovered_url_id = Some(record.id.clone());
+                }
+                let source_state_id = record
+                    .detail
+                    .get("source_canonical_url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|source| crawl_url_state_id(run_id, source));
+                if source_state_id.as_deref() == state.parent_url_state_id.as_deref() {
+                    state.parent_discovered_url_id = Some(record.id.clone());
+                }
+            }
+        }
+        for record in evidence {
+            let Some(reason) = preserve_reason_for_discovery_status(&record.status) else {
+                continue;
+            };
+            if work
+                .iter()
+                .any(|state| state.canonical_url == record.canonical_url)
+            {
+                continue;
+            }
+            let seed_provenance = record
+                .detail
+                .get("seed_ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            work.push(CrawlUrlStateRecord {
+                id: crawl_url_state_id(run_id, &record.canonical_url),
+                crawl_run_id: run_id,
+                canonical_url: record.canonical_url.clone(),
+                first_discovered_url_id: Some(record.id.clone()),
+                requested_url: record.original_url.clone(),
+                parent_url_state_id: None,
+                parent_discovered_url_id: None,
+                admission_state: CrawlAdmissionState::PreserveOnly,
+                preserve_reason: Some(reason.to_owned()),
+                resolved_to_url_state_id: None,
+                admission_sequence: None,
+                depth: None,
+                target_page_type_id: None,
+                transition_id: None,
+                pagination: false,
+                final_canonical_url: None,
+                current_work_state: None,
+                work_generation: 0,
+                current_execution_id: None,
+                seed_provenance,
+                seen: true,
+                sampled: false,
+                expanded: false,
+                in_scope: false,
+                page_type_match_state: None,
+            });
+        }
+        let repository = CrawlTraversalRepository::new(&self.database);
+        let transition_source_counts = transition_source_counts(run_id, traversal);
+        let redirects = pages
+            .iter()
+            .filter_map(|page| {
+                let final_canonical_url = page.canonical_url.as_ref()?;
+                (page.requested_canonical_url != *final_canonical_url).then(|| {
+                    CrawlRedirectReconciliation {
+                        alias_url_state_id: crawl_url_state_id(
+                            run_id,
+                            &page.requested_canonical_url,
+                        ),
+                        final_url_state_id: crawl_url_state_id(run_id, final_canonical_url),
+                        alias_canonical_url: page.requested_canonical_url.clone(),
+                        final_canonical_url: final_canonical_url.clone(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        // SemanticTraversal has already committed the observation to its
+        // in-memory sets by this point. Keep that source logical unit
+        // non-pending in the same discovery transaction until the guarded
+        // execution write can attach its result. A sampled PENDING row would
+        // be an impossible checkpoint-equivalent state: strict restore would
+        // reject it, while recovery could otherwise select it again.
+        // Provider failures and robots exclusions are deliberately left
+        // pending; they have no sampled semantic observation and remain
+        // eligible for the existing retry/recovery actions.
+        let in_flight_work = pages
+            .iter()
+            .filter(|page| {
+                !matches!(
+                    page.state,
+                    PreviewUrlState::ProviderError | PreviewUrlState::RobotsExcluded
+                )
+            })
+            .map(|page| {
+                let canonical_url = page
+                    .canonical_url
+                    .as_deref()
+                    .unwrap_or(&page.requested_canonical_url);
+                CrawlInFlightWork {
+                    state_id: crawl_url_state_id(run_id, canonical_url),
+                    expected_work_generation: (page.requested_canonical_url == canonical_url)
+                        .then_some(expected_work_generation)
+                        .flatten(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let semantic_state = semantic_projection(&traversal.checkpoint_state());
+        repository
+            .apply_discovery_delta_with_projection(
+                run_id,
+                evidence,
+                &work,
+                &control,
+                &transition_source_counts,
+                &semantic_state,
+                &redirects,
+                &in_flight_work,
+            )
+            .await
+            .map_err(|_| ())
+    }
+
+    fn durable_traversal_snapshot(
+        run_id: CrawlRunId,
+        traversal: &SemanticTraversal,
+    ) -> (Vec<CrawlUrlStateRecord>, CrawlTraversalControl) {
+        let state = traversal.checkpoint_state();
+        let projection = semantic_projection(&state);
+        let work = state
+            .pending
+            .iter()
+            .map(|entry| CrawlUrlStateRecord {
+                id: crawl_url_state_id(run_id, &entry.canonical_url),
+                crawl_run_id: run_id,
+                canonical_url: entry.canonical_url.clone(),
+                first_discovered_url_id: entry.discovered_url_id.clone(),
+                requested_url: entry.requested_url.clone(),
+                parent_url_state_id: entry
+                    .parent_canonical_url
+                    .as_deref()
+                    .map(|url| crawl_url_state_id(run_id, url)),
+                parent_discovered_url_id: None,
+                admission_state: CrawlAdmissionState::Admitted,
+                preserve_reason: None,
+                resolved_to_url_state_id: None,
+                admission_sequence: Some(entry.order),
+                depth: Some(entry.depth),
+                target_page_type_id: entry.target_page_type_id.map(|id| id.to_string()),
+                transition_id: entry.transition_id.map(|id| id.to_string()),
+                pagination: entry.pagination,
+                final_canonical_url: None,
+                current_work_state: Some(CrawlWorkState::Pending),
+                work_generation: 0,
+                current_execution_id: None,
+                seed_provenance: entry.seed_ids.iter().map(ToString::to_string).collect(),
+                seen: true,
+                sampled: projection
+                    .url_states
+                    .iter()
+                    .find(|value| value.canonical_url == entry.canonical_url)
+                    .is_some_and(|value| value.sampled),
+                expanded: projection
+                    .url_states
+                    .iter()
+                    .find(|value| value.canonical_url == entry.canonical_url)
+                    .is_some_and(|value| value.expanded),
+                in_scope: projection
+                    .url_states
+                    .iter()
+                    .find(|value| value.canonical_url == entry.canonical_url)
+                    .is_some_and(|value| value.in_scope),
+                page_type_match_state: projection
+                    .url_states
+                    .iter()
+                    .find(|value| value.canonical_url == entry.canonical_url)
+                    .and_then(|value| value.page_type_match_state),
+            })
+            .collect::<Vec<_>>();
+        let control = CrawlTraversalControl {
+            crawl_run_id: run_id,
+            consumed_bytes: state.consumed_bytes,
+            raw_link_count: state.urls_discovered,
+            duplicate_count: state.duplicates_prevented,
+            robots_excluded_count: state.robots_excluded,
+            provider_error_count: state.provider_errors,
+            external_url_count: state.external_urls,
+            blocked_url_count: state.blocked_urls,
+            peak_expansion_count: state.peak_new_from_page,
+            elapsed_millis: state.elapsed_millis,
+            time_budget_hit: state.time_budget_hit,
+            duration_work_not_expanded: state.duration_work_not_expanded,
+            pagination_truncation_count: state.pagination_truncation_count,
+            next_admission_sequence: state
+                .newly_enqueued_urls
+                .saturating_add(u64::try_from(state.selected_seed_ids.len()).unwrap_or(u64::MAX)),
+        };
+        (work, control)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn initialize_traversal_state(
+        &self,
+        context: &JobExecutionContext,
+        snapshot: &CrawlRunSnapshot,
+        run_id: CrawlRunId,
+        traversal: &SemanticTraversal,
+        provenance: &mut ExecutionProvenanceIds,
+    ) -> Result<(), ()> {
+        let state = traversal.checkpoint_state();
+        let seed_evidence = self.collect_discovery_delta(
+            run_id,
+            &traversal.seed_evidence(),
+            &[],
+            &[],
+            &BTreeMap::new(),
+            0,
+            provenance,
+        )?;
+        let (mut work, control) = Self::durable_traversal_snapshot(run_id, traversal);
+        for record in &seed_evidence {
+            let seed_ids = record
+                .detail
+                .get("seed_ids")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if record.status == "ADMITTED" {
+                if let Some(state) = work
+                    .iter_mut()
+                    .find(|state| state.canonical_url == record.canonical_url)
+                {
+                    if state.first_discovered_url_id.is_none() {
+                        state.first_discovered_url_id = Some(record.id.clone());
+                    }
+                    for seed_id in seed_ids {
+                        if !state.seed_provenance.contains(&seed_id) {
+                            state.seed_provenance.push(seed_id);
+                        }
+                    }
+                }
+            } else if let Some(reason) = preserve_reason_for_discovery_status(&record.status) {
+                if let Some(state) = work
+                    .iter_mut()
+                    .find(|state| state.canonical_url == record.canonical_url)
+                {
+                    for seed_id in seed_ids {
+                        if !state.seed_provenance.contains(&seed_id) {
+                            state.seed_provenance.push(seed_id);
+                        }
+                    }
+                } else {
+                    work.push(CrawlUrlStateRecord {
+                        id: crawl_url_state_id(run_id, &record.canonical_url),
+                        crawl_run_id: run_id,
+                        canonical_url: record.canonical_url.clone(),
+                        first_discovered_url_id: Some(record.id.clone()),
+                        requested_url: record.original_url.clone(),
+                        parent_url_state_id: None,
+                        parent_discovered_url_id: None,
+                        admission_state: CrawlAdmissionState::PreserveOnly,
+                        preserve_reason: Some(reason.to_owned()),
+                        resolved_to_url_state_id: None,
+                        admission_sequence: None,
+                        depth: None,
+                        target_page_type_id: None,
+                        transition_id: None,
+                        pagination: false,
+                        final_canonical_url: None,
+                        current_work_state: None,
+                        work_generation: 0,
+                        current_execution_id: None,
+                        seed_provenance: seed_ids,
+                        seen: true,
+                        sampled: false,
+                        expanded: false,
+                        in_scope: false,
+                        page_type_match_state: None,
+                    });
+                }
+            }
+        }
+        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
+            .map_err(|_| ())?
+            .to_envelope()
+            .map_err(|_| ())?;
+        let (job_id, attempt_id, lease, created_at) =
+            context.checkpoint_lineage().await.map_err(|_| ())?;
+        CrawlTraversalRepository::new(&self.database)
+            .initialize_run_state_with_checkpoint_and_evidence(
+                run_id,
+                &work,
+                &seed_evidence,
+                &control,
+                &semantic_projection(&state),
+                &job_id,
+                &attempt_id,
+                &lease,
+                &checkpoint,
+                created_at,
+            )
+            .await
+            .map_err(|_| ())?;
+        context.mark_checkpoint_persisted();
+        self.progress(context, "CHECKPOINT_SAVED", None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn reconstruct_traversal_checkpoint(
+        &self,
+        run_id: CrawlRunId,
+        snapshot: &CrawlRunSnapshot,
+        semantic: &erabi_db::repositories::CrawlerSemanticSnapshot,
+        selected_state_ids: Option<&BTreeSet<String>>,
+    ) -> Result<
+        (
+            SemanticTraversalCheckpoint,
+            Vec<SemanticTraversalQueueEntry>,
+        ),
+        (),
+    > {
+        let durable = CrawlTraversalRepository::new(&self.database)
+            .reconstruct_recovery_state(run_id)
+            .await
+            .map_err(|_| ())?;
+        let queue_entry = |work: &CrawlUrlStateRecord| {
+            Ok(SemanticTraversalQueueEntry {
+                requested_url: work.requested_url.clone(),
+                canonical_url: work.canonical_url.clone(),
+                depth: work.depth.ok_or(())?,
+                seed_ids: work
+                    .seed_provenance
+                    .iter()
+                    .map(|id| decode_id(id))
+                    .collect::<Result<Vec<_>, _>>()?,
+                target_page_type_id: work
+                    .target_page_type_id
+                    .as_deref()
+                    .map(decode_id)
+                    .transpose()?,
+                transition_id: work.transition_id.as_deref().map(decode_id).transpose()?,
+                parent_canonical_url: work
+                    .parent_url_state_id
+                    .as_deref()
+                    .and_then(|parent| durable.work.iter().find(|candidate| candidate.id == parent))
+                    .map(|parent| parent.canonical_url.clone()),
+                pagination: work.pagination,
+                discovered_url_id: work.first_discovered_url_id.clone(),
+                order: work.admission_sequence.ok_or(())?,
+            })
+        };
+        let pending = durable
+            .work
+            .iter()
+            .filter(|work| {
+                work.current_work_state == Some(CrawlWorkState::Pending)
+                    && selected_state_ids.is_none_or(|ids| ids.contains(&work.id))
+            })
+            .map(queue_entry)
+            .collect::<Result<Vec<_>, ()>>()?;
+        let recovery_entries = selected_state_ids
+            .map(|ids| {
+                durable
+                    .work
+                    .iter()
+                    .filter(|work| {
+                        ids.contains(&work.id)
+                            && work.current_work_state != Some(CrawlWorkState::Completed)
+                    })
+                    .map(queue_entry)
+                    .collect::<Result<Vec<_>, ()>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let seen = durable
+            .work
+            .iter()
+            .filter(|work| work.seen)
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let admitted = durable
+            .work
+            .iter()
+            .filter(|work| work.admission_state == CrawlAdmissionState::Admitted)
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let sampled = durable
+            .work
+            .iter()
+            .filter(|work| work.sampled)
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let expanded = durable
+            .work
+            .iter()
+            .filter(|work| work.expanded)
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let matching = durable
+            .work
+            .iter()
+            .filter(|work| work.page_type_match_state == Some(CrawlPageTypeMatchState::Matched))
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let unmatched = durable
+            .work
+            .iter()
+            .filter(|work| work.page_type_match_state == Some(CrawlPageTypeMatchState::Unmatched))
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let ambiguous = durable
+            .work
+            .iter()
+            .filter(|work| work.page_type_match_state == Some(CrawlPageTypeMatchState::Ambiguous))
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let in_scope = durable
+            .work
+            .iter()
+            .filter(|work| work.in_scope)
+            .map(|work| work.canonical_url.clone())
+            .collect::<Vec<_>>();
+        let mut transition_page_counts = Vec::new();
+        let mut transition_counts = semantic
+            .transitions
+            .iter()
+            .map(|transition| {
+                (
+                    transition.transition.id.to_string(),
+                    (transition.transition.id, 0_u64, BTreeSet::new()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for count in &durable.transition_source_counts {
+            let source = durable
+                .work
+                .iter()
+                .find(|work| work.id == count.source_url_state_id)
+                .ok_or(())?;
+            let transition_id = decode_id(&count.transition_id)?;
+            transition_page_counts.push((
+                transition_id,
+                source.canonical_url.clone(),
+                u32::try_from(count.eligible_edge_count).map_err(|_| ())?,
+            ));
+            let entry = transition_counts
+                .entry(count.transition_id.clone())
+                .or_insert((transition_id, 0, BTreeSet::new()));
+            entry.1 = entry.1.saturating_add(count.eligible_edge_count);
+            entry.2.insert(source.canonical_url.clone());
+        }
+        let transition_counts = semantic
+            .transitions
+            .iter()
+            .map(|transition| {
+                let (_, eligible_edges, source_pages) = transition_counts
+                    .remove(&transition.transition.id.to_string())
+                    .ok_or(())?;
+                Ok(SemanticTraversalTransitionState {
+                    transition_id: transition.transition.id,
+                    name: transition.transition.name.clone(),
+                    eligible_edges,
+                    source_pages: source_pages.into_iter().collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, ()>>()?;
+        let mut page_type_scheduled = BTreeMap::<String, u64>::new();
+        for state in &durable.work {
+            if state.admission_state == CrawlAdmissionState::Admitted
+                && let Some(page_type_id) = state.target_page_type_id.as_deref()
+            {
+                *page_type_scheduled
+                    .entry(page_type_id.to_owned())
+                    .or_default() += 1;
+            }
+        }
+        let page_type_sampled = durable
+            .page_type_counts
+            .iter()
+            .map(|count| Ok((decode_id(count.page_type_id.as_str())?, count.sampled_count)))
+            .collect::<Result<Vec<_>, ()>>()?;
+        let page_type_discovered = durable
+            .page_type_counts
+            .iter()
+            .map(|count| {
+                Ok((
+                    decode_id(count.page_type_id.as_str())?,
+                    count.discovered_count,
+                ))
+            })
+            .collect::<Result<Vec<_>, ()>>()?;
+        let page_type_scheduled = page_type_scheduled
+            .into_iter()
+            .map(|(id, count)| Ok((decode_id(id.as_str())?, count)))
+            .collect::<Result<Vec<_>, ()>>()?;
+        Ok((
+            SemanticTraversalCheckpoint {
+                selected_seed_ids: snapshot.selected_seed_ids().to_vec(),
+                pending,
+                admitted_canonical_urls: admitted.clone(),
+                seen_canonical_urls: seen,
+                sampled_canonical_urls: sampled.clone(),
+                expanded_canonical_urls: expanded,
+                matching_canonical_urls: matching,
+                unmatched_canonical_urls: unmatched,
+                ambiguous_canonical_urls: ambiguous,
+                in_scope_canonical_urls: in_scope,
+                consumed_bytes: durable.control.consumed_bytes,
+                pages_sampled: u64::try_from(sampled.len()).map_err(|_| ())?,
+                urls_discovered: durable.control.raw_link_count,
+                duplicates_prevented: durable.control.duplicate_count,
+                robots_excluded: durable.control.robots_excluded_count,
+                provider_errors: durable.control.provider_error_count,
+                external_urls: durable.control.external_url_count,
+                blocked_urls: durable.control.blocked_url_count,
+                newly_enqueued_urls: u64::try_from(admitted.len()).map_err(|_| ())?,
+                peak_new_from_page: durable.control.peak_expansion_count,
+                time_budget_hit: durable.control.time_budget_hit,
+                pagination_truncation_count: durable.control.pagination_truncation_count,
+                duration_work_not_expanded: durable.control.duration_work_not_expanded,
+                page_type_sampled,
+                page_type_discovered,
+                page_type_scheduled,
+                transition_counts,
+                transition_page_counts,
+                elapsed_millis: durable.control.elapsed_millis,
+            },
+            recovery_entries,
+        ))
+    }
+
+    async fn save_checkpoint(
+        &self,
+        context: &JobExecutionContext,
+        snapshot: &CrawlRunSnapshot,
+        run_id: CrawlRunId,
+        _traversal: &SemanticTraversal,
+        _provenance: &ExecutionProvenanceIds,
+    ) -> Result<(), ()> {
+        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
+            .map_err(|_| ())?;
+        context
+            .checkpoint(&checkpoint.to_envelope().map_err(|_| ())?)
+            .await
+            .map_err(|_| ())?;
+        self.progress(context, "CHECKPOINT_SAVED", None).await
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn collect_discovery_delta(
+        &self,
+        run_id: CrawlRunId,
+        seeds: &[DiscoveryPreviewSeed],
+        paths: &[DiscoveryPath],
+        pages: &[DiscoveryPreviewPage],
+        attempts: &BTreeMap<String, ProductionPageAttempt>,
+        work_generation: u64,
+        ids: &mut ExecutionProvenanceIds,
+    ) -> Result<Vec<DiscoveredUrlRecord>, ()> {
+        let mut evidence = Vec::new();
+        for seed in seeds {
+            let original_url = fragment_free_fetch_url(&seed.requested_url)?;
+            let status = if seed.duplicate_of_canonical_url.is_some() {
+                "CANONICAL_DUPLICATE"
+            } else if seed.state == PreviewUrlState::InScopeMatched {
+                "ADMITTED"
+            } else {
+                discovery_seed_status(seed.state)
+            };
+            let detail = serde_json::json!({
+                "origin": "SEED",
+                "work_generation": work_generation,
+                "seed_ids": [seed.seed_id.to_string()],
+                "entry_page_type_hint": seed.entry_page_type_hint.map(|id| id.to_string()),
+                "duplicate_of_canonical_url": seed.duplicate_of_canonical_url,
+                "scope": seed.scope,
+                "page_type_match": seed.page_type_match,
+                "budget_hits": seed.budget_hits,
+            });
+            let id = semantic_discovered_id(
+                run_id,
+                "SEED",
+                work_generation,
+                &(
+                    seed.seed_id.to_string(),
+                    seed.canonical_url.clone(),
+                    status,
+                    &detail,
+                ),
+            )?;
+            evidence.push(DiscoveredUrlRecord {
+                id: id.clone(),
+                crawl_run_id: run_id,
+                source_id: None,
+                raw_href: None,
+                original_url: original_url.clone(),
+                canonical_url: seed.canonical_url.clone(),
+                status: status.to_owned(),
+                discovered_at: discovered_at(
+                    attempts,
+                    &seed.requested_url,
+                    self.clock.now_millis(),
+                ),
+                detail,
+            });
+            if seed.duplicate_of_canonical_url.is_none() {
+                insert_execution_provenance(ids, original_url, seed.canonical_url.clone(), id)?;
+            }
+        }
+        for path in paths {
+            let canonical_url = path
+                .canonical_url
+                .clone()
+                .unwrap_or_else(|| path.source_canonical_url.clone());
+            let resolved_original_url = path
+                .resolved_original_url
+                .clone()
+                .unwrap_or_else(|| path.source_canonical_url.clone());
+            let original_url = fragment_free_fetch_url(&resolved_original_url)?;
+            let status = discovery_status(path);
+            let detail = serde_json::json!({
+                "seed_ids": path.seed_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "work_generation": work_generation,
+                "source_requested_url": path.source_requested_url,
+                "source_final_url": path.source_final_url,
+                "source_canonical_url": path.source_canonical_url,
+                "source_depth": path.source_depth,
+                "selector": path.selector,
+                "resolved_observation_url": path.resolved_original_url,
+                "duplicate_of_canonical_url": path.duplicate_of_canonical_url,
+                "transition_evaluations": path.transition_evaluations,
+                "budget_hits": path.budget_hits,
+            });
+            let id = semantic_discovered_id(
+                run_id,
+                "DISCOVERY_PATH",
+                work_generation,
+                &(
+                    path.source_requested_url.clone(),
+                    path.source_canonical_url.clone(),
+                    path.raw_href.clone(),
+                    path.selector.clone(),
+                    original_url.clone(),
+                    canonical_url.clone(),
+                    status,
+                    &detail,
+                ),
+            )?;
+            evidence.push(DiscoveredUrlRecord {
+                id: id.clone(),
+                crawl_run_id: run_id,
+                source_id: None,
+                raw_href: Some(path.raw_href.clone()),
+                original_url: original_url.clone(),
+                canonical_url: canonical_url.clone(),
+                status: status.to_owned(),
+                discovered_at: discovered_at(
+                    attempts,
+                    &path.source_requested_url,
+                    self.clock.now_millis(),
+                ),
+                detail,
+            });
+            if status == "ADMITTED" {
+                insert_execution_provenance(ids, original_url, canonical_url.clone(), id)?;
+            }
+        }
+        for page in pages {
+            let canonical_url = page
+                .canonical_url
+                .clone()
+                .unwrap_or_else(|| page.requested_url.clone());
+            let original_url = fragment_free_fetch_url(&page.requested_url)?;
+            let key = (original_url.clone(), canonical_url.clone());
+            if !ids.contains_key(&key) {
+                let detail = serde_json::json!({
+                    "origin": "EXECUTION_RECONCILIATION",
+                    "work_generation": work_generation,
+                    "requested_url": page.requested_url,
+                    "observed_final_url": page.final_url,
+                    "authoritative_canonical_url": canonical_url.clone(),
+                    "seed_ids": page.seed_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                });
+                let id = semantic_discovered_id(
+                    run_id,
+                    "EXECUTION_RECONCILIATION",
+                    work_generation,
+                    &(original_url.clone(), canonical_url.clone(), &detail),
+                )?;
+                evidence.push(DiscoveredUrlRecord {
+                    id: id.clone(),
+                    crawl_run_id: run_id,
+                    source_id: None,
+                    raw_href: None,
+                    original_url: original_url.clone(),
+                    canonical_url: canonical_url.clone(),
+                    status: "EXECUTION_RECONCILED".to_owned(),
+                    discovered_at: discovered_at(
+                        attempts,
+                        &page.requested_url,
+                        self.clock.now_millis(),
+                    ),
+                    detail,
+                });
+                insert_execution_provenance(ids, original_url, canonical_url.clone(), id)?;
+            }
+            if page.state == PreviewUrlState::AmbiguousPageType {
+                let detail = serde_json::json!({
+                    "origin": "PAGE_TYPE_EVALUATION",
+                    "work_generation": work_generation,
+                    "requested_url": page.requested_url,
+                });
+                let ambiguity_id = semantic_discovered_id(
+                    run_id,
+                    "PAGE_TYPE_EVALUATION",
+                    work_generation,
+                    &(page.requested_url.clone(), canonical_url.clone(), &detail),
+                )?;
+                evidence.push(DiscoveredUrlRecord {
+                    id: ambiguity_id,
+                    crawl_run_id: run_id,
+                    source_id: None,
+                    raw_href: None,
+                    original_url: page.requested_url.clone(),
+                    canonical_url: page
+                        .canonical_url
+                        .clone()
+                        .unwrap_or_else(|| page.requested_url.clone()),
+                    status: "AMBIGUOUS_PAGE_TYPE".to_owned(),
+                    discovered_at: discovered_at(
+                        attempts,
+                        &page.requested_url,
+                        self.clock.now_millis(),
+                    ),
+                    detail,
+                });
+            }
+        }
+        Ok(evidence)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn persist_page_delta(
+        &self,
+        run_id: CrawlRunId,
+        snapshot: &CrawlRunSnapshot,
+        pages: &[DiscoveryPreviewPage],
+        paths: &[DiscoveryPath],
+        discovered_ids: &ExecutionProvenanceIds,
+        mut attempts: BTreeMap<String, ProductionPageAttempt>,
+        expected_work_generation: Option<u64>,
+        context: &JobExecutionContext,
+    ) -> Result<(), ()> {
+        for page in pages {
+            let attempt = attempts.remove(&page.requested_url).ok_or(())?;
+            match attempt {
+                ProductionPageAttempt::Observed { page: result, .. } => {
+                    let canonical_url = page
+                        .canonical_url
+                        .clone()
+                        .unwrap_or_else(|| result.observation.requested_url.clone());
+                    let page_type_id = page
+                        .page_type_match
+                        .as_ref()
+                        .and_then(|evidence| evidence.winner.as_ref())
+                        .map(|winner| winner.page_type_id);
+                    let page_is_partial = matches!(
+                        result.completeness,
+                        CrawlerResultCompleteness::Partial { .. }
+                    );
+                    let artifacts = self
+                        .persist_artifacts(
+                            run_id,
+                            snapshot.created_at(),
+                            result.artifacts.clone(),
+                            snapshot.settings().retain_artifacts.value,
+                        )
+                        .await?;
+                    let expected_generation = self
+                        .expected_generation_for_page(
+                            run_id,
+                            page,
+                            &canonical_url,
+                            expected_work_generation,
+                        )
+                        .await?;
+                    self.persist_execution(
+                        CrawlExecutionRecord {
+                            id: CrawlExecutionId::new(),
+                            crawl_run_id: run_id,
+                            requested_url: page.requested_url.clone(),
+                            canonical_url: canonical_url.clone(),
+                            observed_final_url: result.observation.final_url.clone(),
+                            source_id: None,
+                            page_type_id,
+                            transition_id: page_type_id
+                                .and_then(|id| transition_for_paths(&canonical_url, id, paths)),
+                            discovered_url_id: discovered_ids
+                                .get(&(page.requested_url.clone(), canonical_url.clone()))
+                                .cloned(),
+                            outcome: if page_is_partial {
+                                CrawlExecutionOutcome::Partial
+                            } else {
+                                CrawlExecutionOutcome::Completed
+                            },
+                            error_code: page_is_partial
+                                .then_some(CrawlExecutionErrorCode::PartialResult),
+                            http_status: result.status,
+                            media_type: result.media_type.clone(),
+                            content_length_bytes: result.content_length,
+                            provider_elapsed_ms: result.elapsed_ms,
+                            artifacts,
+                        },
+                        context,
+                        Some(expected_generation),
+                        page.requested_canonical_url != canonical_url,
+                    )
+                    .await?;
+                    self.progress(
+                        context,
+                        if page_is_partial {
+                            "PAGE_PARTIAL"
+                        } else {
+                            "PAGE_COMPLETED"
+                        },
+                        None,
+                    )
+                    .await?;
+                }
+                ProductionPageAttempt::Failed { failure, .. } => {
+                    let canonical_url = page
+                        .canonical_url
+                        .clone()
+                        .unwrap_or_else(|| page.requested_url.clone());
+                    let expected_generation = self
+                        .expected_generation_for_page(
+                            run_id,
+                            page,
+                            &canonical_url,
+                            expected_work_generation,
+                        )
+                        .await?;
+                    self.persist_execution(
+                        CrawlExecutionRecord {
+                            id: CrawlExecutionId::new(),
+                            crawl_run_id: run_id,
+                            requested_url: page.requested_url.clone(),
+                            canonical_url: canonical_url.clone(),
+                            observed_final_url: None,
+                            source_id: None,
+                            page_type_id: None,
+                            transition_id: None,
+                            discovered_url_id: discovered_ids
+                                .get(&(page.requested_url.clone(), canonical_url.clone()))
+                                .cloned(),
+                            outcome: if failure.code == CrawlExecutionErrorCode::Cancelled {
+                                CrawlExecutionOutcome::Cancelled
+                            } else {
+                                CrawlExecutionOutcome::Failed
+                            },
+                            error_code: Some(failure.code),
+                            http_status: failure.status,
+                            media_type: None,
+                            content_length_bytes: None,
+                            provider_elapsed_ms: None,
+                            artifacts: Vec::new(),
+                        },
+                        context,
+                        Some(expected_generation),
+                        page.requested_canonical_url != canonical_url,
+                    )
+                    .await?;
+                    self.progress(context, "PAGE_FAILED", None).await?;
+                }
+            }
+        }
+        if attempts.is_empty() { Ok(()) } else { Err(()) }
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments, clippy::too_many_lines)]
     async fn persist_page_attempts(
         &self,
         run_id: CrawlRunId,
@@ -248,31 +1650,36 @@ impl ProductionCrawlJobHandler {
                         result.completeness,
                         CrawlerResultCompleteness::Partial { .. }
                     );
-                    self.persist_execution(CrawlExecutionRecord {
-                        id: CrawlExecutionId::new(),
-                        crawl_run_id: run_id,
-                        requested_url: page.requested_url.clone(),
-                        canonical_url: canonical_url.clone(),
-                        observed_final_url: result.observation.final_url.clone(),
-                        source_id: None,
-                        page_type_id,
-                        transition_id,
-                        discovered_url_id: discovered_ids
-                            .get(&(page.requested_url.clone(), canonical_url.clone()))
-                            .cloned(),
-                        outcome: if page_is_partial {
-                            CrawlExecutionOutcome::Partial
-                        } else {
-                            CrawlExecutionOutcome::Completed
+                    self.persist_execution(
+                        CrawlExecutionRecord {
+                            id: CrawlExecutionId::new(),
+                            crawl_run_id: run_id,
+                            requested_url: page.requested_url.clone(),
+                            canonical_url: canonical_url.clone(),
+                            observed_final_url: result.observation.final_url.clone(),
+                            source_id: None,
+                            page_type_id,
+                            transition_id,
+                            discovered_url_id: discovered_ids
+                                .get(&(page.requested_url.clone(), canonical_url.clone()))
+                                .cloned(),
+                            outcome: if page_is_partial {
+                                CrawlExecutionOutcome::Partial
+                            } else {
+                                CrawlExecutionOutcome::Completed
+                            },
+                            error_code: page_is_partial
+                                .then_some(CrawlExecutionErrorCode::PartialResult),
+                            http_status: result.status,
+                            media_type: result.media_type.clone(),
+                            content_length_bytes: result.content_length,
+                            provider_elapsed_ms: result.elapsed_ms,
+                            artifacts,
                         },
-                        error_code: page_is_partial
-                            .then_some(CrawlExecutionErrorCode::PartialResult),
-                        http_status: result.status,
-                        media_type: result.media_type.clone(),
-                        content_length_bytes: result.content_length,
-                        provider_elapsed_ms: result.elapsed_ms,
-                        artifacts,
-                    })
+                        context,
+                        None,
+                        false,
+                    )
                     .await?;
                     counts.completed = counts.completed.saturating_add(1);
                     if page_is_partial {
@@ -295,26 +1702,31 @@ impl ProductionCrawlJobHandler {
                         .canonical_url
                         .clone()
                         .unwrap_or_else(|| page.requested_url.clone());
-                    self.persist_execution(CrawlExecutionRecord {
-                        id: CrawlExecutionId::new(),
-                        crawl_run_id: run_id,
-                        requested_url: page.requested_url.clone(),
-                        canonical_url: canonical_url.clone(),
-                        observed_final_url: None,
-                        source_id: None,
-                        page_type_id: None,
-                        transition_id: None,
-                        discovered_url_id: discovered_ids
-                            .get(&(page.requested_url.clone(), canonical_url.clone()))
-                            .cloned(),
-                        outcome: CrawlExecutionOutcome::Failed,
-                        error_code: Some(failure.code),
-                        http_status: failure.status,
-                        media_type: None,
-                        content_length_bytes: None,
-                        provider_elapsed_ms: None,
-                        artifacts: Vec::new(),
-                    })
+                    self.persist_execution(
+                        CrawlExecutionRecord {
+                            id: CrawlExecutionId::new(),
+                            crawl_run_id: run_id,
+                            requested_url: page.requested_url.clone(),
+                            canonical_url: canonical_url.clone(),
+                            observed_final_url: None,
+                            source_id: None,
+                            page_type_id: None,
+                            transition_id: None,
+                            discovered_url_id: discovered_ids
+                                .get(&(page.requested_url.clone(), canonical_url.clone()))
+                                .cloned(),
+                            outcome: CrawlExecutionOutcome::Failed,
+                            error_code: Some(failure.code),
+                            http_status: failure.status,
+                            media_type: None,
+                            content_length_bytes: None,
+                            provider_elapsed_ms: None,
+                            artifacts: Vec::new(),
+                        },
+                        context,
+                        None,
+                        false,
+                    )
                     .await?;
                     counts.unresolved_partial_work =
                         counts.unresolved_partial_work.saturating_add(1);
@@ -325,6 +1737,24 @@ impl ProductionCrawlJobHandler {
         attempts.is_empty().then_some(counts).ok_or(())
     }
 
+    async fn expected_generation_for_page(
+        &self,
+        run_id: CrawlRunId,
+        page: &DiscoveryPreviewPage,
+        canonical_url: &str,
+        expected_work_generation: Option<u64>,
+    ) -> Result<u64, ()> {
+        if page.requested_canonical_url == canonical_url {
+            expected_work_generation.ok_or(())
+        } else {
+            CrawlTraversalRepository::new(&self.database)
+                .read_work_generation(run_id, &crawl_url_state_id(run_id, canonical_url))
+                .await
+                .map_err(|_| ())
+        }
+    }
+
+    #[allow(dead_code)]
     async fn persist_discovery_paths(
         &self,
         run_id: CrawlRunId,
@@ -430,6 +1860,7 @@ impl ProductionCrawlJobHandler {
         Ok(execution_ids)
     }
 
+    #[allow(dead_code)]
     async fn persist_execution_reconciliations(
         &self,
         run_id: CrawlRunId,
@@ -502,6 +1933,7 @@ impl ProductionCrawlJobHandler {
         let pacing_cancel = PacingCancellation::new();
         let admission = tokio::select! {
             value = self.robots.evaluate(&target, snapshot, &pacing_cancel) => value.map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RobotsExcluded)),
+            () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
             () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
         }?;
         if admission.decision() == RobotsAdmissionDecision::Disallowed {
@@ -509,6 +1941,7 @@ impl ProductionCrawlJobHandler {
         }
         let permit = tokio::select! {
             value = registration.acquire(&admission, &pacing_cancel) => value.map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure)),
+            () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
             () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
         }?;
         // Recompute immediately before the provider call so pacing/robots
@@ -544,6 +1977,7 @@ impl ProductionCrawlJobHandler {
         .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
         let result = tokio::select! {
             value = self.adapter.execute(request) => value,
+            () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
             () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
         };
         let result = match result {
@@ -590,11 +2024,58 @@ impl ProductionCrawlJobHandler {
         })
     }
 
-    async fn persist_execution(&self, record: CrawlExecutionRecord) -> Result<(), ()> {
-        CrawlExecutionRepository::new(&self.database)
-            .persist(&record)
-            .await
-            .map_err(|_| ())
+    async fn persist_execution(
+        &self,
+        record: CrawlExecutionRecord,
+        context: &JobExecutionContext,
+        expected_work_generation: Option<u64>,
+        historical_alias_if_current: bool,
+    ) -> Result<(), ()> {
+        let work_state = match record.outcome {
+            CrawlExecutionOutcome::Completed => CrawlWorkState::Completed,
+            CrawlExecutionOutcome::Partial => CrawlWorkState::Partial,
+            CrawlExecutionOutcome::Failed => CrawlWorkState::Failed,
+            CrawlExecutionOutcome::Cancelled => CrawlWorkState::Cancelled,
+        };
+        let executions = CrawlExecutionRepository::new(&self.database);
+        let expected_work_generation = match expected_work_generation {
+            Some(generation) => generation,
+            None => CrawlTraversalRepository::new(&self.database)
+                .read_work_generation(
+                    record.crawl_run_id,
+                    &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
+                )
+                .await
+                .map_err(|_| ())?,
+        };
+        let result = executions
+            .persist_current_work(
+                &record,
+                &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
+                context.job_id(),
+                context.attempt_id(),
+                work_state,
+                expected_work_generation,
+                context.ownership_now(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(CrawlExecutionRepositoryError::InvalidReference) if historical_alias_if_current => {
+                executions
+                    .persist_historical_work(
+                        &record,
+                        &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
+                        context.job_id(),
+                        context.attempt_id(),
+                        expected_work_generation,
+                        context.ownership_now(),
+                    )
+                    .await
+                    .map_err(|_| ())
+            }
+            Err(_) => Err(()),
+        }
     }
 
     async fn persist_artifacts(
@@ -730,6 +2211,16 @@ impl DiscoveryPreviewProvider for ProductionTraversalProvider {
         let provider = self.clone();
         Box::pin(async move {
             let requested_url = request.requested_url;
+            if provider.context.cancellation().is_cancelled() {
+                return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
+                    reason: erabi_crawler::DiscoveryPreviewInterruption::Cancelled,
+                });
+            }
+            if provider.context.storage_pressure().is_signalled() {
+                return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
+                    reason: erabi_crawler::DiscoveryPreviewInterruption::StoragePressure,
+                });
+            }
             let outcome = match provider
                 .handler
                 .execute_page(
@@ -756,6 +2247,20 @@ impl DiscoveryPreviewProvider for ProductionTraversalProvider {
                     }
                 }
                 Err(failure) => {
+                    if failure.code == CrawlExecutionErrorCode::Cancelled
+                        && provider.context.cancellation().is_cancelled()
+                    {
+                        return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
+                            reason: erabi_crawler::DiscoveryPreviewInterruption::Cancelled,
+                        });
+                    }
+                    if failure.code == CrawlExecutionErrorCode::StoragePressure
+                        && provider.context.storage_pressure().is_signalled()
+                    {
+                        return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
+                            reason: erabi_crawler::DiscoveryPreviewInterruption::StoragePressure,
+                        });
+                    }
                     provider.attempts.lock().await.insert(
                         requested_url,
                         ProductionPageAttempt::Failed {
@@ -853,6 +2358,7 @@ struct PageResult {
 /// Task 3 summary contract, while its partial evidence contributes one
 /// unresolved-work unit; it is never counted as a second attempt.
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 struct PageAttemptCounts {
     attempted: u64,
     completed: u64,
@@ -932,6 +2438,36 @@ fn production_limits(
     })
 }
 
+/// A checkpoint is required to recover interrupted frontier state, not to
+/// repeat a run whose every admitted unit is already represented by durable
+/// discovery and execution evidence.  The provenance tuple prevents a
+/// redirect/canonical collision from treating a different admission as done.
+fn durable_production_completion_without_checkpoint(
+    executions: &[CrawlExecutionRecord],
+    discovered: &[DiscoveredUrlRecord],
+) -> bool {
+    let admitted = discovered
+        .iter()
+        .filter(|record| matches!(record.status.as_str(), "ADMITTED" | "EXECUTION_RECONCILED"))
+        .map(|record| {
+            (
+                record.id.as_str(),
+                record.original_url.as_str(),
+                record.canonical_url.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    !admitted.is_empty()
+        && admitted.iter().all(|(id, requested, canonical)| {
+            executions.iter().any(|execution| {
+                execution.discovered_url_id.as_deref() == Some(*id)
+                    && execution.requested_url == *requested
+                    && execution.canonical_url == *canonical
+            })
+        })
+}
+
+#[allow(dead_code)]
 fn transition_for(
     canonical_url: &str,
     page_type_id: PageTypeId,
@@ -949,6 +2485,23 @@ fn transition_for(
         })
 }
 
+fn transition_for_paths(
+    canonical_url: &str,
+    page_type_id: PageTypeId,
+    paths: &[DiscoveryPath],
+) -> Option<DiscoveryTransitionId> {
+    paths
+        .iter()
+        .find(|path| path.canonical_url.as_deref() == Some(canonical_url))
+        .and_then(|path| {
+            path.transition_evaluations.iter().find_map(|evaluation| {
+                (evaluation.eligible && evaluation.target_page_type_id == page_type_id)
+                    .then_some(evaluation.transition_id)
+            })
+        })
+}
+
+#[allow(dead_code)]
 fn count_ambiguities(traversal: &DiscoveryPreviewResult) -> u64 {
     let pages = traversal
         .pages
@@ -963,6 +2516,7 @@ fn count_ambiguities(traversal: &DiscoveryPreviewResult) -> u64 {
     u64::try_from(pages.saturating_add(paths)).unwrap_or(u64::MAX)
 }
 
+#[allow(dead_code)]
 fn duration_left_known_incomplete(traversal: &DiscoveryPreviewResult) -> bool {
     let duration_hit = traversal
         .summary
@@ -980,15 +2534,23 @@ fn fragment_free_fetch_url(value: &str) -> Result<String, ()> {
     Ok(parsed.to_string())
 }
 
+fn crawl_url_state_id(run_id: CrawlRunId, canonical_url: &str) -> String {
+    let identity = format!("{run_id}:{canonical_url}");
+    let digest = erabi_domain::canonical_sha256(&identity).unwrap_or_else(|_| "invalid".to_owned());
+    format!("crawl:{digest}")
+}
+
+fn decode_id<T: DeserializeOwned>(value: &str) -> Result<T, ()> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| ())
+}
+
+#[allow(clippy::unnecessary_wraps)]
 fn insert_execution_provenance(
     ids: &mut ExecutionProvenanceIds,
     original_url: String,
     canonical_url: String,
     id: String,
 ) -> Result<(), ()> {
-    if ids.contains_key(&(original_url.clone(), canonical_url.clone())) {
-        return Err(());
-    }
     ids.insert((original_url, canonical_url), id);
     Ok(())
 }
@@ -1059,6 +2621,22 @@ fn discovery_status(path: &erabi_domain::DiscoveryPath) -> &'static str {
     }
 }
 
+fn preserve_reason_for_discovery_status(status: &str) -> Option<&'static str> {
+    match status {
+        "CANONICAL_DUPLICATE" => Some("CANONICAL_DUPLICATE"),
+        "AMBIGUOUS_PAGE_TYPE" => Some("AMBIGUOUS_PAGE_TYPE"),
+        "UNMATCHED" => Some("UNMATCHED"),
+        "EXTERNAL" => Some("EXTERNAL"),
+        "BLOCKED" => Some("BLOCKED"),
+        "BUDGET_EXCLUDED" => Some("BUDGET_EXCLUDED"),
+        "INVALID" => Some("INVALID"),
+        "ROBOTS_EXCLUDED" => Some("ROBOTS_EXCLUDED"),
+        "PROVIDER_ERROR" => Some("PROVIDER_ERROR"),
+        "TRANSITION_INELIGIBLE" => Some("TRANSITION_INELIGIBLE"),
+        _ => None,
+    }
+}
+
 fn is_html(media_type: &str) -> bool {
     media_type
         .split(';')
@@ -1072,6 +2650,28 @@ fn parse_run_id(value: &str) -> Option<CrawlRunId> {
 
 fn discovered_id() -> String {
     Uuid::now_v7().to_string()
+}
+
+fn semantic_discovered_id<T: serde::Serialize>(
+    run_id: CrawlRunId,
+    kind: &str,
+    work_generation: u64,
+    identity: &T,
+) -> Result<String, ()> {
+    let digest =
+        erabi_domain::canonical_sha256(&(run_id.to_string(), kind, work_generation, identity))
+            .map_err(|_| ())?;
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16).map_err(|_| ())?;
+    }
+    // Keep the existing UUID-shaped DiscoveredUrlId contract while making the
+    // semantic observation identity stable across an uncertain transaction
+    // replay. The work generation remains part of the identity, so a retry is
+    // retained as a distinct physical discovery observation.
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(Uuid::from_bytes(bytes).to_string())
 }
 
 fn adapter_error_code(error: &CrawlerAdapterError) -> CrawlExecutionErrorCode {
@@ -1165,7 +2765,7 @@ fn epoch_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProductionDeadline, discovered_id};
+    use super::{ProductionDeadline, discovered_id, is_production_job_kind};
     use erabi_crawler::{ManualPreviewClock, PreviewClock};
     use std::{sync::Arc, time::Duration};
     use uuid::Uuid;
@@ -1192,5 +2792,20 @@ mod tests {
         clock.advance_millis(500);
         assert_eq!(deadline.remaining_timeout(2_000), None);
         assert_eq!(clock.now_millis(), 500);
+    }
+
+    #[test]
+    fn production_recovery_kinds_are_explicitly_routed() {
+        for kind in [
+            "PRODUCTION_CRAWL",
+            "RETRY",
+            "RETRY_FAILED_PARTS",
+            "RESUME_CHECKPOINT",
+            "RERUN_FULL_CRAWL",
+        ] {
+            assert!(is_production_job_kind(kind), "{kind} must use production");
+        }
+        assert!(!is_production_job_kind("QUICK_SCRAPE"));
+        assert!(!is_production_job_kind("RESTART_FROM_BEGINNING"));
     }
 }

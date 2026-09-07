@@ -8,9 +8,16 @@ use erabi_domain::{
     CrawlRunType, CrawlerId, CrawlerVersion, CrawlerVersionId, CrawlerVersionState,
     DiscoveryTransition, DiscoveryTransitionId, PageTypeId, RunConfiguration, SourceId,
 };
-use turso::{Connection, Row, transaction::TransactionBehavior};
+use turso::{Connection, Row, Value, params_from_iter, transaction::TransactionBehavior};
 use url::Url;
 use uuid::Uuid;
+
+use super::JobId;
+use super::crawl_traversal::CrawlWorkState;
+use super::run::{
+    CrawlRunRepositoryError, cancel_execution_status_in_transaction,
+    transition_execution_status_in_transaction,
+};
 
 const MAX_EXECUTION_URL_CHARS: usize = 4_096;
 const MAX_EXECUTION_MEDIA_TYPE_CHARS: usize = 256;
@@ -199,6 +206,214 @@ impl<'database> CrawlExecutionRepository<'database> {
         }
     }
 
+    /// Atomically records append-only execution evidence and advances the
+    /// current logical work projection. A crash before commit exposes neither
+    /// half; a crash after commit cannot make a completed work item callable
+    /// again merely because a checkpoint append was delayed.
+    ///
+    /// # Errors
+    /// Returns a typed validation, ownership, execution, or transaction
+    /// failure without exposing a half-advanced logical work state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn persist_current_work(
+        &self,
+        record: &CrawlExecutionRecord,
+        crawl_url_state_id: &str,
+        job_id: &JobId,
+        job_attempt_id: &str,
+        state: CrawlWorkState,
+        expected_work_generation: u64,
+        now: i64,
+    ) -> Result<(), CrawlExecutionRepositoryError> {
+        validate_record_input(record)?;
+        if crawl_url_state_id.is_empty()
+            || job_attempt_id.is_empty()
+            || !outcome_matches_work_state(record.outcome, state)
+        {
+            return Err(CrawlExecutionRepositoryError::InvalidInput(
+                "logical work lineage",
+            ));
+        }
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let result = async {
+            validate_current_work_owner(
+                &transaction,
+                record,
+                crawl_url_state_id,
+                job_id,
+                job_attempt_id,
+                expected_work_generation,
+                now,
+            )
+            .await?;
+            persist_in_transaction_with_lineage(
+                &transaction,
+                record,
+                crawl_url_state_id,
+                job_attempt_id,
+                expected_work_generation,
+            )
+            .await?;
+            let changed = transaction.execute("UPDATE crawl_url_state SET current_work_state = ?1, current_execution_id = ?2 WHERE id = ?3 AND crawl_run_id = ?4 AND work_generation = ?5 AND current_work_state IN ('PENDING', 'RUNNING')", (work_state_name(state), record.id.to_string(), crawl_url_state_id, record.crawl_run_id.to_string(), i64::try_from(expected_work_generation).map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)?)).await.map_err(CrawlExecutionRepositoryError::database)?;
+            if changed != 1 { return Err(CrawlExecutionRepositoryError::CorruptState); }
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(CrawlExecutionRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Marks one logical work generation active before provider IO. The
+    /// current job attempt and work generation are both verified in the same
+    /// transaction, so a re-leased retry cannot revive a newer generation or
+    /// let a stale attempt replace its current execution.
+    ///
+    /// # Errors
+    /// Returns a typed ownership, lineage, or transition failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_current_work(
+        &self,
+        crawl_run_id: CrawlRunId,
+        crawl_url_state_id: &str,
+        job_id: &JobId,
+        job_attempt_id: &str,
+        expected_work_generation: u64,
+        now: i64,
+    ) -> Result<(), CrawlExecutionRepositoryError> {
+        if crawl_url_state_id.is_empty() || job_attempt_id.is_empty() {
+            return Err(CrawlExecutionRepositoryError::InvalidInput(
+                "logical work activation",
+            ));
+        }
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let result = async {
+            validate_active_attempt_owner(
+                &transaction,
+                crawl_run_id,
+                job_id,
+                job_attempt_id,
+                now,
+            )
+            .await?;
+            let changed = transaction
+                .execute(
+                    "UPDATE crawl_url_state SET current_work_state = 'RUNNING', current_execution_id = NULL WHERE id = ?1 AND crawl_run_id = ?2 AND admission_state = 'ADMITTED' AND work_generation = ?3 AND current_work_state IN ('PENDING', 'RUNNING', 'FAILED')",
+                    (
+                        crawl_url_state_id,
+                        crawl_run_id.to_string(),
+                        i64::try_from(expected_work_generation)
+                            .map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)?,
+                    ),
+                )
+                .await
+                .map_err(CrawlExecutionRepositoryError::database)?;
+            if changed != 1 {
+                return Err(CrawlExecutionRepositoryError::InvalidReference);
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(CrawlExecutionRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Appends a physical execution that is known to be a historical alias
+    /// observation while leaving the already completed canonical work unit
+    /// authoritative. This is used only when an alias is discovered after an
+    /// independently authored final-canonical Seed has already completed.
+    ///
+    /// # Errors
+    /// Returns a typed ownership, execution, or transaction failure. The
+    /// method never changes current logical work or current execution
+    /// linkage.
+    pub async fn persist_historical_work(
+        &self,
+        record: &CrawlExecutionRecord,
+        crawl_url_state_id: &str,
+        job_id: &JobId,
+        job_attempt_id: &str,
+        expected_work_generation: u64,
+        now: i64,
+    ) -> Result<(), CrawlExecutionRepositoryError> {
+        validate_record_input(record)?;
+        if crawl_url_state_id.is_empty() || job_attempt_id.is_empty() {
+            return Err(CrawlExecutionRepositoryError::InvalidInput(
+                "historical logical work lineage",
+            ));
+        }
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let result = async {
+            validate_historical_work_owner(
+                &transaction,
+                record,
+                crawl_url_state_id,
+                job_id,
+                job_attempt_id,
+                expected_work_generation,
+                now,
+            )
+            .await?;
+            persist_in_transaction_with_lineage(
+                &transaction,
+                record,
+                crawl_url_state_id,
+                job_attempt_id,
+                expected_work_generation,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(CrawlExecutionRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Reads one page execution and validates every durable relationship.
     ///
     /// # Errors
@@ -303,6 +518,56 @@ impl<'database> CrawlExecutionRepository<'database> {
         }
     }
 
+    /// Atomically persists the current structural summary with its terminal
+    /// run status. Finalization callers must not expose a status that was
+    /// committed without the counters used to justify it.
+    ///
+    /// # Errors
+    /// Returns a typed summary, run-lifecycle, or database error.
+    pub async fn finalize(
+        &self,
+        summary: &CrawlExecutionSummary,
+        status: erabi_domain::CrawlRunStatus,
+    ) -> Result<(), CrawlExecutionRepositoryError> {
+        let values = summary_sql_values(summary)?;
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(CrawlExecutionRepositoryError::database)?;
+        let result = async {
+            save_summary_in_transaction(&transaction, summary, values).await?;
+            if status == erabi_domain::CrawlRunStatus::Cancelled {
+                cancel_execution_status_in_transaction(&transaction, summary.crawl_run_id)
+                    .await
+                    .map_err(map_run_error)
+            } else {
+                transition_execution_status_in_transaction(
+                    &transaction,
+                    summary.crawl_run_id,
+                    status,
+                )
+                .await
+                .map_err(map_run_error)
+            }
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(CrawlExecutionRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Reads one durable run execution summary.
     ///
     /// # Errors
@@ -348,6 +613,28 @@ async fn persist_in_transaction(
     connection: &Connection,
     record: &CrawlExecutionRecord,
 ) -> Result<(), CrawlExecutionRepositoryError> {
+    let content_length_bytes = optional_counter(record.content_length_bytes)?;
+    let provider_elapsed_ms = optional_counter(record.provider_elapsed_ms)?;
+    let run = load_run_context(connection, record.crawl_run_id).await?;
+    validate_references(connection, record, &run).await?;
+    validate_artifact_references(connection, record).await?;
+    insert_execution_row(
+        connection,
+        record,
+        content_length_bytes,
+        provider_elapsed_ms,
+        None,
+    )
+    .await
+}
+
+async fn persist_in_transaction_with_lineage(
+    connection: &Connection,
+    record: &CrawlExecutionRecord,
+    crawl_url_state_id: &str,
+    job_attempt_id: &str,
+    work_generation: u64,
+) -> Result<(), CrawlExecutionRepositoryError> {
     if row_exists(
         connection,
         "SELECT 1 FROM crawl_execution_results WHERE id = ?1",
@@ -363,28 +650,65 @@ async fn persist_in_transaction(
     let run = load_run_context(connection, record.crawl_run_id).await?;
     validate_references(connection, record, &run).await?;
     validate_artifact_references(connection, record).await?;
+    insert_execution_row(
+        connection,
+        record,
+        content_length_bytes,
+        provider_elapsed_ms,
+        Some((crawl_url_state_id, job_attempt_id, work_generation)),
+    )
+    .await
+}
 
-    connection
-        .execute(
-            "INSERT INTO crawl_execution_results (id, crawl_run_id, requested_url, canonical_url, observed_final_url, source_id, page_type_id, transition_id, discovered_url_id, outcome, error_code, http_status, media_type, content_length_bytes, provider_elapsed_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            (
-                record.id.to_string(),
-                record.crawl_run_id.to_string(),
-                record.requested_url.as_str(),
-                record.canonical_url.as_str(),
-                optional_text(record.observed_final_url.as_deref()),
-                optional_id(record.source_id),
-                optional_id(record.page_type_id),
-                optional_id(record.transition_id),
-                optional_text(record.discovered_url_id.as_deref()),
-                outcome_name(record.outcome),
-                optional_error_code(record.error_code),
-                optional_i64(record.http_status.map(i64::from)),
-                optional_text(record.media_type.as_deref()),
-                content_length_bytes,
-                provider_elapsed_ms,
+async fn insert_execution_row(
+    connection: &Connection,
+    record: &CrawlExecutionRecord,
+    content_length_bytes: Value,
+    provider_elapsed_ms: Value,
+    lineage: Option<(&str, &str, u64)>,
+) -> Result<(), CrawlExecutionRepositoryError> {
+    if row_exists(
+        connection,
+        "SELECT 1 FROM crawl_execution_results WHERE id = ?1",
+        [record.id.to_string()],
+    )
+    .await?
+    {
+        return Err(CrawlExecutionRepositoryError::DuplicateExecution);
+    }
+
+    let mut values = vec![
+        Value::Text(record.id.to_string()),
+        Value::Text(record.crawl_run_id.to_string()),
+        Value::Text(record.requested_url.clone()),
+        Value::Text(record.canonical_url.clone()),
+        optional_text(record.observed_final_url.as_deref()),
+        optional_id(record.source_id),
+        optional_id(record.page_type_id),
+        optional_id(record.transition_id),
+        optional_text(record.discovered_url_id.as_deref()),
+        optional_text(Some(outcome_name(record.outcome))),
+        optional_error_code(record.error_code),
+        optional_i64(record.http_status.map(i64::from)),
+        optional_text(record.media_type.as_deref()),
+        content_length_bytes,
+        provider_elapsed_ms,
+    ];
+    let sql = if let Some((crawl_url_state_id, job_attempt_id, work_generation)) = lineage {
+        values.extend([
+            Value::Text(crawl_url_state_id.to_owned()),
+            Value::Text(job_attempt_id.to_owned()),
+            Value::Integer(
+                i64::try_from(work_generation)
+                    .map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)?,
             ),
-        )
+        ]);
+        "INSERT INTO crawl_execution_results (id, crawl_run_id, requested_url, canonical_url, observed_final_url, source_id, page_type_id, transition_id, discovered_url_id, outcome, error_code, http_status, media_type, content_length_bytes, provider_elapsed_ms, crawl_url_state_id, job_attempt_id, work_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+    } else {
+        "INSERT INTO crawl_execution_results (id, crawl_run_id, requested_url, canonical_url, observed_final_url, source_id, page_type_id, transition_id, discovered_url_id, outcome, error_code, http_status, media_type, content_length_bytes, provider_elapsed_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+    };
+    connection
+        .execute(sql, params_from_iter(values))
         .await
         .map_err(CrawlExecutionRepositoryError::database)?;
 
@@ -400,6 +724,172 @@ async fn persist_in_transaction(
             )
             .await
             .map_err(CrawlExecutionRepositoryError::database)?;
+    }
+    Ok(())
+}
+
+async fn validate_current_work_owner(
+    connection: &Connection,
+    record: &CrawlExecutionRecord,
+    crawl_url_state_id: &str,
+    job_id: &JobId,
+    job_attempt_id: &str,
+    expected_work_generation: u64,
+    now: i64,
+) -> Result<(), CrawlExecutionRepositoryError> {
+    let state = connection
+        .prepare(
+            "SELECT canonical_url, admission_state, current_work_state, work_generation FROM crawl_url_state WHERE id = ?1 AND crawl_run_id = ?2",
+        )
+        .await
+        .map_err(CrawlExecutionRepositoryError::database)?
+        .query_row((crawl_url_state_id, record.crawl_run_id.to_string()))
+        .await
+        .map_err(|error| match error {
+            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
+            other => CrawlExecutionRepositoryError::database(other),
+        })?;
+    let canonical_url: String = state
+        .get(0)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let admission_state: String = state
+        .get(1)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let current_work_state: Option<String> = state
+        .get(2)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let generation: i64 = state
+        .get(3)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    if canonical_url != record.canonical_url
+        || admission_state != "ADMITTED"
+        || !matches!(current_work_state.as_deref(), Some("PENDING" | "RUNNING"))
+        || generation != i64::try_from(expected_work_generation).unwrap_or(i64::MIN)
+    {
+        return Err(CrawlExecutionRepositoryError::InvalidReference);
+    }
+
+    validate_active_attempt_owner(connection, record.crawl_run_id, job_id, job_attempt_id, now)
+        .await
+}
+
+async fn validate_historical_work_owner(
+    connection: &Connection,
+    record: &CrawlExecutionRecord,
+    crawl_url_state_id: &str,
+    job_id: &JobId,
+    job_attempt_id: &str,
+    expected_work_generation: u64,
+    now: i64,
+) -> Result<(), CrawlExecutionRepositoryError> {
+    let state = connection
+        .prepare(
+            "SELECT canonical_url, admission_state, current_work_state, work_generation, current_execution_id FROM crawl_url_state WHERE id = ?1 AND crawl_run_id = ?2",
+        )
+        .await
+        .map_err(CrawlExecutionRepositoryError::database)?
+        .query_row((crawl_url_state_id, record.crawl_run_id.to_string()))
+        .await
+        .map_err(|error| match error {
+            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
+            other => CrawlExecutionRepositoryError::database(other),
+        })?;
+    let canonical_url: String = state
+        .get(0)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let admission_state: String = state
+        .get(1)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let current_work_state: Option<String> = state
+        .get(2)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let generation: i64 = state
+        .get(3)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let current_execution_id: Option<String> = state
+        .get(4)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    if canonical_url != record.canonical_url
+        || admission_state != "ADMITTED"
+        || !matches!(
+            current_work_state.as_deref(),
+            Some("COMPLETED" | "PARTIAL" | "FAILED" | "CANCELLED")
+        )
+        || current_execution_id.is_none()
+        || generation != i64::try_from(expected_work_generation).unwrap_or(i64::MIN)
+    {
+        return Err(CrawlExecutionRepositoryError::InvalidReference);
+    }
+
+    validate_active_attempt_owner(connection, record.crawl_run_id, job_id, job_attempt_id, now)
+        .await
+}
+
+async fn validate_active_attempt_owner(
+    connection: &Connection,
+    crawl_run_id: CrawlRunId,
+    job_id: &JobId,
+    job_attempt_id: &str,
+    now: i64,
+) -> Result<(), CrawlExecutionRepositoryError> {
+    let attempt = connection
+        .prepare(
+            "SELECT job.crawl_run_id, job.state, job.current_attempt, job.lease_id, job.lease_owner, job.lease_generation, job.lease_expires_at, attempt.attempt_number, attempt.lease_id, attempt.lease_generation, attempt.worker_id, attempt.outcome FROM job_attempts AS attempt JOIN jobs AS job ON job.id = attempt.job_id WHERE attempt.id = ?1 AND job.id = ?2",
+        )
+        .await
+        .map_err(CrawlExecutionRepositoryError::database)?
+        .query_row((job_attempt_id, job_id.to_string()))
+        .await
+        .map_err(|error| match error {
+            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
+            other => CrawlExecutionRepositoryError::database(other),
+        })?;
+    let attempt_run_id: Option<String> = attempt
+        .get(0)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let job_state: String = attempt
+        .get(1)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let current_attempt: i64 = attempt
+        .get(2)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let job_lease_id: Option<String> = attempt
+        .get(3)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let job_lease_owner: Option<String> = attempt
+        .get(4)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let job_lease_generation: i64 = attempt
+        .get(5)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let job_lease_expires_at: Option<i64> = attempt
+        .get(6)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let attempt_number: i64 = attempt
+        .get(7)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let attempt_lease_id: String = attempt
+        .get(8)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let attempt_lease_generation: i64 = attempt
+        .get(9)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let attempt_worker_id: String = attempt
+        .get(10)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    let attempt_outcome: String = attempt
+        .get(11)
+        .map_err(CrawlExecutionRepositoryError::database)?;
+    if attempt_run_id.as_deref() != Some(crawl_run_id.to_string().as_str())
+        || job_state != "RUNNING"
+        || current_attempt != attempt_number
+        || job_lease_id.as_deref() != Some(attempt_lease_id.as_str())
+        || job_lease_owner.as_deref() != Some(attempt_worker_id.as_str())
+        || job_lease_generation != attempt_lease_generation
+        || attempt_outcome != "RUNNING"
+        || job_lease_expires_at.is_none_or(|expires_at| expires_at <= now)
+    {
+        return Err(CrawlExecutionRepositoryError::InvalidReference);
     }
     Ok(())
 }
@@ -1123,6 +1613,13 @@ fn checked_counter(value: u64) -> Result<i64, CrawlExecutionRepositoryError> {
     i64::try_from(value).map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)
 }
 
+fn map_run_error(error: CrawlRunRepositoryError) -> CrawlExecutionRepositoryError {
+    match error {
+        CrawlRunRepositoryError::NotFound => CrawlExecutionRepositoryError::NotFound,
+        CrawlRunRepositoryError::Database(error) => CrawlExecutionRepositoryError::Database(error),
+    }
+}
+
 fn summary_from_row(row: &Row) -> Result<CrawlExecutionSummary, CrawlExecutionRepositoryError> {
     let summary = CrawlExecutionSummary {
         crawl_run_id: parse_run_id(
@@ -1238,6 +1735,27 @@ fn outcome_name(value: CrawlExecutionOutcome) -> &'static str {
         CrawlExecutionOutcome::Failed => "FAILED",
         CrawlExecutionOutcome::Cancelled => "CANCELLED",
     }
+}
+
+fn work_state_name(state: CrawlWorkState) -> &'static str {
+    match state {
+        CrawlWorkState::Pending => "PENDING",
+        CrawlWorkState::Running => "RUNNING",
+        CrawlWorkState::Completed => "COMPLETED",
+        CrawlWorkState::Partial => "PARTIAL",
+        CrawlWorkState::Failed => "FAILED",
+        CrawlWorkState::Cancelled => "CANCELLED",
+    }
+}
+
+fn outcome_matches_work_state(outcome: CrawlExecutionOutcome, state: CrawlWorkState) -> bool {
+    matches!(
+        (outcome, state),
+        (CrawlExecutionOutcome::Completed, CrawlWorkState::Completed)
+            | (CrawlExecutionOutcome::Partial, CrawlWorkState::Partial)
+            | (CrawlExecutionOutcome::Failed, CrawlWorkState::Failed)
+            | (CrawlExecutionOutcome::Cancelled, CrawlWorkState::Cancelled)
+    )
 }
 
 fn error_code_name(value: CrawlExecutionErrorCode) -> &'static str {
