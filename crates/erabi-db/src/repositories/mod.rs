@@ -3,11 +3,14 @@
 mod artifact;
 mod checkpoint;
 mod configuration;
+mod crawl_execution;
+mod crawl_traversal;
 mod crawler;
 mod identity;
 mod job;
 mod progress;
 mod run;
+mod source;
 mod test_evidence;
 
 pub use artifact::ArtifactRepository;
@@ -19,6 +22,18 @@ pub use checkpoint::{
     MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
 };
 pub use configuration::ConfigurationRepository;
+pub use crawl_execution::{
+    CrawlExecutionArtifact, CrawlExecutionArtifactKind, CrawlExecutionRecord,
+    CrawlExecutionRepository, CrawlExecutionRepositoryError, CrawlExecutionSummary,
+};
+pub use crawl_traversal::{
+    CrawlAdmissionState, CrawlInFlightWork, CrawlPageTypeMatchState, CrawlRecoveryActionKind,
+    CrawlRecoveryActionSelection, CrawlRedirectReconciliation, CrawlTransitionSourceCount,
+    CrawlTraversalControl, CrawlTraversalPageTypeCounts, CrawlTraversalRepository,
+    CrawlTraversalRepositoryError, CrawlTraversalSemanticProjection,
+    CrawlTraversalUrlSemanticState, CrawlUrlStateRecord, CrawlWorkState,
+    ReconstructedTraversalState,
+};
 pub use crawler::{
     CrawlerAuditMetadata, CrawlerEvaluationSnapshot, CrawlerPointers, CrawlerRepository,
     CrawlerRepositoryError, CrawlerSemanticSnapshot, CrawlerVersionRecord,
@@ -28,7 +43,7 @@ pub use identity::JobIdParseError;
 pub use job::{
     AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,
     JobFailureCode, JobId, JobKind, JobLease, JobRecord, JobRepository, JobRepositoryError,
-    JobState, JobStorageClass, NewJob, StaleJobRecovery,
+    JobState, JobStorageClass, NewJob, ProductionRunJob, QuickScrapeRunJob, StaleJobRecovery,
 };
 pub use progress::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
@@ -36,5 +51,6 @@ pub use progress::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
-pub use run::{CrawlRunRepository, CrawlRunRepositoryError};
+pub use run::{CrawlRunRepository, CrawlRunRepositoryError, DiscoveredUrlRecord};
+pub use source::{NewSource, SourceRepository, SourceRepositoryError};
 pub use test_evidence::{TestEvidenceRecord, TestEvidenceRepository, TestEvidenceRepositoryError};

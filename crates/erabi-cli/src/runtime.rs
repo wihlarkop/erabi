@@ -9,14 +9,23 @@ use std::{
 
 use axum::Router;
 use erabi_api::{AppState, RuntimeMode, SecurityConfig, SecurityConfigError, build_router};
+use erabi_crawl4ai::{Crawl4AiAdapter, Crawl4AiConfig};
+use erabi_crawler::{
+    CrawlerAdapter, CrawlerAdapterError, CrawlerExecuteRequest, CrawlerExecuteResult,
+    CrawlerFuture, CrawlerHealth, NetworkTargetPolicy, PacingService,
+    ProductionRunSubmissionService, QuickScrapeSubmissionService, RobotsPolicyService,
+};
 use erabi_db::{
     ArtifactStore, ErabiDatabase, LightweightIntegrityChecker, MigrationRunner,
     repositories::ConcurrencyState,
 };
 use erabi_jobs::{
-    CancellationController, ProgressLiveHub, StoragePressureMonitor, StoragePressurePolicy,
-    StoragePressureState, recover_and_rebuild_at,
+    CancellationController, CrawlRootJobHandler, JobRuntime, ProductionCrawlJobHandler,
+    ProgressLiveHub, QuickScrapeJobHandler, StoragePressureMonitor, StoragePressurePolicy,
+    StoragePressureState, WorkerPolicy, recover_and_rebuild_at,
 };
+use secrecy::ExposeSecret;
+use std::sync::Arc;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
@@ -82,6 +91,7 @@ pub struct RunningRuntime {
     _progress_live_hub: ProgressLiveHub,
     storage_pressure: StoragePressureMonitor,
     storage_pressure_task: JoinHandle<()>,
+    quick_scrape_worker_task: Option<JoinHandle<()>>,
     cancellation: CancellationController,
 }
 
@@ -119,6 +129,7 @@ impl RunningRuntime {
     /// Returns a typed fatal error for pre-service, database-open, or listener
     /// failures. Migration and integrity risk instead construct a limited
     /// Recovery Mode runtime.
+    #[allow(clippy::too_many_lines)] // Startup composes bounded recovery, HTTP, and worker lifecycles.
     pub async fn start_with_options(
         config: BootstrapConfig,
         options: RuntimeOptions,
@@ -176,10 +187,18 @@ impl RunningRuntime {
 
         let progress_live_hub = ProgressLiveHub::new();
         let cancellation = CancellationController::default();
+        let pacing = PacingService::new();
+        let network_policy = NetworkTargetPolicy::default();
+        let adapter = crawler_adapter(&config);
+        let quick_scrape_submission =
+            QuickScrapeSubmissionService::new(database.clone(), network_policy.clone());
+        let production_run_submission = ProductionRunSubmissionService::new(database.clone());
         let app_state = AppState::with_readiness(false)
             .with_progress_runtime(database.clone(), progress_live_hub.clone())
             .with_job_actions_runtime(database.clone(), cancellation.clone())
             .with_crawler_authoring_runtime(database.clone())
+            .with_quick_scrape_runtime(quick_scrape_submission)
+            .with_production_run_runtime(database.clone(), production_run_submission)
             .with_storage_pressure_controller(storage_pressure.controller().clone());
         match &startup_outcome {
             StartupOutcome::Recovery(recovery) => {
@@ -215,6 +234,32 @@ impl RunningRuntime {
         let (stop_server, stop_receiver) = watch::channel(false);
         let storage_pressure_task =
             spawn_storage_pressure_refresh(storage_pressure.clone(), stop_receiver.clone());
+        let quick_scrape_worker_task = match &startup_outcome {
+            StartupOutcome::Ready { .. } => {
+                let artifact_store =
+                    ArtifactStore::new(data_dir.join("artifacts")).map_err(|_| {
+                        fatal(
+                            "ARTIFACT_DIRECTORY_UNAVAILABLE",
+                            "Erabi could not prepare controlled artifact storage.",
+                        )
+                    })?;
+                Some(spawn_crawl_root_worker(
+                    CrawlRootWorkerDependencies {
+                        database: database.clone(),
+                        adapter,
+                        robots: RobotsPolicyService::new(network_policy.clone(), pacing.clone()),
+                        pacing,
+                        network_policy,
+                        artifact_store,
+                        progress_live_hub: progress_live_hub.clone(),
+                        cancellation: cancellation.clone(),
+                        storage_pressure: storage_pressure.clone(),
+                    },
+                    stop_receiver.clone(),
+                ))
+            }
+            StartupOutcome::Recovery(_) | StartupOutcome::Fatal(_) => None,
+        };
         let server_task = spawn_server(listener, router, stop_receiver);
 
         Ok(Self {
@@ -229,6 +274,7 @@ impl RunningRuntime {
             _progress_live_hub: progress_live_hub,
             storage_pressure,
             storage_pressure_task,
+            quick_scrape_worker_task,
             cancellation,
         })
     }
@@ -318,6 +364,11 @@ impl RunningRuntime {
         {
             self.storage_pressure_task.abort();
         }
+        if let Some(worker_task) = &mut self.quick_scrape_worker_task
+            && timeout_at(deadline, &mut *worker_task).await.is_err()
+        {
+            worker_task.abort();
+        }
         match timeout_at(deadline, &mut self.server_task).await {
             Ok(Ok(Ok(()))) => Ok(report),
             Ok(Ok(Err(_)) | Err(_)) => Err(RuntimeError::Server),
@@ -361,6 +412,109 @@ fn spawn_server(
             })
             .await
     })
+}
+
+struct CrawlRootWorkerDependencies {
+    database: ErabiDatabase,
+    adapter: Arc<dyn CrawlerAdapter>,
+    robots: RobotsPolicyService,
+    pacing: PacingService,
+    network_policy: NetworkTargetPolicy,
+    artifact_store: ArtifactStore,
+    progress_live_hub: ProgressLiveHub,
+    cancellation: CancellationController,
+    storage_pressure: StoragePressureMonitor,
+}
+
+fn spawn_crawl_root_worker(
+    dependencies: CrawlRootWorkerDependencies,
+    mut stop_receiver: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let CrawlRootWorkerDependencies {
+            database,
+            adapter,
+            robots,
+            pacing,
+            network_policy,
+            artifact_store,
+            progress_live_hub,
+            cancellation,
+            storage_pressure,
+        } = dependencies;
+        let Ok(runtime) = JobRuntime::with_storage_pressure_monitor(
+            &database,
+            "crawl-root-worker",
+            WorkerPolicy::conservative(),
+            cancellation,
+            storage_pressure,
+        ) else {
+            return;
+        };
+        let quick_scrape = QuickScrapeJobHandler::new(
+            database.clone(),
+            Arc::clone(&adapter),
+            robots.clone(),
+            pacing.clone(),
+            network_policy.clone(),
+            artifact_store.clone(),
+        )
+        .with_progress_live_hub(progress_live_hub.clone());
+        let production = ProductionCrawlJobHandler::new(
+            database.clone(),
+            adapter,
+            robots,
+            pacing,
+            network_policy,
+            artifact_store,
+        )
+        .with_progress_live_hub(progress_live_hub);
+        let handler = CrawlRootJobHandler::new(quick_scrape, production);
+        let mut polling = tokio::time::interval(Duration::from_millis(100));
+        polling.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = polling.tick() => {
+                    let _ = Box::pin(runtime.execute_next_at(&handler, startup_epoch_seconds())).await;
+                }
+                changed = stop_receiver.changed() => {
+                    if changed.is_err() || *stop_receiver.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn crawler_adapter(config: &BootstrapConfig) -> Arc<dyn CrawlerAdapter> {
+    let Some(base_url) = config.crawl4ai().base_url() else {
+        return Arc::new(UnavailableCrawlerAdapter);
+    };
+    let token = config
+        .crawl4ai()
+        .api_token()
+        .map(|value| value.expose_secret().to_owned());
+    let Ok(config) = Crawl4AiConfig::new(base_url.as_url().as_str(), token) else {
+        return Arc::new(UnavailableCrawlerAdapter);
+    };
+    Crawl4AiAdapter::new(config).map_or_else(
+        |_| Arc::new(UnavailableCrawlerAdapter) as Arc<dyn CrawlerAdapter>,
+        |adapter| Arc::new(adapter) as Arc<dyn CrawlerAdapter>,
+    )
+}
+
+#[derive(Debug)]
+struct UnavailableCrawlerAdapter;
+
+impl CrawlerAdapter for UnavailableCrawlerAdapter {
+    fn health(&self) -> CrawlerFuture<'_, CrawlerHealth> {
+        Box::pin(async { Err(CrawlerAdapterError::Unavailable) })
+    }
+
+    fn execute(&self, _request: CrawlerExecuteRequest) -> CrawlerFuture<'_, CrawlerExecuteResult> {
+        Box::pin(async { Err(CrawlerAdapterError::Unavailable) })
+    }
 }
 
 fn prepare_data_directory(configured: &Path) -> Result<PathBuf, RuntimeError> {

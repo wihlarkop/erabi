@@ -15,8 +15,8 @@ use std::{
 use erabi_db::{
     ErabiDatabase,
     repositories::{
-        ConcurrencyState, JobFailureCode, JobId, JobKind, JobLease, JobRepository,
-        JobRepositoryError, JobState, StaleJobRecovery,
+        ConcurrencyState, CrawlRunRepository, JobFailureCode, JobId, JobKind, JobLease,
+        JobRepository, JobRepositoryError, JobState, StaleJobRecovery,
     },
 };
 use futures_util::FutureExt;
@@ -27,7 +27,9 @@ use tokio::{
 
 mod actions;
 mod cancellation;
+mod production;
 mod progress;
+mod quick_scrape;
 mod storage_pressure;
 
 pub use actions::{
@@ -46,7 +48,9 @@ pub use storage_pressure::{
 };
 
 pub use erabi_db::repositories::JobStorageClass;
-pub use erabi_db::repositories::{AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob};
+pub use erabi_db::repositories::{
+    AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob, QuickScrapeRunJob,
+};
 pub use erabi_db::repositories::{
     CURRENT_CHECKPOINT_SCHEMA_VERSION, CheckpointArtifactReference, CheckpointCompatibility,
     CheckpointEnvelope, CheckpointIdentity, CheckpointPosition, CheckpointRecord,
@@ -60,6 +64,77 @@ pub use erabi_db::repositories::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
+pub use production::ProductionCrawlJobHandler;
+pub use quick_scrape::QuickScrapeJobHandler;
+
+/// One durable runtime dispatcher for the two Plan 06 crawl root-job kinds.
+/// The queue leases by priority, not handler kind, so separate polling loops
+/// would be able to lease and incorrectly fail one another's work.
+#[derive(Clone)]
+pub struct CrawlRootJobHandler {
+    quick_scrape: QuickScrapeJobHandler,
+    production: ProductionCrawlJobHandler,
+}
+
+impl CrawlRootJobHandler {
+    #[must_use]
+    pub const fn new(
+        quick_scrape: QuickScrapeJobHandler,
+        production: ProductionCrawlJobHandler,
+    ) -> Self {
+        Self {
+            quick_scrape,
+            production,
+        }
+    }
+}
+
+impl JobHandler for CrawlRootJobHandler {
+    fn execute(
+        &self,
+        context: JobExecutionContext,
+    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+        let handler = self.clone();
+        async move {
+            match context.kind().as_str() {
+                "QUICK_SCRAPE" => handler.quick_scrape.execute(context).await,
+                "PRODUCTION_CRAWL" => handler.production.execute(context).await,
+                "RETRY"
+                | "RETRY_FAILED_PARTS"
+                | "RESUME_CHECKPOINT"
+                | "RERUN_FULL_CRAWL"
+                | "RESTART_FROM_BEGINNING" => {
+                    let database = handler.quick_scrape.database();
+                    let job = JobRepository::new(database)
+                        .job(context.job_id())
+                        .await
+                        .map_err(|_| JobExecutionError)?;
+                    let run_id = job
+                        .crawl_run_id
+                        .as_deref()
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        .and_then(erabi_domain::CrawlRunId::from_uuid)
+                        .ok_or(JobExecutionError)?;
+                    let snapshot = erabi_db::repositories::CrawlRunRepository::new(database)
+                        .snapshot(run_id)
+                        .await
+                        .map_err(|_| JobExecutionError)?;
+                    match snapshot.run_type() {
+                        erabi_domain::CrawlRunType::QuickScrape => {
+                            handler.quick_scrape.execute(context).await
+                        }
+                        erabi_domain::CrawlRunType::ProductionRun => {
+                            handler.production.execute(context).await
+                        }
+                        erabi_domain::CrawlRunType::TestRun
+                        | erabi_domain::CrawlRunType::DiscoveryPreview => Err(JobExecutionError),
+                    }
+                }
+                _ => Err(JobExecutionError),
+            }
+        }
+    }
+}
 
 /// Fixed bounded retry and lease policy for one generic worker runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,12 +172,14 @@ impl WorkerPolicy {
 pub struct JobExecutionContext {
     job_id: JobId,
     kind: JobKind,
+    attempt_id: String,
     attempt_number: u32,
     worker_id: String,
     lease: JobLease,
     cancellation: CancellationToken,
     storage_pressure: StoragePressureToken,
     checkpoint_writer: CheckpointWriter,
+    terminal_failure: Arc<AtomicBool>,
 }
 
 impl JobExecutionContext {
@@ -114,6 +191,13 @@ impl JobExecutionContext {
     #[must_use]
     pub fn kind(&self) -> &JobKind {
         &self.kind
+    }
+
+    /// Returns the durable `UUIDv7` identity of the current attempt. Progress
+    /// events use this reference instead of inventing an in-memory sequence.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
     }
 
     #[must_use]
@@ -154,6 +238,40 @@ impl JobExecutionContext {
     ) -> Result<CheckpointRecord, JobRepositoryError> {
         self.checkpoint_writer.append(checkpoint).await
     }
+
+    /// Returns the verified ownership material needed by the narrowly scoped
+    /// Task 9 initialization transaction. Callers must mark the writer after
+    /// the repository commits its coupled checkpoint append.
+    pub(crate) async fn checkpoint_lineage(
+        &self,
+    ) -> Result<(JobId, String, JobLease, i64), JobRepositoryError> {
+        self.checkpoint_writer.lineage().await
+    }
+
+    /// Returns the queue clock value associated with this owned turn. Durable
+    /// result writes must use the same seconds-based clock as lease creation;
+    /// handlers must not substitute a provider or wall-clock timestamp.
+    pub(crate) fn ownership_now(&self) -> i64 {
+        self.checkpoint_writer.initial_now.saturating_add(
+            i64::try_from(self.checkpoint_writer.started.elapsed().as_secs()).unwrap_or(i64::MAX),
+        )
+    }
+
+    pub(crate) fn mark_checkpoint_persisted(&self) {
+        self.checkpoint_writer.mark_persisted();
+    }
+
+    /// Marks the current expected handler error as permanently terminal after
+    /// the handler has durably recorded its stable outcome. Generic handlers
+    /// remain retryable by default; this narrow signal prevents a known
+    /// permanent external result from consuming unrelated retry attempts.
+    pub(crate) fn mark_terminal_failure(&self) {
+        self.terminal_failure.store(true, Ordering::Release);
+    }
+
+    fn terminal_failure_requested(&self) -> bool {
+        self.terminal_failure.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -168,10 +286,7 @@ struct CheckpointWriter {
 }
 
 impl CheckpointWriter {
-    async fn append(
-        &self,
-        checkpoint: &CheckpointEnvelope,
-    ) -> Result<CheckpointRecord, JobRepositoryError> {
+    async fn lineage(&self) -> Result<(JobId, String, JobLease, i64), JobRepositoryError> {
         let lease = self.lease.read().await.clone();
         let elapsed = i64::try_from(self.started.elapsed().as_secs())
             .map_err(|_| JobRepositoryError::QueueInvariant)?;
@@ -179,16 +294,27 @@ impl CheckpointWriter {
             .initial_now
             .checked_add(elapsed)
             .ok_or(JobRepositoryError::QueueInvariant)?;
-        let record = JobRepository::new(&self.database)
-            .append_checkpoint(
-                &self.job_id,
-                &self.attempt_id,
-                &lease,
-                checkpoint,
-                created_at,
-            )
-            .await?;
+        Ok((
+            self.job_id.clone(),
+            self.attempt_id.clone(),
+            lease,
+            created_at,
+        ))
+    }
+
+    fn mark_persisted(&self) {
         self.persisted.store(true, Ordering::Release);
+    }
+
+    async fn append(
+        &self,
+        checkpoint: &CheckpointEnvelope,
+    ) -> Result<CheckpointRecord, JobRepositoryError> {
+        let (job_id, attempt_id, lease, created_at) = self.lineage().await?;
+        let record = JobRepository::new(&self.database)
+            .append_checkpoint(&job_id, &attempt_id, &lease, checkpoint, created_at)
+            .await?;
+        self.mark_persisted();
         Ok(record)
     }
 
@@ -416,12 +542,14 @@ impl<'database> JobRuntime<'database> {
         let context = JobExecutionContext {
             job_id: acquired.job.id.clone(),
             kind: acquired.job.kind.clone(),
+            attempt_id: acquired.attempt.id.clone(),
             attempt_number: acquired.attempt.attempt_number,
             worker_id: self.worker_id.clone(),
             lease: current_lease,
             cancellation,
             storage_pressure,
             checkpoint_writer,
+            terminal_failure: Arc::new(AtomicBool::new(false)),
         };
         let outcome = self.execute_acquired(handler, context, now, started).await;
         self.cancellation.release(
@@ -529,6 +657,7 @@ impl<'database> JobRuntime<'database> {
                     &current_lease,
                     completed_at,
                     JobFailureCode::HandlerFailed,
+                    context.terminal_failure_requested(),
                 )
                 .await
             }
@@ -538,6 +667,7 @@ impl<'database> JobRuntime<'database> {
                     &current_lease,
                     completed_at,
                     JobFailureCode::HandlerPanicked,
+                    false,
                 )
                 .await
             }
@@ -550,7 +680,28 @@ impl<'database> JobRuntime<'database> {
         lease: &JobLease,
         now: i64,
         failure: JobFailureCode,
+        terminal: bool,
     ) -> Result<WorkerTurn, JobRuntimeError> {
+        if self.is_production_context(context).await? {
+            self.repository
+                .fail_terminal_production(&context.job_id, lease, now, failure)
+                .await
+                .map_err(JobRuntimeError::Repository)?;
+            return Ok(WorkerTurn::Failed {
+                job_id: context.job_id.clone(),
+                failure,
+            });
+        }
+        if terminal {
+            self.repository
+                .fail_terminal(&context.job_id, lease, now, failure)
+                .await
+                .map_err(JobRuntimeError::Repository)?;
+            return Ok(WorkerTurn::Failed {
+                job_id: context.job_id.clone(),
+                failure,
+            });
+        }
         let retry_at = now
             .checked_add(self.policy.retry_delay_seconds)
             .ok_or(JobRuntimeError::InvalidPolicy)?;
@@ -572,6 +723,48 @@ impl<'database> JobRuntime<'database> {
                 JobRepositoryError::QueueInvariant,
             )),
         }
+    }
+
+    async fn is_production_context(
+        &self,
+        context: &JobExecutionContext,
+    ) -> Result<bool, JobRuntimeError> {
+        if context.kind().as_str() == "PRODUCTION_CRAWL" {
+            return Ok(true);
+        }
+        if !matches!(
+            context.kind().as_str(),
+            "RETRY"
+                | "RETRY_FAILED_PARTS"
+                | "RESUME_CHECKPOINT"
+                | "RERUN_FULL_CRAWL"
+                | "RESTART_FROM_BEGINNING"
+        ) {
+            return Ok(false);
+        }
+        let job = self
+            .repository
+            .job(&context.job_id)
+            .await
+            .map_err(JobRuntimeError::Repository)?;
+        let Some(run_id) = job.crawl_run_id.as_deref() else {
+            return Ok(false);
+        };
+        let Ok(uuid) = uuid::Uuid::parse_str(run_id) else {
+            return Err(JobRuntimeError::Repository(
+                JobRepositoryError::QueueInvariant,
+            ));
+        };
+        let Some(run_id) = erabi_domain::CrawlRunId::from_uuid(uuid) else {
+            return Err(JobRuntimeError::Repository(
+                JobRepositoryError::QueueInvariant,
+            ));
+        };
+        let snapshot = CrawlRunRepository::new(&self.database)
+            .snapshot(run_id)
+            .await
+            .map_err(|_| JobRuntimeError::Repository(JobRepositoryError::QueueInvariant))?;
+        Ok(snapshot.run_type() == erabi_domain::CrawlRunType::ProductionRun)
     }
 }
 

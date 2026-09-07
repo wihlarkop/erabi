@@ -47,6 +47,7 @@ typed_uuid_id!(CollectionId);
 typed_uuid_id!(RunProfileId);
 typed_uuid_id!(TestEvidenceId);
 typed_uuid_id!(CrawlRunId);
+typed_uuid_id!(CrawlExecutionId);
 typed_uuid_id!(ArtifactId);
 typed_uuid_id!(CanonicalizationPolicyId);
 typed_uuid_id!(DomainScopeId);

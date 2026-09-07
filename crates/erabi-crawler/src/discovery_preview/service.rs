@@ -36,7 +36,7 @@ use erabi_domain::{
     DiscoveryPreviewSeed, DiscoveryPreviewSummary, DiscoveryTransition, DiscoveryTransitionId,
     DomainScopeEvidence, MAX_PREVIEW_DIAGNOSTICS, MAX_PREVIEW_LINKS_PER_OBSERVATION,
     MAX_PREVIEW_PROVENANCE_EDGES, MAX_PREVIEW_SELECTED_SEEDS, MAX_PREVIEW_URL_CHARS, PageType,
-    PageTypeMatchEvidence, PageTypeMatchStatus, PreviewBudgetHit, PreviewBudgetKind,
+    PageTypeId, PageTypeMatchEvidence, PageTypeMatchStatus, PreviewBudgetHit, PreviewBudgetKind,
     PreviewDiagnostic, PreviewGrowthIndicators, PreviewGrowthWarning, PreviewGrowthWarningCode,
     PreviewPageTypeDistribution, PreviewQueryVariantGroup, PreviewTransitionCount,
     PreviewTransitionEvaluation, PreviewUrlState, Seed, SeedId, TestDiagnostic, TransitionGraph,
@@ -44,8 +44,9 @@ use erabi_domain::{
 };
 
 use super::{
-    DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider, DiscoveryPreviewProviderError,
-    DiscoveryPreviewProviderOutcome, MonotonicPreviewClock, PreviewClock,
+    DiscoveryPreviewInterruption, DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider,
+    DiscoveryPreviewProviderError, DiscoveryPreviewProviderOutcome, MonotonicPreviewClock,
+    PreviewClock,
 };
 use crate::observation::{ObservedLink, PageObservation};
 
@@ -179,7 +180,7 @@ impl DiscoveryPreviewService {
             .map_err(map_crawler_error)?;
         let context = PreviewContext::new(&snapshot, request.limits.clone())?;
         let selected_seeds = select_seeds(&context, &request.seed_ids)?;
-        let mut run = PreviewRun::new(
+        let mut run = SemanticTraversal::new(
             context,
             request.seed_ids,
             provider,
@@ -201,11 +202,10 @@ struct PreviewContext {
 }
 
 impl PreviewContext {
-    fn new(
-        evaluation: &CrawlerEvaluationSnapshot,
-        limits: DiscoveryPreviewLimits,
+    fn from_snapshot(
+        snapshot: CrawlerSemanticSnapshot,
+        limits: erabi_domain::EffectiveDiscoveryPreviewLimits,
     ) -> Result<Self, DiscoveryPreviewError> {
-        let snapshot = evaluation.draft.clone();
         snapshot
             .version
             .validate_semantic_contract()
@@ -248,6 +248,25 @@ impl PreviewContext {
         }
         let graph = TransitionGraph::new(snapshot.version.page_type_ids(), transitions.clone())
             .map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+        Ok(Self {
+            snapshot,
+            page_types,
+            transitions,
+            graph,
+            limits,
+        })
+    }
+
+    fn new(
+        evaluation: &CrawlerEvaluationSnapshot,
+        limits: DiscoveryPreviewLimits,
+    ) -> Result<Self, DiscoveryPreviewError> {
+        let snapshot = evaluation.draft.clone();
+        let transitions = snapshot
+            .transitions
+            .iter()
+            .map(|record| record.transition.clone())
+            .collect::<Vec<_>>();
         let semantic_duration_ms = snapshot
             .version
             .guardrails()
@@ -304,13 +323,7 @@ impl PreviewContext {
             max_downloaded_bytes: snapshot.version.guardrails().max_downloaded_bytes,
             transition_total_limits,
         };
-        Ok(Self {
-            snapshot,
-            page_types,
-            transitions,
-            graph,
-            limits: effective,
-        })
+        Self::from_snapshot(snapshot, effective)
     }
 
     fn transition_total_limit(&self, id: DiscoveryTransitionId) -> Option<u64> {
@@ -370,7 +383,96 @@ struct QueueEntry {
     /// Present only for a discovery-admitted target. Roots are already at
     /// depth zero and therefore never need a duplicate depth reduction.
     target_page_type_id: Option<erabi_domain::PageTypeId>,
+    /// The exact admission which placed this unit in the frontier.  This is
+    /// deliberately queue state rather than something reconstructed from the
+    /// current graph when a durable checkpoint is restored.
+    transition_id: Option<DiscoveryTransitionId>,
+    parent_canonical_url: Option<String>,
+    pagination: bool,
     order: usize,
+}
+
+/// One admitted queue item exported at a durable safe boundary. This is a
+/// semantic scheduling identity, not a provider request/response DTO.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SemanticTraversalQueueEntry {
+    pub requested_url: String,
+    pub canonical_url: String,
+    pub depth: u32,
+    pub seed_ids: Vec<SeedId>,
+    pub target_page_type_id: Option<erabi_domain::PageTypeId>,
+    pub transition_id: Option<DiscoveryTransitionId>,
+    pub parent_canonical_url: Option<String>,
+    pub pagination: bool,
+    /// This is attached from the authoritative durable discovery record when
+    /// Production writes its checkpoint.  Preview leaves it absent.
+    pub discovered_url_id: Option<String>,
+    pub order: u64,
+}
+
+/// Durable transition-budget state needed to continue the same traversal.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SemanticTraversalTransitionState {
+    pub transition_id: DiscoveryTransitionId,
+    pub name: String,
+    pub eligible_edges: u64,
+    pub source_pages: Vec<String>,
+}
+
+/// Provider-neutral traversal state that can be carried by a Plan 04
+/// checkpoint. All collections are exported in sorted semantic order.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SemanticTraversalCheckpoint {
+    pub selected_seed_ids: Vec<SeedId>,
+    pub pending: Vec<SemanticTraversalQueueEntry>,
+    pub admitted_canonical_urls: Vec<String>,
+    pub seen_canonical_urls: Vec<String>,
+    pub sampled_canonical_urls: Vec<String>,
+    pub expanded_canonical_urls: Vec<String>,
+    pub matching_canonical_urls: Vec<String>,
+    pub unmatched_canonical_urls: Vec<String>,
+    pub ambiguous_canonical_urls: Vec<String>,
+    pub in_scope_canonical_urls: Vec<String>,
+    pub consumed_bytes: u64,
+    pub pages_sampled: u64,
+    pub urls_discovered: u64,
+    pub duplicates_prevented: u64,
+    pub robots_excluded: u64,
+    pub provider_errors: u64,
+    pub external_urls: u64,
+    pub blocked_urls: u64,
+    pub newly_enqueued_urls: u64,
+    pub peak_new_from_page: u64,
+    pub time_budget_hit: bool,
+    pub pagination_truncation_count: u64,
+    pub duration_work_not_expanded: bool,
+    pub page_type_sampled: Vec<(PageTypeId, u64)>,
+    pub page_type_discovered: Vec<(PageTypeId, u64)>,
+    pub page_type_scheduled: Vec<(PageTypeId, u64)>,
+    pub transition_counts: Vec<SemanticTraversalTransitionState>,
+    pub transition_page_counts: Vec<(DiscoveryTransitionId, String, u32)>,
+    pub elapsed_millis: u64,
+}
+
+impl SemanticTraversalCheckpoint {
+    #[must_use]
+    pub fn empty(selected_seed_ids: Vec<SeedId>) -> Self {
+        Self {
+            selected_seed_ids,
+            ..Self::default()
+        }
+    }
+}
+
+/// The result of one bounded semantic work-unit boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SemanticTraversalStep {
+    Processed {
+        pages: Vec<erabi_domain::DiscoveryPreviewPage>,
+        discovery_paths: Vec<DiscoveryPath>,
+    },
+    Complete,
+    Interrupted(DiscoveryPreviewInterruption),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -397,7 +499,11 @@ struct ObservedSource<'a> {
     canonical: &'a str,
 }
 
-struct PreviewRun {
+/// Provider-neutral Plan 05 traversal state shared by Discovery Preview and
+/// Production. Its interface accepts only a coherent semantic snapshot,
+/// selected Seed identities, bounded limits, and observed pages; all URL
+/// admission decisions remain here rather than in a caller-specific engine.
+pub struct SemanticTraversal {
     context: PreviewContext,
     selected_seed_ids: Vec<SeedId>,
     provider: Arc<dyn DiscoveryPreviewProvider>,
@@ -434,6 +540,14 @@ struct PreviewRun {
     newly_enqueued_urls: u64,
     peak_new_from_page: u64,
     time_budget_hit: bool,
+    pagination_truncation_count: u64,
+    duration_work_not_expanded: bool,
+}
+
+#[derive(Clone)]
+struct TraversalObservedLink {
+    link: ObservedLink,
+    is_pagination: bool,
 }
 
 #[derive(Default)]
@@ -444,7 +558,7 @@ struct TransitionRuntimeCount {
     source_pages: BTreeSet<String>,
 }
 
-impl PreviewRun {
+impl SemanticTraversal {
     fn new(
         context: PreviewContext,
         selected_seed_ids: Vec<SeedId>,
@@ -503,7 +617,591 @@ impl PreviewRun {
             newly_enqueued_urls: 0,
             peak_new_from_page: 0,
             time_budget_hit: false,
+            pagination_truncation_count: 0,
+            duration_work_not_expanded: false,
         }
+    }
+
+    fn restore_state(
+        &mut self,
+        state: SemanticTraversalCheckpoint,
+        selected_seeds: &[Seed],
+    ) -> Result<(), DiscoveryPreviewError> {
+        let selected = self
+            .selected_seed_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        if selected.len() != self.selected_seed_ids.len()
+            || state.selected_seed_ids != self.selected_seed_ids
+        {
+            return Err(DiscoveryPreviewError::PersistedStateInvalid);
+        }
+
+        let known_page_types = self
+            .context
+            .page_types
+            .iter()
+            .map(|page_type| page_type.id.to_string())
+            .collect::<BTreeSet<_>>();
+        let known_transitions = self
+            .context
+            .transitions
+            .iter()
+            .map(|transition| transition.id.to_string())
+            .collect::<BTreeSet<_>>();
+        let context_transitions = self.context.transitions.clone();
+        let validate_url = |value: &str| {
+            let parsed =
+                url::Url::parse(value).map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+            if parsed.fragment().is_some() || value.len() > MAX_PREVIEW_URL_CHARS {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+            Ok(())
+        };
+        let collect_urls = |values: Vec<String>| {
+            let mut output = BTreeSet::new();
+            for value in values {
+                validate_url(&value)?;
+                if !output.insert(value) {
+                    return Err(DiscoveryPreviewError::PersistedStateInvalid);
+                }
+            }
+            Ok(output)
+        };
+
+        let admitted = collect_urls(state.admitted_canonical_urls)?;
+        let seen = collect_urls(state.seen_canonical_urls)?;
+        let sampled = collect_urls(state.sampled_canonical_urls)?;
+        let expanded = collect_urls(state.expanded_canonical_urls)?;
+        let matching = collect_urls(state.matching_canonical_urls)?;
+        let unmatched = collect_urls(state.unmatched_canonical_urls)?;
+        let ambiguous = collect_urls(state.ambiguous_canonical_urls)?;
+        let in_scope = collect_urls(state.in_scope_canonical_urls)?;
+        if !admitted.is_subset(&seen)
+            || !sampled.is_subset(&seen)
+            || !expanded.is_subset(&sampled)
+            || !matching.is_subset(&in_scope)
+            || !unmatched.is_subset(&in_scope)
+            || !ambiguous.is_subset(&in_scope)
+            || !matching.is_disjoint(&unmatched)
+            || !matching.is_disjoint(&ambiguous)
+            || !unmatched.is_disjoint(&ambiguous)
+        {
+            return Err(DiscoveryPreviewError::PersistedStateInvalid);
+        }
+        let admitted_count = u64::try_from(admitted.len())
+            .map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+        let sampled_count = u64::try_from(sampled.len())
+            .map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+        if admitted_count > self.context.limits.max_pages
+            || state.consumed_bytes > self.context.limits.max_downloaded_bytes
+            || state.pages_sampled != sampled_count
+            || state.newly_enqueued_urls != admitted_count
+        {
+            return Err(DiscoveryPreviewError::PersistedStateInvalid);
+        }
+
+        let mut pending = BTreeMap::new();
+        for entry in state.pending {
+            validate_url(&entry.requested_url)?;
+            validate_url(&entry.canonical_url)?;
+            let entry_seed_ids = entry
+                .seed_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>();
+            if entry.requested_url.contains('#') || entry.canonical_url.contains('#') {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+            if entry.seed_ids.is_empty()
+                || entry_seed_ids.len() != entry.seed_ids.len()
+                || entry.depth > self.context.limits.max_depth
+                || entry
+                    .seed_ids
+                    .iter()
+                    .any(|id| !selected.contains(&id.to_string()))
+                || !admitted.contains(&entry.canonical_url)
+                || sampled.contains(&entry.canonical_url)
+                || expanded.contains(&entry.canonical_url)
+            {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+            if entry
+                .target_page_type_id
+                .is_some_and(|id| !known_page_types.contains(&id.to_string()))
+                || entry
+                    .transition_id
+                    .is_some_and(|id| !known_transitions.contains(&id.to_string()))
+                || entry
+                    .parent_canonical_url
+                    .as_deref()
+                    .is_some_and(|value| validate_url(value).is_err())
+                || entry
+                    .discovered_url_id
+                    .as_deref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 512)
+            {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+            let order = usize::try_from(entry.order)
+                .map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+            let queue_entry = QueueEntry {
+                requested_url: entry.requested_url,
+                canonical_url: entry.canonical_url.clone(),
+                depth: entry.depth,
+                seed_ids: entry.seed_ids,
+                target_page_type_id: entry.target_page_type_id,
+                transition_id: entry.transition_id,
+                parent_canonical_url: entry.parent_canonical_url,
+                pagination: entry.pagination,
+                order,
+            };
+            if pending.insert(entry.canonical_url, queue_entry).is_some() {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+        }
+
+        let restore_page_type_counts =
+            |values: Vec<(PageTypeId, u64)>| -> Result<BTreeMap<String, u64>, DiscoveryPreviewError> {
+                let mut output = BTreeMap::new();
+                for (id, value) in values {
+                    if !known_page_types.contains(&id.to_string())
+                        || output.insert(id.to_string(), value).is_some()
+                    {
+                        return Err(DiscoveryPreviewError::PersistedStateInvalid);
+                    }
+                }
+                Ok(output)
+            };
+        let restore_transition_counts = |values: Vec<SemanticTraversalTransitionState>| {
+            let mut output = BTreeMap::new();
+            for value in values {
+                let Some(transition) = context_transitions
+                    .iter()
+                    .find(|candidate| candidate.id == value.transition_id)
+                else {
+                    return Err(DiscoveryPreviewError::PersistedStateInvalid);
+                };
+                if transition.name != value.name
+                    || output
+                        .insert(
+                            value.transition_id.to_string(),
+                            TransitionRuntimeCount {
+                                transition_id: value.transition_id,
+                                name: value.name,
+                                eligible_edges: value.eligible_edges,
+                                source_pages: value.source_pages.into_iter().collect(),
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(DiscoveryPreviewError::PersistedStateInvalid);
+                }
+            }
+            if output.len() != context_transitions.len() {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+            Ok(output)
+        };
+        let mut transition_page_counts = BTreeMap::new();
+        for (transition_id, source, count) in state.transition_page_counts {
+            validate_url(&source)?;
+            if !known_transitions.contains(&transition_id.to_string())
+                || transition_page_counts
+                    .insert((transition_id.to_string(), source), count)
+                    .is_some()
+            {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+        }
+
+        self.queue.clear();
+        self.queued = pending;
+        self.rebuild_queue();
+        self.admitted = admitted;
+        self.seen = seen;
+        self.sampled = sampled;
+        self.expanded = expanded;
+        self.matching_urls = matching;
+        self.unmatched_urls = unmatched;
+        self.ambiguous_urls = ambiguous;
+        self.in_scope_urls = in_scope;
+        self.consumed_bytes = state.consumed_bytes;
+        self.pages_sampled = state.pages_sampled;
+        self.urls_discovered = state.urls_discovered;
+        self.duplicates_prevented = state.duplicates_prevented;
+        self.robots_excluded = state.robots_excluded;
+        self.provider_errors = state.provider_errors;
+        self.external_urls = state.external_urls;
+        self.blocked_urls = state.blocked_urls;
+        self.newly_enqueued_urls = state.newly_enqueued_urls;
+        self.peak_new_from_page = state.peak_new_from_page;
+        self.time_budget_hit = state.time_budget_hit;
+        self.pagination_truncation_count = state.pagination_truncation_count;
+        self.duration_work_not_expanded = state.duration_work_not_expanded;
+        self.page_type_sampled = restore_page_type_counts(state.page_type_sampled)?;
+        self.page_type_discovered = restore_page_type_counts(state.page_type_discovered)?;
+        self.page_type_scheduled = restore_page_type_counts(state.page_type_scheduled)?;
+        self.transition_counts = restore_transition_counts(state.transition_counts)?;
+        self.transition_page_counts = transition_page_counts;
+
+        self.seeds = selected_seeds
+            .iter()
+            .map(|seed| DiscoveryPreviewSeed {
+                seed_id: seed.id,
+                requested_url: seed.original_url.to_string(),
+                canonical_url: seed.canonical_url.to_string(),
+                entry_page_type_hint: seed.entry_page_type_hint,
+                state: PreviewUrlState::InScopeMatched,
+                duplicate_of_canonical_url: None,
+                scope: None,
+                page_type_match: None,
+                budget_hits: Vec::new(),
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Builds the shared traversal from an immutable Published snapshot. The
+    /// caller supplies its own operational limits but cannot replace any
+    /// canonicalization, scope, matching, transition, or budget semantics.
+    ///
+    /// # Errors
+    /// Returns the same typed semantic/snapshot error used by Preview when
+    /// the frozen version or selected Seeds are inconsistent.
+    pub fn for_frozen_snapshot(
+        snapshot: CrawlerSemanticSnapshot,
+        selected_seed_ids: Vec<SeedId>,
+        limits: erabi_domain::EffectiveDiscoveryPreviewLimits,
+        provider: Arc<dyn DiscoveryPreviewProvider>,
+        clock: Arc<dyn PreviewClock>,
+    ) -> Result<Self, DiscoveryPreviewError> {
+        let context = PreviewContext::from_snapshot(snapshot, limits)?;
+        let selected_seeds = select_seeds(&context, &selected_seed_ids)?;
+        let mut traversal = Self::new(
+            context,
+            selected_seed_ids,
+            provider,
+            clock.clone(),
+            clock.now_millis(),
+        );
+        traversal.admit_roots(&selected_seeds)?;
+        Ok(traversal)
+    }
+
+    /// Restores a bounded traversal from semantic state already admitted by a
+    /// previous run. Roots are deliberately not re-admitted and no current
+    /// Draft/configuration is consulted.
+    ///
+    /// # Errors
+    /// Returns a persisted-state error when the state does not belong to the
+    /// selected frozen version or cannot satisfy the traversal invariants.
+    pub fn restore_from_checkpoint(
+        snapshot: CrawlerSemanticSnapshot,
+        selected_seed_ids: Vec<SeedId>,
+        limits: erabi_domain::EffectiveDiscoveryPreviewLimits,
+        provider: Arc<dyn DiscoveryPreviewProvider>,
+        clock: Arc<dyn PreviewClock>,
+        state: SemanticTraversalCheckpoint,
+    ) -> Result<Self, DiscoveryPreviewError> {
+        let context = PreviewContext::from_snapshot(snapshot, limits)?;
+        let selected_seeds = select_seeds(&context, &selected_seed_ids)?;
+        if state.selected_seed_ids != selected_seed_ids {
+            return Err(DiscoveryPreviewError::PersistedStateInvalid);
+        }
+        let mut traversal = Self::new(
+            context,
+            selected_seed_ids,
+            provider,
+            clock.clone(),
+            clock.now_millis().saturating_sub(state.elapsed_millis),
+        );
+        traversal.restore_state(state, &selected_seeds)?;
+        Ok(traversal)
+    }
+
+    /// Restores a checkpoint and explicitly admits only the units selected by
+    /// a Plan 04 recovery action. The method reuses the same queue and
+    /// semantic state restoration as resume; it does not rediscover roots or
+    /// scan durable rows for candidates.
+    ///
+    /// # Errors
+    /// Returns a typed persisted-state error when the checkpoint or selected
+    /// recovery entries cannot be restored safely.
+    pub fn restore_for_recovery(
+        snapshot: CrawlerSemanticSnapshot,
+        selected_seed_ids: Vec<SeedId>,
+        limits: erabi_domain::EffectiveDiscoveryPreviewLimits,
+        provider: Arc<dyn DiscoveryPreviewProvider>,
+        clock: Arc<dyn PreviewClock>,
+        state: SemanticTraversalCheckpoint,
+        recovery_entries: Vec<SemanticTraversalQueueEntry>,
+    ) -> Result<Self, DiscoveryPreviewError> {
+        let mut traversal = Self::restore_from_checkpoint(
+            snapshot,
+            selected_seed_ids,
+            limits,
+            provider,
+            clock,
+            state,
+        )?;
+        // Recovery is an explicit selection of work units. Do not leave the
+        // ordinary pending frontier in the queue, otherwise a bounded action
+        // would silently become a full resume.
+        traversal.queued.clear();
+        traversal.rebuild_queue();
+        let known_page_types = traversal
+            .context
+            .page_types
+            .iter()
+            .map(|page_type| page_type.id.to_string())
+            .collect::<BTreeSet<_>>();
+        for entry in recovery_entries {
+            let valid_url = |value: &str| {
+                url::Url::parse(value).is_ok()
+                    && !value.contains('#')
+                    && !value.chars().any(char::is_control)
+                    && value.len() <= MAX_PREVIEW_URL_CHARS
+            };
+            if !valid_url(&entry.requested_url)
+                || !valid_url(&entry.canonical_url)
+                || entry.depth > traversal.context.limits.max_depth
+                || !traversal.admitted.contains(&entry.canonical_url)
+                || traversal.queued.contains_key(&entry.canonical_url)
+                || entry.seed_ids.is_empty()
+                || entry
+                    .seed_ids
+                    .iter()
+                    .any(|id| !traversal.selected_seed_ids.contains(id))
+                || entry
+                    .target_page_type_id
+                    .is_some_and(|id| !known_page_types.contains(&id.to_string()))
+                || entry.transition_id.is_some_and(|id| {
+                    !traversal
+                        .context
+                        .transitions
+                        .iter()
+                        .any(|transition| transition.id == id)
+                })
+                || entry
+                    .parent_canonical_url
+                    .as_deref()
+                    .is_some_and(|value| !valid_url(value))
+                || entry
+                    .discovered_url_id
+                    .as_deref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 512)
+            {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
+            }
+            let order = usize::try_from(entry.order)
+                .map_err(|_| DiscoveryPreviewError::PersistedStateInvalid)?;
+            traversal.queued.insert(
+                entry.canonical_url.clone(),
+                QueueEntry {
+                    requested_url: entry.requested_url,
+                    canonical_url: entry.canonical_url,
+                    depth: entry.depth,
+                    seed_ids: entry.seed_ids,
+                    target_page_type_id: entry.target_page_type_id,
+                    transition_id: entry.transition_id,
+                    parent_canonical_url: entry.parent_canonical_url,
+                    pagination: entry.pagination,
+                    order,
+                },
+            );
+        }
+        traversal.rebuild_queue();
+        Ok(traversal)
+    }
+
+    /// Returns the currently admitted pending frontier in deterministic
+    /// queue order without exposing provider state.
+    #[must_use]
+    pub fn checkpoint_state(&self) -> SemanticTraversalCheckpoint {
+        let mut pending = self
+            .queued
+            .values()
+            .map(|entry| SemanticTraversalQueueEntry {
+                requested_url: entry.requested_url.clone(),
+                canonical_url: entry.canonical_url.clone(),
+                depth: entry.depth,
+                seed_ids: entry.seed_ids.clone(),
+                target_page_type_id: entry.target_page_type_id,
+                transition_id: entry.transition_id,
+                parent_canonical_url: entry.parent_canonical_url.clone(),
+                pagination: entry.pagination,
+                discovered_url_id: None,
+                order: u64::try_from(entry.order).unwrap_or(u64::MAX),
+            })
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then(left.order.cmp(&right.order))
+                .then(left.canonical_url.cmp(&right.canonical_url))
+                .then(left.requested_url.cmp(&right.requested_url))
+        });
+        let page_type_values = |values: &BTreeMap<String, u64>| {
+            self.context
+                .page_types
+                .iter()
+                .filter_map(|page_type| {
+                    values
+                        .get(&page_type.id.to_string())
+                        .map(|value| (page_type.id, *value))
+                })
+                .collect::<Vec<_>>()
+        };
+        let transition_counts = self
+            .transition_counts
+            .values()
+            .map(|value| {
+                let mut source_pages = value.source_pages.iter().cloned().collect::<Vec<_>>();
+                source_pages.sort();
+                SemanticTraversalTransitionState {
+                    transition_id: value.transition_id,
+                    name: value.name.clone(),
+                    eligible_edges: value.eligible_edges,
+                    source_pages,
+                }
+            })
+            .collect::<Vec<_>>();
+        let transition_page_counts = self
+            .transition_page_counts
+            .iter()
+            .filter_map(|((transition_id, source), count)| {
+                self.context
+                    .transitions
+                    .iter()
+                    .find(|transition| transition.id.to_string() == *transition_id)
+                    .map(|transition| (transition.id, source.clone(), *count))
+            })
+            .collect::<Vec<_>>();
+        SemanticTraversalCheckpoint {
+            selected_seed_ids: self.selected_seed_ids.clone(),
+            pending,
+            admitted_canonical_urls: self.admitted.iter().cloned().collect(),
+            seen_canonical_urls: self.seen.iter().cloned().collect(),
+            sampled_canonical_urls: self.sampled.iter().cloned().collect(),
+            expanded_canonical_urls: self.expanded.iter().cloned().collect(),
+            matching_canonical_urls: self.matching_urls.iter().cloned().collect(),
+            unmatched_canonical_urls: self.unmatched_urls.iter().cloned().collect(),
+            ambiguous_canonical_urls: self.ambiguous_urls.iter().cloned().collect(),
+            in_scope_canonical_urls: self.in_scope_urls.iter().cloned().collect(),
+            consumed_bytes: self.consumed_bytes,
+            pages_sampled: self.pages_sampled,
+            urls_discovered: self.urls_discovered,
+            duplicates_prevented: self.duplicates_prevented,
+            robots_excluded: self.robots_excluded,
+            provider_errors: self.provider_errors,
+            external_urls: self.external_urls,
+            blocked_urls: self.blocked_urls,
+            newly_enqueued_urls: self.newly_enqueued_urls,
+            peak_new_from_page: self.peak_new_from_page,
+            time_budget_hit: self.time_budget_hit,
+            pagination_truncation_count: self.pagination_truncation_count,
+            duration_work_not_expanded: self.duration_work_not_expanded,
+            page_type_sampled: page_type_values(&self.page_type_sampled),
+            page_type_discovered: page_type_values(&self.page_type_discovered),
+            page_type_scheduled: page_type_values(&self.page_type_scheduled),
+            transition_counts,
+            transition_page_counts,
+            elapsed_millis: self.elapsed_millis(),
+        }
+    }
+
+    /// Returns the immutable selected-root evidence currently held by the
+    /// traversal. Production persists this before provider work begins.
+    #[must_use]
+    pub fn seed_evidence(&self) -> Vec<DiscoveryPreviewSeed> {
+        self.seeds.clone()
+    }
+
+    /// Returns whether admitted work remains in the frontier.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Returns the current logical identity about to be observed. Jobs use
+    /// this only to capture the durable generation before provider IO; it does
+    /// not perform any semantic selection.
+    #[must_use]
+    pub fn next_pending_canonical_url(&self) -> Option<&str> {
+        self.queue.front().map(|entry| entry.canonical_url.as_str())
+    }
+
+    /// Processes one semantic work unit. The caller owns persistence after the
+    /// returned boundary and may then checkpoint the exported state.
+    ///
+    /// # Errors
+    /// Returns a provider-contract or semantic error. An interruption restores
+    /// the current queue entry before returning.
+    pub async fn step(&mut self) -> Result<SemanticTraversalStep, DiscoveryPreviewError> {
+        if self.queue.is_empty() {
+            return Ok(SemanticTraversalStep::Complete);
+        }
+        if self.elapsed_millis() >= self.context.limits.max_duration_ms {
+            self.hit_time_budget();
+            return Ok(SemanticTraversalStep::Complete);
+        }
+        if self.consumed_bytes >= self.context.limits.max_downloaded_bytes {
+            self.record_budget(PreviewBudgetHit {
+                kind: PreviewBudgetKind::MaxDownloadedBytes,
+                transition_id: None,
+                page_type_id: None,
+                observed: self.consumed_bytes,
+                limit: self.context.limits.max_downloaded_bytes,
+            });
+            return Ok(SemanticTraversalStep::Complete);
+        }
+        let entry = self
+            .queue
+            .pop_front()
+            .ok_or(DiscoveryPreviewError::PersistedStateInvalid)?;
+        self.queued.remove(&entry.canonical_url);
+        let remaining = self
+            .context
+            .limits
+            .max_downloaded_bytes
+            .checked_sub(self.consumed_bytes)
+            .ok_or(DiscoveryPreviewError::BudgetOverflow)?;
+        let outcome = self
+            .provider
+            .observe(DiscoveryPreviewObservationRequest {
+                requested_url: entry.requested_url.clone(),
+                remaining_download_bytes: remaining,
+            })
+            .await
+            .map_err(map_provider_error)?;
+        if let DiscoveryPreviewProviderOutcome::Interrupted { reason } = outcome {
+            self.queued.insert(entry.canonical_url.clone(), entry);
+            self.rebuild_queue();
+            return Ok(SemanticTraversalStep::Interrupted(reason));
+        }
+        if self.elapsed_millis() >= self.context.limits.max_duration_ms {
+            self.hit_time_budget();
+        }
+        let page_count = self.pages.len();
+        let path_count = self.paths.len();
+        self.process_outcome(entry, outcome)?;
+        Ok(SemanticTraversalStep::Processed {
+            pages: self.pages[page_count..].to_vec(),
+            discovery_paths: self.paths[path_count..].to_vec(),
+        })
+    }
+
+    /// Runs this bounded semantic traversal to completion and returns the
+    /// common decision/provenance report consumed by Preview and Production.
+    ///
+    /// # Errors
+    /// Returns a stable provider-contract, semantic snapshot, or arithmetic
+    /// error; ordinary page-local failures stay in the returned report.
+    pub async fn execute(mut self) -> Result<DiscoveryPreviewResult, DiscoveryPreviewError> {
+        self.traverse().await?;
+        Ok(self.finish())
     }
 
     fn admit_roots(&mut self, seeds: &[Seed]) -> Result<(), DiscoveryPreviewError> {
@@ -556,11 +1254,14 @@ impl PreviewRun {
                     self.queued.insert(
                         canonical_url.clone(),
                         QueueEntry {
-                            requested_url: seed.original_url.to_string(),
+                            requested_url: fragment_free_url(&seed.original_url),
                             canonical_url: canonical_url.clone(),
                             depth: 0,
                             seed_ids: vec![seed.id],
                             target_page_type_id: None,
+                            transition_id: None,
+                            parent_canonical_url: None,
+                            pagination: false,
                             order,
                         },
                     );
@@ -603,50 +1304,16 @@ impl PreviewRun {
                 depth: entry.depth,
                 seed_ids: entry.seed_ids.clone(),
                 target_page_type_id: entry.target_page_type_id,
+                transition_id: entry.transition_id,
+                parent_canonical_url: entry.parent_canonical_url.clone(),
+                pagination: entry.pagination,
                 order: entry.order,
             })
             .collect();
     }
 
     async fn traverse(&mut self) -> Result<(), DiscoveryPreviewError> {
-        while !self.queue.is_empty() {
-            if self.elapsed_millis() >= self.context.limits.max_duration_ms {
-                self.hit_time_budget();
-                break;
-            }
-            if self.consumed_bytes >= self.context.limits.max_downloaded_bytes {
-                self.record_budget(PreviewBudgetHit {
-                    kind: PreviewBudgetKind::MaxDownloadedBytes,
-                    transition_id: None,
-                    page_type_id: None,
-                    observed: self.consumed_bytes,
-                    limit: self.context.limits.max_downloaded_bytes,
-                });
-                break;
-            }
-            let Some(entry) = self.queue.pop_front() else {
-                break;
-            };
-            self.queued.remove(&entry.canonical_url);
-            let remaining = self
-                .context
-                .limits
-                .max_downloaded_bytes
-                .checked_sub(self.consumed_bytes)
-                .ok_or(DiscoveryPreviewError::BudgetOverflow)?;
-            let outcome = self
-                .provider
-                .observe(DiscoveryPreviewObservationRequest {
-                    requested_url: entry.requested_url.clone(),
-                    remaining_download_bytes: remaining,
-                })
-                .await
-                .map_err(map_provider_error)?;
-            if self.elapsed_millis() >= self.context.limits.max_duration_ms {
-                self.hit_time_budget();
-            }
-            self.process_outcome(entry, outcome)?;
-        }
+        while let SemanticTraversalStep::Processed { .. } = self.step().await? {}
         Ok(())
     }
 
@@ -671,6 +1338,7 @@ impl PreviewRun {
                     &[],
                 );
                 self.pages.push(erabi_domain::DiscoveryPreviewPage {
+                    requested_canonical_url: entry.canonical_url.clone(),
                     requested_url: entry.requested_url,
                     final_url: None,
                     canonical_url: Some(entry.canonical_url),
@@ -700,6 +1368,7 @@ impl PreviewRun {
                     &[],
                 );
                 self.pages.push(erabi_domain::DiscoveryPreviewPage {
+                    requested_canonical_url: entry.canonical_url.clone(),
                     requested_url: entry.requested_url,
                     final_url: None,
                     canonical_url: Some(entry.canonical_url),
@@ -713,6 +1382,9 @@ impl PreviewRun {
                     diagnostic: Some(diagnostic),
                     budget_hits: Vec::new(),
                 });
+            }
+            DiscoveryPreviewProviderOutcome::Interrupted { .. } => {
+                return Err(DiscoveryPreviewError::PersistedStateInvalid);
             }
             DiscoveryPreviewProviderOutcome::Observed {
                 observation,
@@ -763,10 +1435,41 @@ impl PreviewRun {
         let final_url_string = observation.final_url.clone();
         let canonical_url = final_canonical.canonical_url.to_string();
         let final_was_seen = !self.seen.insert(canonical_url.clone());
+        let final_was_sampled = self.sampled.contains(&canonical_url);
         if final_was_seen && canonical_url != entry.canonical_url {
             self.duplicates_prevented = self.duplicates_prevented.saturating_add(1);
         }
         if canonical_url != entry.canonical_url {
+            // A redirect changes the current logical scheduling identity. Keep
+            // the alias in `seen` for historical dedupe, but move the admitted
+            // identity to the authoritative final canonical URL. If that
+            // final identity was already admitted (for example by an
+            // independently authored Seed), collapse the two admissions to
+            // one current work unit.
+            if self.admitted.remove(&entry.canonical_url) {
+                let final_was_already_admitted = !self.admitted.insert(canonical_url.clone());
+                if final_was_already_admitted {
+                    self.newly_enqueued_urls = self.newly_enqueued_urls.saturating_sub(1);
+                    if let Some(page_type_id) = entry.target_page_type_id {
+                        let scheduled = self
+                            .page_type_scheduled
+                            .get_mut(&page_type_id.to_string())
+                            .ok_or(DiscoveryPreviewError::PersistedStateInvalid)?;
+                        *scheduled = scheduled
+                            .checked_sub(1)
+                            .ok_or(DiscoveryPreviewError::PersistedStateInvalid)?;
+                    }
+                }
+            }
+            // The alias may have been classified when its href was admitted.
+            // That classification belongs to the historical alias evidence;
+            // the final canonical identity receives the authoritative match
+            // below. Preserve `seen` for alias dedupe, but do not project the
+            // alias as a current PageType identity.
+            self.in_scope_urls.remove(&entry.canonical_url);
+            self.matching_urls.remove(&entry.canonical_url);
+            self.unmatched_urls.remove(&entry.canonical_url);
+            self.ambiguous_urls.remove(&entry.canonical_url);
             self.queued.remove(&canonical_url);
             self.rebuild_queue();
         }
@@ -784,7 +1487,8 @@ impl PreviewRun {
             None
         };
         let mut page_budget_hits = Vec::new();
-        if let Some(page_match) = &page_match
+        if !final_was_sampled
+            && let Some(page_match) = &page_match
             && page_match.decision == PageTypeMatchStatus::Matched
         {
             if let Some(page_type_id) = page_match.winner.as_ref().map(|winner| winner.page_type_id)
@@ -798,8 +1502,10 @@ impl PreviewRun {
                     .or_default() += 1;
             }
         }
-        self.pages_sampled = self.pages_sampled.saturating_add(1);
-        self.sampled.insert(canonical_url.clone());
+        if !final_was_sampled {
+            self.pages_sampled = self.pages_sampled.saturating_add(1);
+            self.sampled.insert(canonical_url.clone());
+        }
         let page_state = match scope.as_ref().map(|item| item.classification) {
             Some(erabi_domain::DomainScopeStatus::External) => PreviewUrlState::External,
             Some(erabi_domain::DomainScopeStatus::Blocked) => PreviewUrlState::Blocked,
@@ -809,7 +1515,9 @@ impl PreviewRun {
                 Some(PageTypeMatchStatus::Matched) => PreviewUrlState::Sampled,
             },
         };
-        self.count_scope(page_state);
+        if !final_was_sampled {
+            self.count_scope(page_state);
+        }
         for seed in &mut self.seeds {
             if entry.seed_ids.contains(&seed.seed_id) {
                 seed.page_type_match.clone_from(&page_match);
@@ -818,6 +1526,7 @@ impl PreviewRun {
             }
         }
         self.pages.push(erabi_domain::DiscoveryPreviewPage {
+            requested_canonical_url: entry.canonical_url.clone(),
             requested_url: entry.requested_url.clone(),
             final_url: final_url_string,
             canonical_url: Some(canonical_url.clone()),
@@ -831,22 +1540,69 @@ impl PreviewRun {
             diagnostic: None,
             budget_hits: page_budget_hits.clone(),
         });
-        if self.elapsed_millis() >= self.context.limits.max_duration_ms {
-            self.hit_time_budget();
-            self.urls_discovered = self
-                .urls_discovered
-                .saturating_add(observation.discovered_links.len() as u64);
-            self.push_diagnostic(PreviewDiagnostic {
-                code: "PREVIEW_TIME_BUDGET_LINKS_NOT_EXPANDED".to_owned(),
-                message: "Links from the completed observation were counted but not expanded after the time cap.".to_owned(),
-                observed: Some(observation.discovered_links.len() as u64),
-                threshold: Some(0),
-            });
-        } else if page_budget_hits.is_empty()
-            && is_in_scope(scope.as_ref())
+        let targetful_pagination_count = observation
+            .pagination_observations
+            .iter()
+            .filter(|pagination| pagination.target_url.is_some())
+            .count();
+        let targetless_pagination_count = observation
+            .pagination_observations
+            .iter()
+            .filter(|pagination| pagination.target_url.is_none())
+            .count();
+        let source_can_expand = is_in_scope(scope.as_ref())
             && page_match
                 .as_ref()
-                .is_some_and(|item| item.decision == PageTypeMatchStatus::Matched)
+                .is_some_and(|item| item.decision == PageTypeMatchStatus::Matched);
+        if source_can_expand && targetless_pagination_count > 0 {
+            self.record_pagination_truncation(
+                targetless_pagination_count as u64,
+                "Observed pagination did not provide a usable target URL.",
+                "PREVIEW_PAGINATION_TARGET_UNAVAILABLE",
+            );
+        }
+        if self.elapsed_millis() >= self.context.limits.max_duration_ms {
+            self.hit_time_budget();
+            // `duration_work_not_expanded` describes one otherwise
+            // unrepresented regular semantic work condition. Targetful
+            // pagination is represented separately by its structural
+            // truncation counter; setting both for that same observation
+            // would make finalization double-count it.
+            let regular_work = !observation.discovered_links.is_empty();
+            if source_can_expand && targetful_pagination_count > 0 {
+                self.record_pagination_truncation(
+                    targetful_pagination_count as u64,
+                    "Observed pagination was not expanded before the duration boundary.",
+                    "PREVIEW_PAGINATION_NOT_EXPANDED",
+                );
+            }
+            self.duration_work_not_expanded = self.duration_work_not_expanded || regular_work;
+            self.urls_discovered = self
+                .urls_discovered
+                .saturating_add(observation.discovered_links.len() as u64)
+                .saturating_add(targetful_pagination_count as u64);
+            if regular_work || targetful_pagination_count > 0 || targetless_pagination_count > 0 {
+                self.push_diagnostic(PreviewDiagnostic {
+                    code: "PREVIEW_TIME_BUDGET_LINKS_NOT_EXPANDED".to_owned(),
+                    message: "Observed links or pagination were not expanded after the duration boundary.".to_owned(),
+                    observed: Some(
+                        observation.discovered_links.len() as u64
+                            + targetful_pagination_count as u64,
+                    ),
+                    threshold: Some(0),
+                });
+            }
+        } else if source_can_expand
+            && targetful_pagination_count > 0
+            && !page_budget_hits.is_empty()
+        {
+            self.record_pagination_truncation(
+                targetful_pagination_count as u64,
+                "Observed pagination was not expanded because the observed page reached a bounded PageType limit.",
+                "PREVIEW_PAGINATION_NOT_EXPANDED",
+            );
+        } else if page_budget_hits.is_empty()
+            && source_can_expand
             && !self.expanded.contains(&canonical_url)
         {
             if let Some(source_match) = page_match.as_ref() {
@@ -881,17 +1637,64 @@ impl PreviewRun {
         let base = source.final_url.unwrap_or(source.requested);
         let base_url =
             url::Url::parse(base).map_err(|_| DiscoveryPreviewError::ProviderObservationInvalid)?;
-        let mut links = observation.discovered_links.clone();
+        let mut links = observation
+            .discovered_links
+            .iter()
+            .cloned()
+            .map(|link| TraversalObservedLink {
+                link,
+                is_pagination: false,
+            })
+            .collect::<Vec<_>>();
+        // Pagination observations are provider evidence for the same bounded
+        // discovery pipeline.  A repeated regular href is coalesced here,
+        // while a pagination-only target receives the identical resolution,
+        // scope, matching, transition, and budget treatment.
+        links.extend(
+            observation
+                .pagination_observations
+                .iter()
+                .filter_map(|pagination| {
+                    pagination
+                        .target_url
+                        .as_ref()
+                        .map(|target_url| TraversalObservedLink {
+                            link: ObservedLink {
+                                raw_href: target_url.clone(),
+                                selector: pagination.selector.clone(),
+                            },
+                            is_pagination: true,
+                        })
+                }),
+        );
         links.sort_by(|left, right| {
-            left.raw_href
-                .cmp(&right.raw_href)
-                .then(left.selector.cmp(&right.selector))
+            left.link
+                .raw_href
+                .cmp(&right.link.raw_href)
+                .then(left.link.selector.cmp(&right.link.selector))
+        });
+        links.dedup_by(|left, right| {
+            if left.link.raw_href == right.link.raw_href
+                && left.link.selector == right.link.selector
+            {
+                left.is_pagination |= right.is_pagination;
+                true
+            } else {
+                false
+            }
         });
         let mut new_from_page = 0_u64;
         let mut provenance_truncated = false;
         for link in links {
             self.urls_discovered = self.urls_discovered.saturating_add(1);
             if self.paths.len() >= MAX_PREVIEW_PROVENANCE_EDGES {
+                if link.is_pagination {
+                    self.record_pagination_truncation(
+                        1,
+                        "Observed pagination exceeded the bounded provenance retention limit.",
+                        "PREVIEW_PAGINATION_NOT_EXPANDED",
+                    );
+                }
                 if !provenance_truncated {
                     self.record_budget(PreviewBudgetHit {
                         kind: PreviewBudgetKind::ProvenanceRetention,
@@ -910,15 +1713,15 @@ impl PreviewRun {
                 }
                 continue;
             }
-            let resolved = base_url.join(&link.raw_href).ok();
+            let resolved = base_url.join(&link.link.raw_href).ok();
             let Some(resolved_url) = resolved else {
                 self.paths
-                    .push(self.invalid_path(entry, source, source_match, &link)?);
+                    .push(self.invalid_path(entry, source, source_match, &link.link)?);
                 continue;
             };
             if resolved_url.to_string().chars().count() > MAX_PREVIEW_URL_CHARS {
                 self.paths
-                    .push(self.invalid_path(entry, source, source_match, &link)?);
+                    .push(self.invalid_path(entry, source, source_match, &link.link)?);
                 continue;
             }
             let canonicalization = self
@@ -930,7 +1733,7 @@ impl PreviewRun {
                 .ok();
             let Some(canonicalization_result) = canonicalization else {
                 self.paths
-                    .push(self.invalid_path(entry, source, source_match, &link)?);
+                    .push(self.invalid_path(entry, source, source_match, &link.link)?);
                 continue;
             };
             let canonical_url = canonicalization_result.canonical_url.to_string();
@@ -952,7 +1755,7 @@ impl PreviewRun {
                     entry,
                     source,
                     source_match,
-                    &link,
+                    &link.link,
                     Some(resolved_url.to_string()),
                     Some(canonical_url),
                     Some(canonicalization_result),
@@ -974,7 +1777,7 @@ impl PreviewRun {
                     let depth = self.queued_duplicate_prospective_depth(
                         entry,
                         source_match,
-                        &link,
+                        &link.link,
                         &canonical_url,
                     )?;
                     self.merge_queued_duplicate_provenance(&canonical_url, &entry.seed_ids, depth);
@@ -984,7 +1787,7 @@ impl PreviewRun {
                     entry,
                     source,
                     source_match,
-                    &link,
+                    &link.link,
                     Some(resolved_url.to_string()),
                     Some(canonical_url.clone()),
                     Some(canonicalization_result),
@@ -1008,7 +1811,7 @@ impl PreviewRun {
             let mut eligible = Vec::new();
             for transition in self.sorted_transitions_for(source_page_type_id) {
                 let selector_eligible =
-                    link.selector.as_deref() == Some(transition.link_selector.as_str());
+                    link.link.selector.as_deref() == Some(transition.link_selector.as_str());
                 let target_page_type_eligible = target_match.decision
                     == PageTypeMatchStatus::Matched
                     && target_match.winner.as_ref().is_some_and(|winner| {
@@ -1083,7 +1886,7 @@ impl PreviewRun {
                     diagnostic,
                 });
             }
-            let state = match target_match.decision {
+            let mut state = match target_match.decision {
                 PageTypeMatchStatus::Ambiguous => PreviewUrlState::AmbiguousPageType,
                 PageTypeMatchStatus::Unmatched => PreviewUrlState::Unmatched,
                 PageTypeMatchStatus::Matched
@@ -1097,28 +1900,26 @@ impl PreviewRun {
                 PageTypeMatchStatus::Matched => PreviewUrlState::InScopeMatched,
             };
             let prospective_depth = eligible.iter().map(|(_, depth)| *depth).min();
-            let mut path = self.path_base(
-                entry,
-                source,
-                source_match,
-                &link,
-                Some(resolved_url.to_string()),
-                Some(canonical_url.clone()),
-                Some(canonicalization_result),
-                scope,
-                state,
-                Some(target_match.clone()),
-                None,
-                evaluations,
-                Vec::new(),
-            )?;
-            path.prospective_depth = prospective_depth;
-            self.paths.push(path);
+            let mut path_budget_hits = evaluations
+                .iter()
+                .flat_map(|evaluation| evaluation.budget_hits.iter().cloned())
+                .collect::<Vec<_>>();
+            let mut admission_allowed = false;
+            let mut admission_depth = None;
+            let mut admission_page_type_id = None;
+            let mut admission_transition_id = None;
             if let Some((_, depth)) = eligible.iter().min_by(|left, right| left.1.cmp(&right.1)) {
                 let target_page_type_id = target_match
                     .winner
                     .as_ref()
                     .map(|winner| winner.page_type_id);
+                admission_depth = Some(*depth);
+                admission_page_type_id = target_page_type_id;
+                admission_transition_id = eligible
+                    .iter()
+                    .filter(|(_, candidate_depth)| candidate_depth == depth)
+                    .map(|(transition, _)| transition.id)
+                    .min_by_key(ToString::to_string);
                 if let Some(winner) = target_match.winner.as_ref() {
                     let page_count = self
                         .page_type_scheduled
@@ -1135,26 +1936,57 @@ impl PreviewRun {
                     let allowed_by_page_budget =
                         configured_page_limit.is_none_or(|limit| page_count < limit);
                     if !allowed_by_page_budget {
-                        self.record_budget(PreviewBudgetHit {
+                        let hit = PreviewBudgetHit {
                             kind: PreviewBudgetKind::PageTypePageBudget,
                             transition_id: None,
                             page_type_id: Some(winner.page_type_id),
                             observed: page_count,
                             limit: configured_page_limit.unwrap_or(page_count),
-                        });
-                        continue;
+                        };
+                        self.record_budget(hit.clone());
+                        path_budget_hits.push(hit);
+                        state = PreviewUrlState::BudgetExcluded;
+                    } else if self.admitted.len() as u64 >= self.context.limits.max_pages {
+                        let hit = PreviewBudgetHit {
+                            kind: PreviewBudgetKind::MaxPages,
+                            transition_id: None,
+                            page_type_id: None,
+                            observed: self.admitted.len() as u64,
+                            limit: self.context.limits.max_pages,
+                        };
+                        self.record_budget(hit.clone());
+                        path_budget_hits.push(hit);
+                        state = PreviewUrlState::BudgetExcluded;
+                    } else {
+                        admission_allowed = true;
                     }
                 }
-                if self.admitted.len() as u64 >= self.context.limits.max_pages {
-                    self.record_budget(PreviewBudgetHit {
-                        kind: PreviewBudgetKind::MaxPages,
-                        transition_id: None,
-                        page_type_id: None,
-                        observed: self.admitted.len() as u64,
-                        limit: self.context.limits.max_pages,
-                    });
-                    continue;
-                }
+            }
+            if link.is_pagination && state == PreviewUrlState::BudgetExcluded {
+                self.record_pagination_truncation(
+                    1,
+                    "Observed pagination was rejected by a bounded admission limit.",
+                    "PREVIEW_PAGINATION_NOT_EXPANDED",
+                );
+            }
+            let mut path = self.path_base(
+                entry,
+                source,
+                source_match,
+                &link.link,
+                Some(resolved_url.to_string()),
+                Some(canonical_url.clone()),
+                Some(canonicalization_result),
+                scope,
+                state,
+                Some(target_match.clone()),
+                None,
+                evaluations,
+                path_budget_hits,
+            )?;
+            path.prospective_depth = prospective_depth;
+            self.paths.push(path);
+            if admission_allowed {
                 self.admitted.insert(canonical_url.clone());
                 if let Some(winner) = target_match.winner.as_ref() {
                     *self
@@ -1168,9 +2000,12 @@ impl PreviewRun {
                     QueueEntry {
                         requested_url: canonical_url.clone(),
                         canonical_url,
-                        depth: *depth,
+                        depth: admission_depth.ok_or(DiscoveryPreviewError::BudgetOverflow)?,
                         seed_ids: entry.seed_ids.clone(),
-                        target_page_type_id,
+                        target_page_type_id: admission_page_type_id,
+                        transition_id: admission_transition_id,
+                        parent_canonical_url: Some(source.canonical.to_owned()),
+                        pagination: link.is_pagination,
                         order,
                     },
                 );
@@ -1623,6 +2458,19 @@ impl PreviewRun {
         }
     }
 
+    fn record_pagination_truncation(&mut self, count: u64, message: &str, code: &str) {
+        if count == 0 {
+            return;
+        }
+        self.pagination_truncation_count = self.pagination_truncation_count.saturating_add(count);
+        self.push_diagnostic(PreviewDiagnostic {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            observed: Some(count),
+            threshold: Some(0),
+        });
+    }
+
     fn hit_time_budget(&mut self) {
         if self.time_budget_hit {
             return;
@@ -1743,6 +2591,8 @@ impl PreviewRun {
                 budget_hit_counts,
                 frontier_remaining,
                 newly_enqueued_urls: self.newly_enqueued_urls,
+                pagination_truncation_count: self.pagination_truncation_count,
+                duration_work_not_expanded: self.duration_work_not_expanded,
             },
             growth_indicators: indicators,
             growth_warnings,
@@ -1842,6 +2692,12 @@ fn map_provider_error(error: DiscoveryPreviewProviderError) -> DiscoveryPreviewE
     match error {
         DiscoveryPreviewProviderError::Unavailable => DiscoveryPreviewError::ProviderUnavailable,
     }
+}
+
+fn fragment_free_url(url: &url::Url) -> String {
+    let mut fetch_url = url.clone();
+    fetch_url.set_fragment(None);
+    fetch_url.to_string()
 }
 
 fn map_crawler_error(error: CrawlerRepositoryError) -> DiscoveryPreviewError {
@@ -1969,7 +2825,7 @@ fn query_variant_groups(urls: &BTreeSet<String>) -> Vec<PreviewQueryVariantGroup
 }
 
 fn growth_warnings(
-    run: &PreviewRun,
+    run: &SemanticTraversal,
     counts: &[PreviewTransitionCount],
     total: u64,
     dominant: Option<&PreviewTransitionCount>,
@@ -2079,7 +2935,7 @@ fn reaches_budget_pressure(observed: u64, limit: u64) -> bool {
 }
 
 fn has_budget_pressure_utilization(
-    run: &PreviewRun,
+    run: &SemanticTraversal,
     counts: &[PreviewTransitionCount],
     total: u64,
 ) -> bool {
@@ -2151,7 +3007,7 @@ fn has_transition_total_budget_pressure(
     })
 }
 
-impl PreviewRun {
+impl SemanticTraversal {
     fn count_scope(&mut self, state: PreviewUrlState) {
         match state {
             PreviewUrlState::External => {
@@ -2279,6 +3135,9 @@ mod tests {
             depth: 0,
             seed_ids: Vec::new(),
             target_page_type_id: None,
+            transition_id: None,
+            parent_canonical_url: None,
+            pagination: false,
             order: 0,
         };
         assert_eq!(

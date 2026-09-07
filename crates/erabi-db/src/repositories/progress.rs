@@ -406,43 +406,7 @@ impl<'database> ProgressRepository<'database> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(ProgressRepositoryError::database)?;
-        let result = async {
-            ensure_job_exists(&transaction, event.job_id()).await?;
-            ensure_attempt_belongs_to_job(&transaction, event).await?;
-            ensure_stream_open(&transaction, event.job_id()).await?;
-            let sequence = allocate_sequence(&transaction, event.job_id()).await?;
-            let payload = StoredProgressPayload::from_event(event)?;
-            let payload_json = serde_json::to_string(&payload)
-                .map_err(|_| ProgressRepositoryError::ProgressInvariant)?;
-            let id = ProgressEventId::new();
-            transaction
-                .execute(
-                    "INSERT INTO job_progress_events (id, job_id, attempt_id, sequence, event_type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    (
-                        id.as_str(),
-                        event.job_id.as_str(),
-                        event.attempt_id.as_ref().map(ProgressAttemptId::as_str),
-                        i64::try_from(sequence.get())
-                            .map_err(|_| ProgressRepositoryError::ProgressInvariant)?,
-                        event.key.as_str(),
-                        payload_json,
-                        created_at,
-                    ),
-                )
-                .await
-                .map_err(ProgressRepositoryError::database)?;
-            Ok(ProgressEvent {
-                id,
-                job_id: event.job_id.clone(),
-                attempt_id: event.attempt_id.clone(),
-                sequence,
-                key: event.key.clone(),
-                metadata: event.metadata.clone(),
-                terminal: event.terminal,
-                created_at,
-            })
-        }
-        .await;
+        let result = append_in_transaction(&transaction, event, created_at).await;
         match result {
             Ok(progress) => transaction
                 .commit()
@@ -503,6 +467,50 @@ impl<'database> ProgressRepository<'database> {
             .flatten();
         Ok(ProgressReplayPage { events, next_after })
     }
+}
+
+/// Appends one validated progress event to an existing transaction. This is
+/// shared by the queue's atomic terminal-failure boundary and the ordinary
+/// repository append path.
+pub(crate) async fn append_in_transaction(
+    connection: &Connection,
+    event: &NewProgressEvent,
+    created_at: i64,
+) -> Result<ProgressEvent, ProgressRepositoryError> {
+    ensure_job_exists(connection, event.job_id()).await?;
+    ensure_attempt_belongs_to_job(connection, event).await?;
+    ensure_stream_open(connection, event.job_id()).await?;
+    let sequence = allocate_sequence(connection, event.job_id()).await?;
+    let payload = StoredProgressPayload::from_event(event)?;
+    let payload_json =
+        serde_json::to_string(&payload).map_err(|_| ProgressRepositoryError::ProgressInvariant)?;
+    let id = ProgressEventId::new();
+    connection
+        .execute(
+            "INSERT INTO job_progress_events (id, job_id, attempt_id, sequence, event_type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                id.as_str(),
+                event.job_id.as_str(),
+                event.attempt_id.as_ref().map(ProgressAttemptId::as_str),
+                i64::try_from(sequence.get())
+                    .map_err(|_| ProgressRepositoryError::ProgressInvariant)?,
+                event.key.as_str(),
+                payload_json,
+                created_at,
+            ),
+        )
+        .await
+        .map_err(ProgressRepositoryError::database)?;
+    Ok(ProgressEvent {
+        id,
+        job_id: event.job_id.clone(),
+        attempt_id: event.attempt_id.clone(),
+        sequence,
+        key: event.key.clone(),
+        metadata: event.metadata.clone(),
+        terminal: event.terminal,
+        created_at,
+    })
 }
 
 impl ProgressRepositoryError {

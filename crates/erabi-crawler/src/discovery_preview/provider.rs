@@ -26,6 +26,20 @@ pub enum DiscoveryPreviewProviderOutcome {
     PageFailed {
         diagnostic: TestDiagnostic,
     },
+    /// The durable worker stopped before this unit was observed. The
+    /// traversal restores the queue entry instead of turning an operator or
+    /// storage-pressure stop into a page failure.
+    Interrupted {
+        reason: DiscoveryPreviewInterruption,
+    },
+}
+
+/// A provider-neutral safe-boundary interruption. The production handler is
+/// the only current producer; Discovery Preview behavior is unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryPreviewInterruption {
+    Cancelled,
+    StoragePressure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

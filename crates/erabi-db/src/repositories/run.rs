@@ -1,5 +1,12 @@
-use erabi_domain::{CrawlRunId, CrawlRunSnapshot, CrawlRunStatus, CrawlRunType, RunConfiguration};
-use turso::{Connection, transaction::TransactionBehavior};
+use erabi_domain::{
+    CrawlRunId, CrawlRunSnapshot, CrawlRunStatus, CrawlRunType, RunConfiguration, SourceId,
+};
+use serde_json::Value;
+use turso::{
+    Connection,
+    transaction::{Transaction, TransactionBehavior},
+};
+use uuid::Uuid;
 
 use crate::{DbError, ErabiDatabase};
 
@@ -17,6 +24,21 @@ pub enum CrawlRunRepositoryError {
 #[derive(Clone, Copy, Debug)]
 pub struct CrawlRunRepository<'database> {
     database: &'database ErabiDatabase,
+}
+
+/// Immutable preserved evidence for one discovered URL decision. `detail` is
+/// bounded structured provenance, not provider body content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredUrlRecord {
+    pub id: String,
+    pub crawl_run_id: CrawlRunId,
+    pub source_id: Option<SourceId>,
+    pub raw_href: Option<String>,
+    pub original_url: String,
+    pub canonical_url: String,
+    pub status: String,
+    pub discovered_at: String,
+    pub detail: Value,
 }
 
 impl<'database> CrawlRunRepository<'database> {
@@ -63,6 +85,140 @@ impl<'database> CrawlRunRepository<'database> {
         id: CrawlRunId,
     ) -> Result<CrawlRunSnapshot, CrawlRunRepositoryError> {
         self.snapshot_by_stored_id(&id.to_string()).await
+    }
+
+    /// Reads the current durable lifecycle status without exposing a raw
+    /// connection. This is intentionally a narrow diagnostic/read boundary:
+    /// execution workers still use `transition_execution_status` for every
+    /// lifecycle mutation.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an absent run or a typed corruption error for an
+    /// unrecognized durable status.
+    pub async fn status(&self, id: CrawlRunId) -> Result<CrawlRunStatus, CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let row = connection
+            .prepare("SELECT status FROM crawl_runs WHERE id = ?1")
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .query_row([id.to_string()])
+            .await
+            .map_err(|error| match error {
+                turso::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
+                other => CrawlRunRepositoryError::Database(DbError::from(other)),
+            })?;
+        parse_run_status(
+            &row.get::<String>(0)
+                .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+        )
+    }
+
+    /// Moves a run through the execution lifecycle without ever modifying its
+    /// immutable snapshot. A recovered leased job may observe `RUNNING` again,
+    /// so that transition is intentionally idempotent.
+    ///
+    /// # Errors
+    /// Returns a typed error when the run is missing, already terminal, or the
+    /// requested transition is not part of the canonical run lifecycle.
+    pub async fn transition_execution_status(
+        &self,
+        id: CrawlRunId,
+        status: CrawlRunStatus,
+    ) -> Result<(), CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        transition_execution_status_in_transaction(&connection, id, status).await
+    }
+
+    /// Reopens a terminal same-run recovery continuation. This boundary is
+    /// reserved for an already queued Plan 04 action; ordinary worker startup
+    /// must continue to use `transition_execution_status` and cannot reopen a
+    /// terminal run implicitly.
+    ///
+    /// # Errors
+    /// Returns a typed error when the run is missing or cannot be reopened.
+    pub async fn transition_recovery_status(
+        &self,
+        id: CrawlRunId,
+    ) -> Result<(), CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let changed = connection
+            .execute(
+                "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'FAILED', 'CANCELLED', 'PARTIAL_RESULT')",
+                [id.to_string()],
+            )
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let exists = connection
+            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .is_some();
+        Err(if exists {
+            CrawlRunRepositoryError::Database(DbError::Invariant(
+                "Crawl Run recovery transition is not legal".into(),
+            ))
+        } else {
+            CrawlRunRepositoryError::NotFound
+        })
+    }
+
+    /// Reopens a terminal same-run restart action. Unlike ordinary recovery,
+    /// an explicit restart may replace a successful Quick Scrape generation.
+    ///
+    /// # Errors
+    /// Returns a typed error when the run is missing or cannot be reopened.
+    pub async fn transition_restart_status(
+        &self,
+        id: CrawlRunId,
+    ) -> Result<(), CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let changed = connection
+            .execute(
+                "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'PARTIAL_RESULT')",
+                [id.to_string()],
+            )
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let exists = connection
+            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .is_some();
+        Err(if exists {
+            CrawlRunRepositoryError::Database(DbError::Invariant(
+                "Crawl Run restart transition is not legal".into(),
+            ))
+        } else {
+            CrawlRunRepositoryError::NotFound
+        })
     }
 
     /// Loads a snapshot using a durable foreign-key value from another
@@ -178,6 +334,394 @@ impl<'database> CrawlRunRepository<'database> {
         row.get(0)
             .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))
     }
+
+    /// Persists one immutable discovery/provenance decision. The existing
+    /// `discovered_urls` contract intentionally retains non-admitted links as
+    /// well as scheduled work, so later finalization can distinguish a bounded
+    /// exclusion from missing evidence.
+    ///
+    /// # Errors
+    /// Returns a typed durable failure without modifying a prior discovery row.
+    pub async fn record_discovered_url(
+        &self,
+        record: &DiscoveredUrlRecord,
+    ) -> Result<(), CrawlRunRepositoryError> {
+        validate_discovered_url_record(record).map_err(CrawlRunRepositoryError::Database)?;
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let run_exists = connection
+            .query(
+                "SELECT 1 FROM crawl_runs WHERE id = ?1",
+                [record.crawl_run_id.to_string()],
+            )
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .is_some();
+        if !run_exists {
+            return Err(CrawlRunRepositoryError::NotFound);
+        }
+        record_discovered_url_values(&connection, record).await
+    }
+
+    /// Reads durable discovery/provenance decisions in deterministic creation
+    /// order. Production uses the same `discovered_urls` table for admitted
+    /// and preserve-only evidence; callers never need a raw connection to
+    /// verify either category.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an absent run and a typed corruption error for
+    /// malformed durable provenance.
+    pub async fn discovered_urls(
+        &self,
+        id: CrawlRunId,
+    ) -> Result<Vec<DiscoveredUrlRecord>, CrawlRunRepositoryError> {
+        let connection = self
+            .database
+            .connection()
+            .await
+            .map_err(CrawlRunRepositoryError::Database)?;
+        let exists = connection
+            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .is_some();
+        if !exists {
+            return Err(CrawlRunRepositoryError::NotFound);
+        }
+        let mut rows = connection
+            .query(
+                "SELECT id, source_id, raw_href, original_url, canonical_url, status, discovered_at, detail_json FROM discovered_urls WHERE crawl_run_id = ?1 ORDER BY discovered_at COLLATE BINARY, id COLLATE BINARY",
+                [id.to_string()],
+            )
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+        {
+            let source_id = row
+                .get::<Option<String>>(1)
+                .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+                .map(|value| {
+                    uuid::Uuid::parse_str(&value)
+                        .ok()
+                        .and_then(SourceId::from_uuid)
+                        .ok_or_else(|| {
+                            CrawlRunRepositoryError::Database(DbError::Invariant(
+                                "stored discovered URL source identity is invalid".into(),
+                            ))
+                        })
+                })
+                .transpose()?;
+            let detail: String = row
+                .get(7)
+                .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+            let record = DiscoveredUrlRecord {
+                id: row
+                    .get(0)
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                crawl_run_id: id,
+                source_id,
+                raw_href: row
+                    .get(2)
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                original_url: row
+                    .get(3)
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                canonical_url: row
+                    .get(4)
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                status: row
+                    .get(5)
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                discovered_at: row
+                    .get(6)
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                detail: serde_json::from_str(&detail).map_err(|error| {
+                    CrawlRunRepositoryError::Database(DbError::Invariant(format!(
+                        "stored discovered URL detail is invalid: {error}"
+                    )))
+                })?,
+            };
+            validate_discovered_url_record(&record).map_err(CrawlRunRepositoryError::Database)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+}
+
+/// Appends immutable discovery evidence inside a caller-owned transaction.
+/// Task 9 uses this to make an admitted child and its logical work state
+/// visible together; no canonicalization or semantic classification happens
+/// here.
+pub(crate) async fn record_discovered_url_in_transaction(
+    connection: &Transaction<'_>,
+    record: &DiscoveredUrlRecord,
+) -> Result<(), CrawlRunRepositoryError> {
+    validate_discovered_url_record(record).map_err(CrawlRunRepositoryError::Database)?;
+    let mut rows = connection
+        .query(
+            "SELECT crawl_run_id, source_id, raw_href, original_url, canonical_url, status, discovered_at, detail_json FROM discovered_urls WHERE id = ?1",
+            [record.id.as_str()],
+        )
+        .await
+        .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+    if let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+    {
+        let persisted_run_id: String = row
+            .get(0)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_source_id: Option<String> = row
+            .get(1)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_raw_href: Option<String> = row
+            .get(2)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_original_url: String = row
+            .get(3)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_canonical_url: String = row
+            .get(4)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_status: String = row
+            .get(5)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let _persisted_discovered_at: String = row
+            .get(6)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_detail_json: String = row
+            .get(7)
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+        let persisted_detail: Value =
+            serde_json::from_str(&persisted_detail_json).map_err(|error| {
+                CrawlRunRepositoryError::Database(DbError::Invariant(format!(
+                    "stored discovered URL detail is invalid: {error}"
+                )))
+            })?;
+        let source_id = record.source_id.map(|value| value.to_string());
+        let same_evidence = persisted_run_id == record.crawl_run_id.to_string()
+            && persisted_source_id == source_id
+            && persisted_raw_href == record.raw_href
+            && persisted_original_url == record.original_url
+            && persisted_canonical_url == record.canonical_url
+            && persisted_status == record.status
+            && persisted_detail == record.detail;
+        if same_evidence {
+            // The deterministic identity and semantic evidence prove this is
+            // the same replayed delta. Preserve the first physical
+            // observation timestamp instead of creating a second row when a
+            // process restart observes the same page later.
+            return Ok(());
+        }
+        return Err(CrawlRunRepositoryError::Database(DbError::Invariant(
+            "discovered URL identity was replayed with conflicting immutable evidence".into(),
+        )));
+    }
+    record_discovered_url_values(connection, record).await
+}
+
+async fn record_discovered_url_values(
+    connection: &impl DiscoveredUrlExecutor,
+    record: &DiscoveredUrlRecord,
+) -> Result<(), CrawlRunRepositoryError> {
+    let detail_json = serde_json::to_string(&record.detail).map_err(|error| {
+        CrawlRunRepositoryError::Database(DbError::Serialization(error.to_string()))
+    })?;
+    connection
+        .execute_discovered_url(
+            "INSERT INTO discovered_urls (id, crawl_run_id, source_id, raw_href, original_url, canonical_url, status, discovered_at, detail_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (
+                record.id.as_str(),
+                record.crawl_run_id.to_string(),
+                record.source_id.map_or(turso::Value::Null, |id| turso::Value::Text(id.to_string())),
+                record.raw_href.as_deref().map_or(turso::Value::Null, |value| turso::Value::Text(value.to_owned())),
+                record.original_url.as_str(),
+                record.canonical_url.as_str(),
+                record.status.as_str(),
+                record.discovered_at.as_str(),
+                detail_json,
+            ),
+        )
+        .await
+        .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+    Ok(())
+}
+
+#[allow(async_fn_in_trait)]
+trait DiscoveredUrlExecutor {
+    async fn execute_discovered_url<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<u64, turso::Error>;
+}
+
+impl DiscoveredUrlExecutor for Connection {
+    async fn execute_discovered_url<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<u64, turso::Error> {
+        self.execute(sql, params).await
+    }
+}
+
+impl DiscoveredUrlExecutor for Transaction<'_> {
+    async fn execute_discovered_url<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<u64, turso::Error> {
+        self.execute(sql, params).await
+    }
+}
+
+/// Applies the canonical worker-owned Crawl Run lifecycle transition on an
+/// existing transaction. Job queue failure synchronization uses this exact
+/// boundary so it cannot bypass the run repository's transition rules.
+pub(crate) async fn transition_execution_status_in_transaction(
+    connection: &Connection,
+    id: CrawlRunId,
+    status: CrawlRunStatus,
+) -> Result<(), CrawlRunRepositoryError> {
+    let changed = match status {
+        CrawlRunStatus::Running => connection
+            .execute(
+                "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING')",
+                [id.to_string()],
+            )
+            .await,
+        CrawlRunStatus::Succeeded => connection
+            .execute(
+                "UPDATE crawl_runs SET status = 'SUCCEEDED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED')",
+                [id.to_string()],
+            )
+            .await,
+        CrawlRunStatus::PartialResult => connection
+            .execute(
+                "UPDATE crawl_runs SET status = 'PARTIAL_RESULT' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'PARTIAL_RESULT')",
+                [id.to_string()],
+            )
+            .await,
+        CrawlRunStatus::Failed => connection
+            .execute(
+                "UPDATE crawl_runs SET status = 'FAILED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'FAILED')",
+                [id.to_string()],
+            )
+            .await,
+        CrawlRunStatus::Queued | CrawlRunStatus::Cancelled => {
+            return Err(CrawlRunRepositoryError::Database(DbError::Invariant(
+                "execution workers cannot directly set queued or cancelled run status".into(),
+            )));
+        }
+    }
+    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+    if changed != 1 {
+        let exists = connection
+            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .is_some();
+        return Err(if exists {
+            CrawlRunRepositoryError::Database(DbError::Invariant(
+                "Crawl Run lifecycle transition is not legal".into(),
+            ))
+        } else {
+            CrawlRunRepositoryError::NotFound
+        });
+    }
+    Ok(())
+}
+
+/// Applies the cancellation-owned run transition on an existing transaction.
+/// Unlike the worker lifecycle helper above, this path is intentionally
+/// available to the cancellation/finalization boundary so a durable summary
+/// and `CANCELLED` status can commit together.
+pub(crate) async fn cancel_execution_status_in_transaction(
+    connection: &Connection,
+    id: CrawlRunId,
+) -> Result<(), CrawlRunRepositoryError> {
+    let changed = connection
+        .execute(
+            "UPDATE crawl_runs SET status = 'CANCELLED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'CANCELLED')",
+            [id.to_string()],
+        )
+        .await
+        .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+    if changed != 1 {
+        let exists = connection
+            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .next()
+            .await
+            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
+            .is_some();
+        return Err(if exists {
+            CrawlRunRepositoryError::Database(DbError::Invariant(
+                "Crawl Run cancellation transition is not legal".into(),
+            ))
+        } else {
+            CrawlRunRepositoryError::NotFound
+        });
+    }
+    Ok(())
+}
+
+fn validate_discovered_url_record(record: &DiscoveredUrlRecord) -> Result<(), DbError> {
+    if Uuid::parse_str(&record.id).map_or(true, |id| id.get_version_num() != 7)
+        || record.status.is_empty()
+        || record.status.len() > 128
+        || record
+            .status
+            .bytes()
+            .any(|byte| !byte.is_ascii_uppercase() && byte != b'_')
+        || record.discovered_at.trim().is_empty()
+        || record.discovered_at.chars().count() > 256
+    {
+        return Err(DbError::Invariant(
+            "discovered URL evidence is invalid".into(),
+        ));
+    }
+    for value in [&record.original_url, &record.canonical_url] {
+        let parsed = url::Url::parse(value)
+            .map_err(|_| DbError::Invariant("discovered URL is invalid".into()))?;
+        if value.chars().count() > 4_096
+            || value.chars().any(char::is_control)
+            || !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(DbError::Invariant("discovered URL is invalid".into()));
+        }
+    }
+    if record
+        .raw_href
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 4_096 || value.chars().any(char::is_control))
+    {
+        return Err(DbError::Invariant("discovered href is invalid".into()));
+    }
+    Ok(())
 }
 
 pub(crate) async fn insert_run_in_transaction(
@@ -284,6 +828,20 @@ const fn run_status_name(status: CrawlRunStatus) -> &'static str {
         CrawlRunStatus::PartialResult => "PARTIAL_RESULT",
         CrawlRunStatus::Failed => "FAILED",
         CrawlRunStatus::Cancelled => "CANCELLED",
+    }
+}
+
+fn parse_run_status(value: &str) -> Result<CrawlRunStatus, CrawlRunRepositoryError> {
+    match value {
+        "QUEUED" => Ok(CrawlRunStatus::Queued),
+        "RUNNING" => Ok(CrawlRunStatus::Running),
+        "SUCCEEDED" => Ok(CrawlRunStatus::Succeeded),
+        "PARTIAL_RESULT" => Ok(CrawlRunStatus::PartialResult),
+        "FAILED" => Ok(CrawlRunStatus::Failed),
+        "CANCELLED" => Ok(CrawlRunStatus::Cancelled),
+        _ => Err(CrawlRunRepositoryError::Database(DbError::Invariant(
+            "stored Crawl Run status is invalid".into(),
+        ))),
     }
 }
 
