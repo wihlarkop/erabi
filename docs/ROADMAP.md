@@ -9,6 +9,7 @@ Erabi is specification-first. Roadmap order communicates dependency and product 
 - [MVP 0.1](roadmap/01-mvp-0.1.md) — the first implementation target.
 - [Post-MVP](roadmap/02-post-mvp.md) — capabilities intentionally deferred until the Crawler Studio core is stable.
 - [Feature Ledger](roadmap/03-feature-ledger.md) — quick scope lookup for major features.
+- [Engineering / DX Improvement Track](roadmap/04-engineering-dx.md) — maintainability, observability, API documentation, tooling, and architecture hardening that may be scheduled between product plans when it reduces rework or risk.
 
 ## Phase map
 
@@ -34,6 +35,8 @@ Erabi is specification-first. Roadmap order communicates dependency and product 
 1.x  Research / long-term bets
 ```
 
+Engineering/DX work is tracked separately from product milestone numbering. DX packages do not imply a product release and must not silently expand product scope.
+
 Every milestone should have explicit outcome/exit criteria before implementation begins.
 
-Implementation plans are created separately only after the relevant specification is stable.
+Implementation plans are created separately only after the relevant specification or DX design is stable.
