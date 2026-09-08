@@ -1725,26 +1725,31 @@ async fn current_execution_write_requires_current_generation_and_attempt_owner()
 
 #[test]
 fn historical_migrations_have_not_changed() -> Result<(), Box<dyn std::error::Error>> {
+    // Expected values are SHA-256 hashes of the canonical LF migration bytes.
     let expected = [
         (
             "../../migrations/0001_system.sql",
-            "320F68362E7E17E83DEE428BDA23FD049175CA6215A1B629933E5DFF75AF93FA",
+            "4F4FE87D479DCE142FE149E47FF54797ED972DB7945925933188B2FF3AF075B5",
         ),
         (
             "../../migrations/0002_crawler_core.sql",
-            "BAC46CA5F6C7003985332B9C6283468B8A9B50CE7E893377C6F5C848F79EE8AA",
+            "05083743118DE67761233E0125D11A01ADD486705101B5C74BB787ED38F92A4E",
         ),
         (
             "../../migrations/0003_runs.sql",
-            "3421582ADC69F2C155CDF218B22A77F93664B73E1C5D4CCC060ADCE8E223AF2C",
+            "A14114EEBD509D5D0A199E318B372B0D80D3F17BCF19752D839CBBB9E8BCFA5F",
         ),
         (
             "../../migrations/0004_jobs.sql",
-            "3588E77F17936E1A231555C785669F99B6C8F79746F37275317910F398427608",
+            "A89172280D20B2BD35170BF705F46DD758CAFCB71CA92461AD7B3FBAD17E1882",
         ),
         (
             "../../migrations/0005_crawl_execution.sql",
             "28D347FAFA9886D82DD502FA619322270FDF15989EE6D15D0CDA48BC2772EC5E",
+        ),
+        (
+            "../../migrations/0006_crawl_traversal_state.sql",
+            "0D1B952B293CEA9DB376233DAC789315CE76A5E6E413E0724E5F5BEEF577CC61",
         ),
     ];
     for (relative_path, expected_hash) in expected {
