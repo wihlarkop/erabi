@@ -31,14 +31,67 @@ use erabi_domain::{
 use uuid::Uuid;
 
 use crate::{
-    JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent, ProgressAttemptId,
-    ProgressKey, ProgressLiveHub, ProgressMetadata, ProgressService, ProgressTerminalState,
+    ExecutionAction, ExecutionDiagnostic, ExecutionDiagnostics, ExecutionOperation,
+    JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent,
+    OrchestrationErrorCategory, ProgressAttemptId, ProgressKey, ProgressLiveHub, ProgressMetadata,
+    ProgressPublication, ProgressService, ProgressTerminalState,
 };
 
 /// A Quick Scrape root performs its initial attempt and one automatic retry.
 /// Further configured attempt budget remains available to an explicit durable
 /// Retry child, preserving the operator-visible generation boundary.
 const QUICK_SCRAPE_AUTOMATIC_MAX_ATTEMPTS: u32 = 2;
+
+#[derive(Clone, Debug)]
+struct QuickScrapeError {
+    diagnostics: ExecutionDiagnostics,
+}
+
+type QuickScrapeResult<T> = Result<T, QuickScrapeError>;
+
+impl QuickScrapeError {
+    fn new(diagnostic: ExecutionDiagnostic) -> Self {
+        let mut diagnostics = ExecutionDiagnostics::new();
+        diagnostics.add_primary(diagnostic);
+        Self { diagnostics }
+    }
+
+    fn progress(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::ProgressPublication,
+            operation,
+            ExecutionAction::Reconcile,
+            code,
+        ))
+    }
+
+    fn repository(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Repository,
+            operation,
+            ExecutionAction::Retry,
+            code,
+        ))
+    }
+
+    fn checkpoint(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::CheckpointRecovery,
+            operation,
+            ExecutionAction::Retry,
+            code,
+        ))
+    }
+
+    fn artifact(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Artifact,
+            operation,
+            ExecutionAction::Retry,
+            code,
+        ))
+    }
+}
 
 /// Focused Plan 06 handler wired into the existing generic durable runtime.
 /// The adapter remains provider-neutral; no `Crawl4AI` DTO or handle enters this
@@ -52,6 +105,7 @@ pub struct QuickScrapeJobHandler {
     network_policy: NetworkTargetPolicy,
     artifact_store: ArtifactStore,
     progress_live_hub: Option<ProgressLiveHub>,
+    fail_terminal_progress_append_for_test: bool,
 }
 
 impl std::fmt::Debug for QuickScrapeJobHandler {
@@ -65,6 +119,7 @@ impl std::fmt::Debug for QuickScrapeJobHandler {
     }
 }
 
+#[allow(clippy::result_large_err)]
 impl QuickScrapeJobHandler {
     #[must_use]
     pub fn new(
@@ -83,6 +138,7 @@ impl QuickScrapeJobHandler {
             network_policy,
             artifact_store,
             progress_live_hub: None,
+            fail_terminal_progress_append_for_test: false,
         }
     }
 
@@ -96,11 +152,20 @@ impl QuickScrapeJobHandler {
         self
     }
 
+    /// Injects one terminal durable-progress append failure for a handler
+    /// boundary test. The CrawlRun business commit remains unaffected.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_terminal_progress_append_failure_for_test(mut self) -> Self {
+        self.fail_terminal_progress_append_for_test = true;
+        self
+    }
+
     // This is the intentionally linear durable attempt lifecycle. Keeping the
     // admissions, provider call, and durable completion in one visible order
     // makes RAII release and crash boundaries auditable.
     #[allow(clippy::too_many_lines)]
-    async fn execute_inner(&self, context: JobExecutionContext) -> Result<(), ()> {
+    async fn execute_inner(&self, context: JobExecutionContext) -> QuickScrapeResult<()> {
         if !matches!(
             context.kind().as_str(),
             "QUICK_SCRAPE"
@@ -110,27 +175,75 @@ impl QuickScrapeJobHandler {
                 | "RERUN_FULL_CRAWL"
                 | "RESTART_FROM_BEGINNING"
         ) {
-            return Err(());
+            return Err(QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::QueueLifecycle,
+                ExecutionAction::Fail,
+                "JOB_KIND_UNSUPPORTED",
+            )));
         }
         let job = JobRepository::new(&self.database)
             .job(context.job_id())
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(ExecutionOperation::LoadJob, "JOB_LOAD_FAILED")
+            })?;
         let terminal_attempt = quick_scrape_terminal_attempt(&context, &job);
-        let stored_run_id = job.crawl_run_id.as_deref().ok_or(())?;
-        let run_id = parse_run_id(stored_run_id)?;
+        let stored_run_id = job.crawl_run_id.as_deref().ok_or_else(|| {
+            QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::LoadJob,
+                ExecutionAction::Fail,
+                "JOB_RUN_ID_MISSING",
+            ))
+        })?;
+        let run_id = parse_run_id(stored_run_id).map_err(|()| {
+            QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::LoadRunSnapshot,
+                ExecutionAction::Fail,
+                "RUN_ID_INVALID",
+            ))
+        })?;
         let snapshot = CrawlRunRepository::new(&self.database)
             .snapshot(run_id)
             .await
-            .map_err(|_| ())?;
-        let target = quick_scrape_snapshot_target(&snapshot).map_err(|_| ())?;
-        let source_id = parse_source_id(&target.source_id)?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "RUN_SNAPSHOT_LOAD_FAILED",
+                )
+            })?;
+        let target = quick_scrape_snapshot_target(&snapshot).map_err(|_| {
+            QuickScrapeError::checkpoint(
+                ExecutionOperation::LoadRunSnapshot,
+                "SNAPSHOT_TARGET_INVALID",
+            )
+        })?;
+        let source_id = parse_source_id(&target.source_id).map_err(|()| {
+            QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::LoadRunSnapshot,
+                ExecutionAction::Fail,
+                "SOURCE_ID_INVALID",
+            ))
+        })?;
         let source = SourceRepository::new(&self.database)
             .read(source_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "SOURCE_LOAD_FAILED",
+                )
+            })?;
         if source.canonical_url != target.target_url {
-            return Err(());
+            return Err(QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::LoadRunSnapshot,
+                ExecutionAction::Fail,
+                "SOURCE_TARGET_MISMATCH",
+            )));
         }
         let latest_checkpoint = if matches!(
             context.kind().as_str(),
@@ -141,11 +254,22 @@ impl QuickScrapeJobHandler {
             JobRepository::new(&self.database)
                 .latest_checkpoint_for_lineage(context.job_id())
                 .await
-                .map_err(|_| ())?
+                .map_err(|_| {
+                    QuickScrapeError::checkpoint(
+                        ExecutionOperation::LoadCheckpoint,
+                        "CHECKPOINT_LOAD_FAILED",
+                    )
+                })?
         };
         if let Some(record) = latest_checkpoint.as_ref() {
-            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id)
-                .map_err(|_| ())?;
+            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id).map_err(
+                |_| {
+                    QuickScrapeError::checkpoint(
+                        ExecutionOperation::LoadCheckpoint,
+                        "CHECKPOINT_INVALID",
+                    )
+                },
+            )?;
         }
         let recovery_kind = match context.kind().as_str() {
             "RETRY" => Some(CrawlRecoveryActionKind::Retry),
@@ -165,14 +289,26 @@ impl QuickScrapeJobHandler {
                 .map(|record| record.checkpoint.clone())
                 .unwrap_or(
                     CrawlCheckpointV2::new(run_id, &snapshot, CrawlRecoveryPhase::Traversing)
-                        .map_err(|_| ())?
+                        .map_err(|_| {
+                            QuickScrapeError::checkpoint(
+                                ExecutionOperation::Serialization,
+                                "CHECKPOINT_BUILD_FAILED",
+                            )
+                        })?
                         .to_envelope()
-                        .map_err(|_| ())?,
+                        .map_err(|_| {
+                            QuickScrapeError::checkpoint(
+                                ExecutionOperation::Serialization,
+                                "CHECKPOINT_ENVELOPE_FAILED",
+                            )
+                        })?,
                 );
-            context
-                .checkpoint(&action_checkpoint)
-                .await
-                .map_err(|_| ())?;
+            context.checkpoint(&action_checkpoint).await.map_err(|_| {
+                QuickScrapeError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_PERSIST_FAILED",
+                )
+            })?;
             CrawlTraversalRepository::new(&self.database)
                 .prepare_recovery_action(
                     context.job_id(),
@@ -182,7 +318,12 @@ impl QuickScrapeJobHandler {
                     context.ownership_now(),
                 )
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::QueueLifecycle,
+                        "RECOVERY_ACTION_PERSIST_FAILED",
+                    )
+                })?;
         }
         let durable_state = match CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
@@ -190,7 +331,12 @@ impl QuickScrapeJobHandler {
         {
             Ok(state) => Some(state),
             Err(CrawlTraversalRepositoryError::CrawlRunNotFound) => None,
-            Err(_) => return Err(()),
+            Err(_) => {
+                return Err(QuickScrapeError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
+                ));
+            }
         };
         let current_work_completed = durable_state.as_ref().is_some_and(|state| {
             state.work.iter().any(|work| {
@@ -204,34 +350,64 @@ impl QuickScrapeJobHandler {
                 .finish_recovered_execution(&context, run_id, snapshot, CrawlRunStatus::Running)
                 .await;
         }
-        let mut execution_id = execution_id_for_job(context.job_id().as_str())?;
+        let mut execution_id = execution_id_for_job(context.job_id().as_str()).map_err(|()| {
+            QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::PersistExecution,
+                ExecutionAction::Fail,
+                "EXECUTION_ID_INVALID",
+            ))
+        })?;
         let executions = CrawlExecutionRepository::new(&self.database);
         match executions.read(execution_id).await {
             Ok(existing) => {
                 if existing.outcome == CrawlExecutionOutcome::Completed {
-                    return Err(());
+                    return Err(QuickScrapeError::repository(
+                        ExecutionOperation::PersistExecution,
+                        "EXECUTION_ALREADY_COMPLETED",
+                    ));
                 }
                 execution_id = CrawlExecutionId::new();
             }
             Err(CrawlExecutionRepositoryError::NotFound) => {}
-            Err(_) => return Err(()),
+            Err(_) => {
+                return Err(QuickScrapeError::repository(
+                    ExecutionOperation::LoadJob,
+                    "EXECUTION_LOAD_FAILED",
+                ));
+            }
         }
         let run_repository = CrawlRunRepository::new(&self.database);
         if let Some(CrawlRecoveryActionKind::RestartFromBeginning) = recovery_kind {
             run_repository
                 .transition_restart_status(run_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::TransitionRun,
+                        "RUN_RESTART_TRANSITION_FAILED",
+                    )
+                })?;
         } else if recovery_kind.is_some() {
             run_repository
                 .transition_recovery_status(run_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::TransitionRun,
+                        "RUN_RECOVERY_TRANSITION_FAILED",
+                    )
+                })?;
         } else {
             run_repository
                 .transition_execution_status(run_id, CrawlRunStatus::Running)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::TransitionRun,
+                        "RUN_EXECUTION_TRANSITION_FAILED",
+                    )
+                })?;
         }
         self.progress(&context, "STARTED", None).await?;
         if latest_checkpoint.is_none() {
@@ -258,7 +434,12 @@ impl QuickScrapeJobHandler {
         let expected_work_generation = CrawlTraversalRepository::new(&self.database)
             .read_work_generation(run_id, &quick_url_state_id(run_id))
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "WORK_GENERATION_LOAD_FAILED",
+                )
+            })?;
         CrawlExecutionRepository::new(&self.database)
             .activate_current_work(
                 run_id,
@@ -269,7 +450,12 @@ impl QuickScrapeJobHandler {
                 context.ownership_now(),
             )
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "EXECUTION_ACTIVATION_FAILED",
+                )
+            })?;
 
         // A confident Task 4 FileAsset classification is a durable completed
         // Quick Scrape without an HTML-provider request or Plan 08 download.
@@ -303,7 +489,14 @@ impl QuickScrapeJobHandler {
                 .await;
         }
 
-        let origin = OriginKey::from_url(&target.target_url).map_err(|_| ())?;
+        let origin = OriginKey::from_url(&target.target_url).map_err(|_| {
+            QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::NetworkAdmission,
+                ExecutionOperation::AcquireAdmission,
+                ExecutionAction::Fail,
+                "ORIGIN_INVALID",
+            ))
+        })?;
         // Registration is a runtime-only RAII contribution to Task 5's
         // process-wide same-origin registry. It cannot cross attempts/restarts.
         let registration = match self.pacing.register(origin, &snapshot) {
@@ -324,6 +517,7 @@ impl QuickScrapeJobHandler {
                     .terminal_failure(
                         &context,
                         &FailureContext {
+                            kind: TerminalFailureKind::Pacing,
                             run_id,
                             execution_id,
                             source_id,
@@ -371,10 +565,16 @@ impl QuickScrapeJobHandler {
                     .await;
             }
             Err(error) => {
+                if let Some(diagnostic) = robots_pacing_diagnostic(&error) {
+                    context.record_secondary_diagnostic(
+                        diagnostic.with_run(run_id).with_execution(execution_id),
+                    );
+                }
                 return self
                     .terminal_failure(
                         &context,
                         &FailureContext {
+                            kind: TerminalFailureKind::NetworkAdmission,
                             run_id,
                             execution_id,
                             source_id,
@@ -394,6 +594,7 @@ impl QuickScrapeJobHandler {
                 .terminal_failure(
                     &context,
                     &FailureContext {
+                        kind: TerminalFailureKind::NetworkAdmission,
                         run_id,
                         execution_id,
                         source_id,
@@ -443,6 +644,7 @@ impl QuickScrapeJobHandler {
                     .terminal_failure(
                         &context,
                         &FailureContext {
+                            kind: TerminalFailureKind::Pacing,
                             run_id,
                             execution_id,
                             source_id,
@@ -478,7 +680,14 @@ impl QuickScrapeJobHandler {
                 ..CrawlerEvidencePolicy::default()
             },
         )
-        .map_err(|_| ())?;
+        .map_err(|_| {
+            QuickScrapeError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::ProviderExecution,
+                ExecutionAction::Fail,
+                "PROVIDER_REQUEST_INVALID",
+            ))
+        })?;
         let provider = tokio::select! {
             value = self.adapter.execute(request) => value,
             () = context.storage_pressure().signalled() => {
@@ -499,13 +708,36 @@ impl QuickScrapeJobHandler {
         };
         let result = match provider {
             Ok(result) => {
-                permit
-                    .record_outcome(PacingOutcome::Success)
-                    .map_err(|_| ())?;
+                if permit.record_outcome(PacingOutcome::Success).is_err() {
+                    context.record_secondary_diagnostic(
+                        ExecutionDiagnostic::new(
+                            OrchestrationErrorCategory::Pacing,
+                            ExecutionOperation::RecordOutcome,
+                            ExecutionAction::Continue,
+                            "PACING_OUTCOME_RECORD_FAILED",
+                        )
+                        .with_run(run_id)
+                        .with_execution(execution_id),
+                    );
+                }
                 result
             }
             Err(error) => {
-                let _ = permit.record_outcome(PacingOutcome::from_adapter_error(&error));
+                if permit
+                    .record_outcome(PacingOutcome::from_adapter_error(&error))
+                    .is_err()
+                {
+                    context.record_secondary_diagnostic(
+                        ExecutionDiagnostic::new(
+                            OrchestrationErrorCategory::Pacing,
+                            ExecutionOperation::RecordOutcome,
+                            ExecutionAction::Continue,
+                            "PACING_OUTCOME_RECORD_FAILED",
+                        )
+                        .with_run(run_id)
+                        .with_execution(execution_id),
+                    );
+                }
                 if matches!(error, CrawlerAdapterError::Cancelled) {
                     context.cancellation().cancel();
                     return self
@@ -521,6 +753,7 @@ impl QuickScrapeJobHandler {
                     .terminal_failure(
                         &context,
                         &FailureContext {
+                            kind: TerminalFailureKind::Provider,
                             run_id,
                             execution_id,
                             source_id,
@@ -543,6 +776,7 @@ impl QuickScrapeJobHandler {
                         .terminal_failure(
                             &context,
                             &FailureContext {
+                                kind: TerminalFailureKind::Provider,
                                 run_id,
                                 execution_id,
                                 source_id,
@@ -568,6 +802,7 @@ impl QuickScrapeJobHandler {
                         .terminal_failure(
                             &context,
                             &FailureContext {
+                                kind: TerminalFailureKind::Provider,
                                 run_id,
                                 execution_id,
                                 source_id,
@@ -626,34 +861,57 @@ impl QuickScrapeJobHandler {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn finish_recovered_execution(
         &self,
         context: &JobExecutionContext,
         run_id: CrawlRunId,
         snapshot: erabi_domain::CrawlRunSnapshot,
         current_status: CrawlRunStatus,
-    ) -> Result<(), ()> {
+    ) -> QuickScrapeResult<()> {
         let executions = CrawlExecutionRepository::new(&self.database)
             .list_for_run(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(ExecutionOperation::LoadJob, "EXECUTIONS_LOAD_FAILED")
+            })?;
         let discovered = CrawlRunRepository::new(&self.database)
             .discovered_urls(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "DISCOVERED_URLS_LOAD_FAILED",
+                )
+            })?;
         let checkpoint = JobRepository::new(&self.database)
             .latest_checkpoint_for_lineage(context.job_id())
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_LOAD_FAILED",
+                )
+            })?;
         let _checkpoint = checkpoint
             .as_ref()
             .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id))
             .transpose()
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_INVALID",
+                )
+            })?;
         let durable = CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
+                )
+            })?;
         let authoritative_status = durable
             .work
             .iter()
@@ -695,7 +953,17 @@ impl QuickScrapeJobHandler {
             Some(&durable.control),
             Some(&durable.work),
         )
-        .map_err(|_| ())?;
+        .map_err(|_| {
+            QuickScrapeError::new(
+                ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Finalization,
+                    ExecutionOperation::FinalizeRun,
+                    ExecutionAction::Retry,
+                    "CRAWL_RUN_FINALIZATION_FAILED",
+                )
+                .with_run(run_id),
+            )
+        })?;
         let summary = CrawlExecutionSummary {
             crawl_run_id: run_id,
             in_scope_pages_planned: finalization.structural_input.in_scope_pages_planned,
@@ -709,21 +977,50 @@ impl QuickScrapeJobHandler {
         CrawlExecutionRepository::new(&self.database)
             .finalize(&summary, finalization.status)
             .await
-            .map_err(|_| ())?;
-        if finalization.status == CrawlRunStatus::Cancelled {
-            let _ = self
+            .map_err(|_| {
+                QuickScrapeError::new(
+                    ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Finalization,
+                        ExecutionOperation::FinalizeRun,
+                        ExecutionAction::Retry,
+                        "CRAWL_RUN_FINALIZATION_FAILED",
+                    )
+                    .with_run(run_id),
+                )
+            })?;
+        context.mark_terminal_crawl_run(run_id, finalization.status);
+        if finalization.status == CrawlRunStatus::Cancelled
+            && let Err(error) = self
                 .progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
-                .await;
+                .await
+        {
+            context.record_secondary_diagnostics(error.diagnostics);
         }
-        let _ = self.progress(context, "FINALIZATION_COMPLETED", None).await;
+        if let Err(error) = self.progress(context, "FINALIZATION_COMPLETED", None).await {
+            context.record_secondary_diagnostics(error.diagnostics);
+        }
         let (key, terminal) = match finalization.status {
             CrawlRunStatus::Failed => ("FAILED", ProgressTerminalState::Failed),
             CrawlRunStatus::Cancelled => ("CANCELLED", ProgressTerminalState::Cancelled),
             CrawlRunStatus::PartialResult => ("PARTIAL_RESULT", ProgressTerminalState::Succeeded),
             CrawlRunStatus::Succeeded => ("COMPLETED", ProgressTerminalState::Succeeded),
-            CrawlRunStatus::Queued | CrawlRunStatus::Running => return Err(()),
+            CrawlRunStatus::Queued | CrawlRunStatus::Running => {
+                return Err(QuickScrapeError::new(
+                    ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Finalization,
+                        ExecutionOperation::FinalizeRun,
+                        ExecutionAction::Fail,
+                        "CRAWL_RUN_NOT_TERMINAL",
+                    )
+                    .with_run(run_id),
+                ));
+            }
         };
-        let _ = self.progress(context, key, Some(terminal)).await;
+        if let Err(error) = self.progress(context, key, Some(terminal)).await {
+            // The CrawlRun has already committed its business outcome. A
+            // terminal progress append is a repairable projection failure.
+            context.record_secondary_diagnostics(error.diagnostics);
+        }
         Ok(())
     }
 
@@ -733,16 +1030,35 @@ impl QuickScrapeJobHandler {
         snapshot: &erabi_domain::CrawlRunSnapshot,
         run_id: CrawlRunId,
         phase: CrawlRecoveryPhase,
-    ) -> Result<(), ()> {
-        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, phase).map_err(|_| ())?;
+    ) -> QuickScrapeResult<()> {
+        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, phase).map_err(|_| {
+            QuickScrapeError::checkpoint(
+                ExecutionOperation::Serialization,
+                "CHECKPOINT_BUILD_FAILED",
+            )
+        })?;
         context
-            .checkpoint(&checkpoint.to_envelope().map_err(|_| ())?)
+            .checkpoint(&checkpoint.to_envelope().map_err(|_| {
+                QuickScrapeError::checkpoint(
+                    ExecutionOperation::Serialization,
+                    "CHECKPOINT_ENVELOPE_FAILED",
+                )
+            })?)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_PERSIST_FAILED",
+                )
+            })?;
         self.progress(context, "CHECKPOINT_SAVED", None).await
     }
 
-    async fn initialize_quick_work(&self, run_id: CrawlRunId, target_url: &str) -> Result<(), ()> {
+    async fn initialize_quick_work(
+        &self,
+        run_id: CrawlRunId,
+        target_url: &str,
+    ) -> QuickScrapeResult<()> {
         let state = CrawlUrlStateRecord {
             id: quick_url_state_id(run_id),
             crawl_run_id: run_id,
@@ -789,7 +1105,12 @@ impl QuickScrapeJobHandler {
         CrawlTraversalRepository::new(&self.database)
             .initialize_run_state(run_id, &[state], &control)
             .await
-            .map_err(|_| ())
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::QueueLifecycle,
+                    "QUICK_WORK_INITIALIZATION_FAILED",
+                )
+            })
     }
 
     async fn persist_record(
@@ -797,7 +1118,7 @@ impl QuickScrapeJobHandler {
         record: &CrawlExecutionRecord,
         context: &JobExecutionContext,
         expected_work_generation: Option<u64>,
-    ) -> Result<(), ()> {
+    ) -> QuickScrapeResult<()> {
         let state = match record.outcome {
             CrawlExecutionOutcome::Completed => CrawlWorkState::Completed,
             CrawlExecutionOutcome::Partial => CrawlWorkState::Partial,
@@ -813,7 +1134,12 @@ impl QuickScrapeJobHandler {
                     &quick_url_state_id(record.crawl_run_id),
                 )
                 .await
-                .map_err(|_| ())?,
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::PersistExecution,
+                        "WORK_GENERATION_LOAD_FAILED",
+                    )
+                })?,
         };
         executions
             .persist_current_work(
@@ -827,22 +1153,67 @@ impl QuickScrapeJobHandler {
             )
             .await
             .or_else(duplicate_execution_is_ok)
-            .map_err(|_| ())
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "EXECUTION_PERSIST_FAILED",
+                )
+            })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn terminal_failure(
         &self,
         context: &JobExecutionContext,
         failure: &FailureContext<'_>,
-    ) -> Result<(), ()> {
+    ) -> QuickScrapeResult<()> {
         if context.storage_pressure().is_signalled() {
             return Ok(());
         }
+        let (category, operation, provider) = match failure.kind {
+            TerminalFailureKind::Provider => (
+                OrchestrationErrorCategory::Provider,
+                ExecutionOperation::ProviderExecution,
+                Some("crawler-adapter"),
+            ),
+            TerminalFailureKind::NetworkAdmission => (
+                OrchestrationErrorCategory::NetworkAdmission,
+                ExecutionOperation::AcquireAdmission,
+                None,
+            ),
+            TerminalFailureKind::Pacing => (
+                OrchestrationErrorCategory::Pacing,
+                ExecutionOperation::AcquireAdmission,
+                None,
+            ),
+        };
+        let primary = ExecutionDiagnostic::new(
+            category,
+            operation,
+            if failure.retryable {
+                ExecutionAction::Retry
+            } else {
+                ExecutionAction::Fail
+            },
+            crawl_execution_code_name(failure.error_code),
+        )
+        .with_run(failure.run_id)
+        .with_execution(failure.execution_id)
+        .with_work_generation(failure.expected_work_generation);
+        let primary = provider.map_or(primary.clone(), |provider| primary.with_provider(provider));
+        // Establish the provider/business failure before any retry progress,
+        // checkpoint, or finalization projection can fail secondarily.
+        context.record_primary_diagnostic(primary.clone());
         if context.cancellation().is_cancelled() {
             let snapshot = CrawlRunRepository::new(&self.database)
                 .snapshot(failure.run_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::LoadRunSnapshot,
+                        "RUN_SNAPSHOT_LOAD_FAILED",
+                    )
+                })?;
             self.persist_record(
                 &CrawlExecutionRecord {
                     id: failure.execution_id,
@@ -905,7 +1276,12 @@ impl QuickScrapeJobHandler {
         let snapshot = CrawlRunRepository::new(&self.database)
             .snapshot(failure.run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "RUN_SNAPSHOT_LOAD_FAILED",
+                )
+            })?;
         self.save_quick_checkpoint(
             context,
             &snapshot,
@@ -915,14 +1291,14 @@ impl QuickScrapeJobHandler {
         .await?;
         if failure.retryable && !failure.terminal_attempt {
             self.progress(context, "RETRY_SCHEDULED", None).await?;
-            return Err(());
+            return Err(QuickScrapeError::new(primary));
         }
         self.finish_recovered_execution(context, failure.run_id, snapshot, CrawlRunStatus::Failed)
             .await?;
         if !failure.retryable || failure.terminal_attempt {
             context.mark_terminal_failure();
         }
-        Err(())
+        Err(QuickScrapeError::new(primary))
     }
 
     #[allow(dead_code)]
@@ -931,12 +1307,17 @@ impl QuickScrapeJobHandler {
         run_id: CrawlRunId,
         record: &CrawlExecutionRecord,
         partial: bool,
-    ) -> Result<(), ()> {
+    ) -> QuickScrapeResult<()> {
         CrawlExecutionRepository::new(&self.database)
             .persist(record)
             .await
             .or_else(duplicate_execution_is_ok)
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "EXECUTION_PERSIST_FAILED",
+                )
+            })?;
         CrawlExecutionRepository::new(&self.database)
             .save_summary(&CrawlExecutionSummary {
                 crawl_run_id: run_id,
@@ -947,7 +1328,12 @@ impl QuickScrapeJobHandler {
                 page_type_ambiguity_count: 0,
             })
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "EXECUTION_SUMMARY_PERSIST_FAILED",
+                )
+            })?;
         CrawlRunRepository::new(&self.database)
             .transition_execution_status(
                 run_id,
@@ -958,7 +1344,12 @@ impl QuickScrapeJobHandler {
                 },
             )
             .await
-            .map_err(|_| ())
+            .map_err(|_| {
+                QuickScrapeError::repository(
+                    ExecutionOperation::TransitionRun,
+                    "RUN_TRANSITION_FAILED",
+                )
+            })
     }
 
     async fn persist_artifacts(
@@ -968,7 +1359,7 @@ impl QuickScrapeJobHandler {
         created_at: &str,
         artifacts: Vec<CrawlerArtifactEvidence>,
         retain: bool,
-    ) -> Result<Vec<CrawlExecutionArtifact>, ()> {
+    ) -> QuickScrapeResult<Vec<CrawlExecutionArtifact>> {
         if !retain {
             return Ok(Vec::new());
         }
@@ -978,7 +1369,12 @@ impl QuickScrapeJobHandler {
             let stored = self
                 .artifact_store
                 .write_bytes(format!("quick-scrape/{run_id}"), file_name, bytes)
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::artifact(
+                        ExecutionOperation::PersistArtifact,
+                        "ARTIFACT_WRITE_FAILED",
+                    )
+                })?;
             ArtifactRepository::new(&self.database)
                 .record(
                     &stored,
@@ -989,7 +1385,12 @@ impl QuickScrapeJobHandler {
                     &serde_json::json!({"kind": artifact_kind_name(kind)}),
                 )
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    QuickScrapeError::artifact(
+                        ExecutionOperation::PersistArtifact,
+                        "ARTIFACT_RECORD_FAILED",
+                    )
+                })?;
             persisted.push(CrawlExecutionArtifact {
                 artifact_id: stored.id,
                 kind: execution_artifact_kind(kind),
@@ -1003,39 +1404,91 @@ impl QuickScrapeJobHandler {
         context: &JobExecutionContext,
         key: &str,
         terminal: Option<ProgressTerminalState>,
-    ) -> Result<(), ()> {
-        let attempt = ProgressAttemptId::new(context.attempt_id().to_owned()).map_err(|_| ())?;
+    ) -> QuickScrapeResult<()> {
+        let attempt = ProgressAttemptId::new(context.attempt_id().to_owned()).map_err(|_| {
+            QuickScrapeError::progress(
+                ExecutionOperation::Serialization,
+                "PROGRESS_ATTEMPT_INVALID",
+            )
+        })?;
+        let terminal_event = terminal.is_some();
         let metadata = ProgressMetadata::default();
         let event = match terminal {
             Some(terminal) => {
-                NewProgressEvent::terminal(context.job_id().clone(), terminal, metadata)
-                    .map_err(|_| ())?
+                NewProgressEvent::terminal(context.job_id().clone(), terminal, metadata).map_err(
+                    |_| {
+                        QuickScrapeError::progress(
+                            ExecutionOperation::Serialization,
+                            "PROGRESS_EVENT_INVALID",
+                        )
+                    },
+                )?
             }
             None => NewProgressEvent::new(
                 context.job_id().clone(),
-                ProgressKey::new(key).map_err(|_| ())?,
+                ProgressKey::new(key).map_err(|_| {
+                    QuickScrapeError::progress(
+                        ExecutionOperation::Serialization,
+                        "PROGRESS_KEY_INVALID",
+                    )
+                })?,
                 metadata,
             ),
         }
         .with_attempt(attempt);
+        if terminal_event && self.fail_terminal_progress_append_for_test {
+            return Err(QuickScrapeError::progress(
+                ExecutionOperation::AppendProgress,
+                "PROGRESS_DURABLE_APPEND_FAILED",
+            ));
+        }
         let service = ProgressService::new(&self.database);
         let now = epoch_seconds();
         match &self.progress_live_hub {
-            Some(hub) => service
-                .append_and_publish_at(hub, &event, now)
-                .await
-                .map(|_| ())
-                .map_err(|_| ()),
+            Some(hub) => match service.append_and_publish_at(hub, &event, now).await {
+                Ok(ProgressPublication::Published(_)) => {
+                    if terminal_event {
+                        context.mark_terminal_progress_durable();
+                    }
+                    Ok(())
+                }
+                Ok(ProgressPublication::DurableOnly { .. }) => {
+                    if terminal_event {
+                        context.mark_terminal_progress_durable();
+                    }
+                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::ProgressPublication,
+                        ExecutionOperation::PublishProgress,
+                        ExecutionAction::Publish,
+                        "PROGRESS_LIVE_PUBLICATION_FAILED",
+                    ));
+                    Ok(())
+                }
+                Err(_) => Err(QuickScrapeError::progress(
+                    ExecutionOperation::AppendProgress,
+                    "PROGRESS_DURABLE_APPEND_FAILED",
+                )),
+            },
             None => service
                 .append_at(&event, now)
                 .await
-                .map(|_| ())
-                .map_err(|_| ()),
+                .map(|_| {
+                    if terminal_event {
+                        context.mark_terminal_progress_durable();
+                    }
+                })
+                .map_err(|_| {
+                    QuickScrapeError::progress(
+                        ExecutionOperation::AppendProgress,
+                        "PROGRESS_DURABLE_APPEND_FAILED",
+                    )
+                }),
         }
     }
 }
 
 struct FailureContext<'url> {
+    kind: TerminalFailureKind,
     run_id: CrawlRunId,
     execution_id: CrawlExecutionId,
     source_id: SourceId,
@@ -1045,6 +1498,13 @@ struct FailureContext<'url> {
     retryable: bool,
     terminal_attempt: bool,
     expected_work_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalFailureKind {
+    Provider,
+    NetworkAdmission,
+    Pacing,
 }
 
 impl JobHandler for QuickScrapeJobHandler {
@@ -1058,10 +1518,13 @@ impl JobHandler for QuickScrapeJobHandler {
         // default worker stack; this is an execution-boundary allocation, not
         // a change to retry or recovery semantics.
         Box::pin(async move {
-            handler
-                .execute_inner(context)
-                .await
-                .map_err(|()| JobExecutionError)
+            match handler.execute_inner(context.clone()).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    context.record_diagnostics(error.diagnostics);
+                    Err(JobExecutionError)
+                }
+            }
         })
     }
 }
@@ -1107,6 +1570,24 @@ fn adapter_error_code(error: &CrawlerAdapterError) -> CrawlExecutionErrorCode {
     }
 }
 
+fn crawl_execution_code_name(code: CrawlExecutionErrorCode) -> &'static str {
+    match code {
+        CrawlExecutionErrorCode::AccessDenied => "ACCESS_DENIED",
+        CrawlExecutionErrorCode::NotFound => "NOT_FOUND",
+        CrawlExecutionErrorCode::Timeout => "TIMEOUT",
+        CrawlExecutionErrorCode::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
+        CrawlExecutionErrorCode::InvalidResponse => "INVALID_RESPONSE",
+        CrawlExecutionErrorCode::RateLimited => "RATE_LIMITED",
+        CrawlExecutionErrorCode::RemoteFailure => "REMOTE_FAILURE",
+        CrawlExecutionErrorCode::UnsupportedCapability => "UNSUPPORTED_CAPABILITY",
+        CrawlExecutionErrorCode::PartialResult => "PARTIAL_RESULT",
+        CrawlExecutionErrorCode::Cancelled => "CANCELLED",
+        CrawlExecutionErrorCode::RobotsExcluded => "ROBOTS_EXCLUDED",
+        CrawlExecutionErrorCode::PageTypeAmbiguous => "PAGE_TYPE_AMBIGUOUS",
+        CrawlExecutionErrorCode::StoragePressure => "STORAGE_PRESSURE",
+    }
+}
+
 fn adapter_error_status(error: &CrawlerAdapterError) -> Option<u16> {
     match error {
         CrawlerAdapterError::RemoteFailure { status_code } => *status_code,
@@ -1131,7 +1612,21 @@ fn adapter_error_is_retryable(error: &CrawlerAdapterError) -> bool {
 }
 
 fn robots_failure_is_retryable(error: &RobotsPolicyError) -> bool {
-    matches!(error, RobotsPolicyError::Unavailable(_))
+    matches!(
+        error,
+        RobotsPolicyError::Unavailable(_) | RobotsPolicyError::UnavailableWithPacing { .. }
+    )
+}
+
+fn robots_pacing_diagnostic(error: &RobotsPolicyError) -> Option<ExecutionDiagnostic> {
+    matches!(error, RobotsPolicyError::UnavailableWithPacing { .. }).then(|| {
+        ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Pacing,
+            ExecutionOperation::RecordOutcome,
+            ExecutionAction::Continue,
+            "ROBOTS_PACING_OUTCOME_RECORD_FAILED",
+        )
+    })
 }
 
 fn quick_scrape_terminal_attempt(context: &JobExecutionContext, job: &crate::JobRecord) -> bool {
@@ -1231,4 +1726,50 @@ fn epoch_seconds() -> i64 {
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn robots_pacing_accounting_failure_remains_secondary_to_admission() {
+        let error = RobotsPolicyError::UnavailableWithPacing {
+            failure: erabi_crawler::RobotsUnavailable::ServerFailure,
+            pacing: AdmissionError::ClockOverflow,
+        };
+        let Some(pacing) = robots_pacing_diagnostic(&error) else {
+            panic!("pacing diagnostic was not produced")
+        };
+        let mut diagnostics = ExecutionDiagnostics::new();
+        diagnostics.add_secondary(pacing);
+        diagnostics.add_primary(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::NetworkAdmission,
+            ExecutionOperation::AcquireAdmission,
+            ExecutionAction::Retry,
+            "ROBOTS_POLICY_FAILED",
+        ));
+
+        assert_eq!(
+            diagnostics
+                .primary
+                .as_ref()
+                .map(|diagnostic| diagnostic.category),
+            Some(OrchestrationErrorCategory::NetworkAdmission)
+        );
+        assert_eq!(
+            diagnostics
+                .secondary
+                .first()
+                .map(|diagnostic| diagnostic.category),
+            Some(OrchestrationErrorCategory::Pacing)
+        );
+        assert_eq!(
+            diagnostics
+                .secondary
+                .first()
+                .map(|diagnostic| diagnostic.operation),
+            Some(ExecutionOperation::RecordOutcome)
+        );
+    }
 }

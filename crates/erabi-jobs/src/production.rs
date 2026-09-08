@@ -45,11 +45,73 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent, ProgressAttemptId,
-    ProgressKey, ProgressLiveHub, ProgressMetadata, ProgressService, ProgressTerminalState,
+    ExecutionAction, ExecutionDiagnostic, ExecutionDiagnostics, ExecutionOperation,
+    JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent,
+    OrchestrationErrorCategory, ProgressAttemptId, ProgressKey, ProgressLiveHub, ProgressMetadata,
+    ProgressPublication, ProgressService, ProgressTerminalState,
 };
 
 const PRODUCTION_CRAWL_JOB_KIND: &str = "PRODUCTION_CRAWL";
+
+#[derive(Clone, Debug)]
+struct ProductionError {
+    diagnostics: ExecutionDiagnostics,
+}
+
+type ProductionResult<T> = Result<T, ProductionError>;
+
+impl ProductionError {
+    fn new(diagnostic: ExecutionDiagnostic) -> Self {
+        let mut diagnostics = ExecutionDiagnostics::new();
+        diagnostics.add_primary(diagnostic);
+        Self { diagnostics }
+    }
+
+    fn progress(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::ProgressPublication,
+            operation,
+            ExecutionAction::Reconcile,
+            code,
+        ))
+    }
+
+    fn repository(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Repository,
+            operation,
+            ExecutionAction::Retry,
+            code,
+        ))
+    }
+
+    fn checkpoint(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::CheckpointRecovery,
+            operation,
+            ExecutionAction::Retry,
+            code,
+        ))
+    }
+
+    fn artifact(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Artifact,
+            operation,
+            ExecutionAction::Retry,
+            code,
+        ))
+    }
+
+    fn projection(operation: ExecutionOperation, code: &'static str) -> Self {
+        Self::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::SerializationProjection,
+            operation,
+            ExecutionAction::Fail,
+            code,
+        ))
+    }
+}
 
 fn is_production_job_kind(kind: &str) -> bool {
     matches!(
@@ -161,6 +223,7 @@ pub struct ProductionCrawlJobHandler {
     clock: Arc<dyn PreviewClock>,
 }
 
+#[allow(clippy::result_large_err)]
 impl ProductionCrawlJobHandler {
     #[must_use]
     pub fn new(
@@ -198,27 +261,58 @@ impl ProductionCrawlJobHandler {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn execute_inner(&self, context: JobExecutionContext) -> Result<(), ()> {
+    async fn execute_inner(&self, context: JobExecutionContext) -> ProductionResult<()> {
         if !is_production_job_kind(context.kind().as_str()) {
-            return Err(());
+            return Err(ProductionError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::QueueLifecycle,
+                ExecutionAction::Fail,
+                "JOB_KIND_UNSUPPORTED",
+            )));
         }
         let job = JobRepository::new(&self.database)
             .job(context.job_id())
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(ExecutionOperation::LoadJob, "JOB_LOAD_FAILED")
+            })?;
         let run_id = job
             .crawl_run_id
             .as_deref()
             .and_then(parse_run_id)
-            .ok_or(())?;
+            .ok_or_else(|| {
+                ProductionError::new(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Invariant,
+                    ExecutionOperation::LoadJob,
+                    ExecutionAction::Fail,
+                    "RUN_ID_INVALID",
+                ))
+            })?;
         let snapshot = CrawlRunRepository::new(&self.database)
             .snapshot(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "RUN_SNAPSHOT_LOAD_FAILED",
+                )
+            })?;
         let semantic = load_frozen_production_semantics(&self.database, &snapshot)
             .await
-            .map_err(|_| ())?;
-        let limits = production_limits(&snapshot, &semantic.version)?;
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "FROZEN_SEMANTICS_LOAD_FAILED",
+                )
+            })?;
+        let limits = production_limits(&snapshot, &semantic.version).map_err(|()| {
+            ProductionError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::LoadRunSnapshot,
+                ExecutionAction::Fail,
+                "PRODUCTION_LIMITS_INVALID",
+            ))
+        })?;
         let deadline = ProductionDeadline::new(
             self.clock.clone(),
             self.clock.now_millis(),
@@ -227,18 +321,33 @@ impl ProductionCrawlJobHandler {
         let executions = CrawlExecutionRepository::new(&self.database)
             .list_for_run(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "EXECUTION_LIST_FAILED",
+                )
+            })?;
         let discovered = CrawlRunRepository::new(&self.database)
             .discovered_urls(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "DISCOVERY_LOAD_FAILED",
+                )
+            })?;
         let checkpoint = if context.kind().as_str() == "RERUN_FULL_CRAWL" {
             None
         } else {
             JobRepository::new(&self.database)
                 .latest_checkpoint_for_lineage(context.job_id())
                 .await
-                .map_err(|_| ())?
+                .map_err(|_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::LoadCheckpoint,
+                        "CHECKPOINT_LOAD_FAILED",
+                    )
+                })?
         };
 
         if checkpoint.is_none() && (!executions.is_empty() || !discovered.is_empty()) {
@@ -246,18 +355,30 @@ impl ProductionCrawlJobHandler {
                 // Durable discovery without a compatible recovery frontier is
                 // not permission to rediscover Seeds.  This is an interrupted
                 // run and must fail closed.
-                return Err(());
+                return Err(ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "RECOVERY_FRONTIER_MISSING",
+                ));
             }
             let current_status = CrawlRunRepository::new(&self.database)
                 .status(run_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::LoadRunSnapshot,
+                        "RUN_STATUS_LOAD_FAILED",
+                    )
+                })?;
             let final_status = self
                 .finalize_durable_run(&context, &snapshot, run_id, current_status)
                 .await?;
-            self.progress(&context, "FINALIZATION_COMPLETED", None)
-                .await?;
-            return self
+            if let Err(error) = self
+                .progress(&context, "FINALIZATION_COMPLETED", None)
+                .await
+            {
+                context.record_secondary_diagnostics(error.diagnostics);
+            }
+            if let Err(error) = self
                 .progress(
                     &context,
                     if final_status == CrawlRunStatus::PartialResult {
@@ -267,7 +388,11 @@ impl ProductionCrawlJobHandler {
                     },
                     Some(ProgressTerminalState::Succeeded),
                 )
-                .await;
+                .await
+            {
+                context.record_secondary_diagnostics(error.diagnostics);
+            }
+            return Ok(());
         }
 
         let run_repository = CrawlRunRepository::new(&self.database);
@@ -278,12 +403,22 @@ impl ProductionCrawlJobHandler {
             run_repository
                 .transition_recovery_status(run_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::TransitionRun,
+                        "RUN_RECOVERY_TRANSITION_FAILED",
+                    )
+                })?;
         } else {
             run_repository
                 .transition_execution_status(run_id, CrawlRunStatus::Running)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::TransitionRun,
+                        "RUN_EXECUTION_TRANSITION_FAILED",
+                    )
+                })?;
         }
         self.progress(
             &context,
@@ -304,8 +439,14 @@ impl ProductionCrawlJobHandler {
         ));
         let mut provenance = self.load_provenance_ids(run_id).await?;
         let mut traversal = if let Some(record) = checkpoint.as_ref() {
-            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id)
-                .map_err(|_| ())?;
+            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id).map_err(
+                |_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::LoadCheckpoint,
+                        "CHECKPOINT_INVALID",
+                    )
+                },
+            )?;
             // A provider result can be durably committed immediately before a
             // process crash and before the following checkpoint append.  The
             // immutable execution rows win over that stale work partition.
@@ -316,10 +457,12 @@ impl ProductionCrawlJobHandler {
                     // selection transaction commits but before the next
                     // checkpoint, queue recovery can replay this same action
                     // instead of exhausting the child as checkpoint-less.
-                    context
-                        .checkpoint(&record.checkpoint)
-                        .await
-                        .map_err(|_| ())?;
+                    context.checkpoint(&record.checkpoint).await.map_err(|_| {
+                        ProductionError::checkpoint(
+                            ExecutionOperation::LoadCheckpoint,
+                            "CHECKPOINT_PERSIST_FAILED",
+                        )
+                    })?;
                     let action_kind = if context.kind().as_str() == "RETRY" {
                         erabi_db::repositories::CrawlRecoveryActionKind::Retry
                     } else {
@@ -335,7 +478,12 @@ impl ProductionCrawlJobHandler {
                                 context.ownership_now(),
                             )
                             .await
-                            .map_err(|_| ())?,
+                            .map_err(|_| {
+                                ProductionError::repository(
+                                    ExecutionOperation::QueueLifecycle,
+                                    "RECOVERY_ACTION_PERSIST_FAILED",
+                                )
+                            })?,
                     )
                 }
                 _ => None,
@@ -361,7 +509,12 @@ impl ProductionCrawlJobHandler {
                     durable,
                     recovery_entries,
                 )
-                .map_err(|_| ())?
+                .map_err(|_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::Serialization,
+                        "TRAVERSAL_RESTORE_FAILED",
+                    )
+                })?
             } else {
                 SemanticTraversal::restore_from_checkpoint(
                     semantic,
@@ -371,7 +524,12 @@ impl ProductionCrawlJobHandler {
                     self.clock.clone(),
                     durable,
                 )
-                .map_err(|_| ())?
+                .map_err(|_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::Serialization,
+                        "TRAVERSAL_RESTORE_FAILED",
+                    )
+                })?
             }
         } else {
             if !executions.is_empty()
@@ -381,7 +539,10 @@ impl ProductionCrawlJobHandler {
                     PRODUCTION_CRAWL_JOB_KIND | "RERUN_FULL_CRAWL"
                 )
             {
-                return Err(());
+                return Err(ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "RECOVERY_STATE_INCOMPATIBLE",
+                ));
             }
             SemanticTraversal::for_frozen_snapshot(
                 semantic,
@@ -390,14 +551,26 @@ impl ProductionCrawlJobHandler {
                 provider.clone(),
                 self.clock.clone(),
             )
-            .map_err(|_| ())?
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "TRAVERSAL_INITIALIZATION_FAILED",
+                )
+            })?
         };
 
         // Initialization atomically commits the exact root evidence, logical
         // work, traversal control, and compact checkpoint before dispatch.
         let mut seeds_persisted = checkpoint.is_some();
         if checkpoint.is_some() {
-            self.synchronize_traversal_state(run_id, &traversal).await?;
+            self.synchronize_traversal_state(run_id, &traversal)
+                .await
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::PersistExecution,
+                        "TRAVERSAL_STATE_PERSIST_FAILED",
+                    )
+                })?;
             self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
                 .await?;
         } else {
@@ -408,7 +581,13 @@ impl ProductionCrawlJobHandler {
                 &traversal,
                 &mut provenance,
             )
-            .await?;
+            .await
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "TRAVERSAL_STATE_INITIALIZATION_FAILED",
+                )
+            })?;
             seeds_persisted = true;
         }
 
@@ -423,12 +602,22 @@ impl ProductionCrawlJobHandler {
                     CrawlTraversalRepository::new(&self.database)
                         .read_work_generation(run_id, &crawl_url_state_id(run_id, canonical_url))
                         .await
-                        .map_err(|_| ())?,
+                        .map_err(|_| {
+                            ProductionError::repository(
+                                ExecutionOperation::PersistExecution,
+                                "WORK_GENERATION_LOAD_FAILED",
+                            )
+                        })?,
                 )
             } else {
                 None
             };
-            match traversal.step().await.map_err(|_| ())? {
+            match traversal.step().await.map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::Serialization,
+                    "TRAVERSAL_STEP_FAILED",
+                )
+            })? {
                 SemanticTraversalStep::Processed {
                     pages,
                     discovery_paths,
@@ -504,7 +693,14 @@ impl ProductionCrawlJobHandler {
                     // control (notably duration/pagination structural
                     // evidence) even when it produces no page delta. Persist
                     // that semantic result before the compact checkpoint.
-                    self.synchronize_traversal_state(run_id, &traversal).await?;
+                    self.synchronize_traversal_state(run_id, &traversal)
+                        .await
+                        .map_err(|_| {
+                            ProductionError::repository(
+                                ExecutionOperation::PersistExecution,
+                                "TRAVERSAL_STATE_PERSIST_FAILED",
+                            )
+                        })?;
                     self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
                         .await?;
                     match reason {
@@ -542,7 +738,14 @@ impl ProductionCrawlJobHandler {
                     // Completion may follow a budget decision with no further
                     // page delta. The scalar control row, not the compact
                     // checkpoint, owns those final traversal facts.
-                    self.synchronize_traversal_state(run_id, &traversal).await?;
+                    self.synchronize_traversal_state(run_id, &traversal)
+                        .await
+                        .map_err(|_| {
+                            ProductionError::repository(
+                                ExecutionOperation::PersistExecution,
+                                "TRAVERSAL_STATE_PERSIST_FAILED",
+                            )
+                        })?;
                     self.save_checkpoint(&context, &snapshot, run_id, &traversal, &provenance)
                         .await?;
                     break;
@@ -553,22 +756,36 @@ impl ProductionCrawlJobHandler {
         let current_status = CrawlRunRepository::new(&self.database)
             .status(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "RUN_STATUS_LOAD_FAILED",
+                )
+            })?;
         let final_status = self
             .finalize_durable_run(&context, &snapshot, run_id, current_status)
             .await?;
-        self.progress(&context, "FINALIZATION_COMPLETED", None)
-            .await?;
-        self.progress(
-            &context,
-            if final_status == CrawlRunStatus::PartialResult {
-                "PRODUCTION_PARTIAL_RESULT"
-            } else {
-                "PRODUCTION_BOUNDED_COMPLETE"
-            },
-            Some(ProgressTerminalState::Succeeded),
-        )
-        .await
+        if let Err(error) = self
+            .progress(&context, "FINALIZATION_COMPLETED", None)
+            .await
+        {
+            context.record_secondary_diagnostics(error.diagnostics);
+        }
+        if let Err(error) = self
+            .progress(
+                &context,
+                if final_status == CrawlRunStatus::PartialResult {
+                    "PRODUCTION_PARTIAL_RESULT"
+                } else {
+                    "PRODUCTION_BOUNDED_COMPLETE"
+                },
+                Some(ProgressTerminalState::Succeeded),
+            )
+            .await
+        {
+            context.record_secondary_diagnostics(error.diagnostics);
+        }
+        Ok(())
     }
 
     async fn cancellation_boundary(
@@ -576,18 +793,31 @@ impl ProductionCrawlJobHandler {
         context: &JobExecutionContext,
         snapshot: &CrawlRunSnapshot,
         run_id: CrawlRunId,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         self.finalize_durable_run(context, snapshot, run_id, CrawlRunStatus::Cancelled)
             .await?;
-        self.progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
-            .await?;
-        self.progress(
-            context,
-            "PRODUCTION_CANCELLED",
-            Some(ProgressTerminalState::Cancelled),
-        )
-        .await?;
-        Err(())
+        if let Err(error) = self
+            .progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
+            .await
+        {
+            context.record_secondary_diagnostics(error.diagnostics);
+        }
+        if let Err(error) = self
+            .progress(
+                context,
+                "PRODUCTION_CANCELLED",
+                Some(ProgressTerminalState::Cancelled),
+            )
+            .await
+        {
+            context.record_secondary_diagnostics(error.diagnostics);
+        }
+        Err(ProductionError::new(ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Finalization,
+            ExecutionOperation::FinalizeRun,
+            ExecutionAction::Fail,
+            "CRAWL_RUN_CANCELLED",
+        )))
     }
 
     async fn finalize_durable_run(
@@ -596,28 +826,53 @@ impl ProductionCrawlJobHandler {
         snapshot: &CrawlRunSnapshot,
         run_id: CrawlRunId,
         current_status: CrawlRunStatus,
-    ) -> Result<CrawlRunStatus, ()> {
+    ) -> ProductionResult<CrawlRunStatus> {
         let executions = CrawlExecutionRepository::new(&self.database)
             .list_for_run(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "EXECUTIONS_LOAD_FAILED",
+                )
+            })?;
         let discovered = CrawlRunRepository::new(&self.database)
             .discovered_urls(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "DISCOVERY_LOAD_FAILED",
+                )
+            })?;
         let latest = JobRepository::new(&self.database)
             .latest_checkpoint_for_lineage(context.job_id())
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_LOAD_FAILED",
+                )
+            })?;
         let _checkpoint = latest
             .as_ref()
             .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, snapshot, run_id))
             .transpose()
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_INVALID",
+                )
+            })?;
         let durable = CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
+                )
+            })?;
         let finalization = erabi_crawler::finalize_durable_state_with_traversal(
             snapshot,
             current_status,
@@ -627,7 +882,17 @@ impl ProductionCrawlJobHandler {
             Some(&durable.control),
             Some(&durable.work),
         )
-        .map_err(|_| ())?;
+        .map_err(|_| {
+            ProductionError::new(
+                ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Finalization,
+                    ExecutionOperation::FinalizeRun,
+                    ExecutionAction::Retry,
+                    "CRAWL_RUN_FINALIZATION_FAILED",
+                )
+                .with_run(run_id),
+            )
+        })?;
         let summary = CrawlExecutionSummary {
             crawl_run_id: run_id,
             in_scope_pages_planned: finalization.structural_input.in_scope_pages_planned,
@@ -641,16 +906,35 @@ impl ProductionCrawlJobHandler {
         CrawlExecutionRepository::new(&self.database)
             .finalize(&summary, finalization.status)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::new(
+                    ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Finalization,
+                        ExecutionOperation::FinalizeRun,
+                        ExecutionAction::Retry,
+                        "CRAWL_RUN_FINALIZATION_FAILED",
+                    )
+                    .with_run(run_id),
+                )
+            })?;
+        context.mark_terminal_crawl_run(run_id, finalization.status);
         Ok(finalization.status)
     }
 
-    async fn load_provenance_ids(&self, run_id: CrawlRunId) -> Result<ExecutionProvenanceIds, ()> {
+    async fn load_provenance_ids(
+        &self,
+        run_id: CrawlRunId,
+    ) -> ProductionResult<ExecutionProvenanceIds> {
         let mut latest = BTreeMap::<ExecutionProvenanceKey, (u64, String)>::new();
         let records = CrawlRunRepository::new(&self.database)
             .discovered_urls(run_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::LoadRunSnapshot,
+                    "PROVENANCE_LOAD_FAILED",
+                )
+            })?;
         for record in records {
             if matches!(record.status.as_str(), "ADMITTED" | "EXECUTION_RECONCILED")
                 || record
@@ -683,7 +967,7 @@ impl ProductionCrawlJobHandler {
         &self,
         run_id: CrawlRunId,
         traversal: &SemanticTraversal,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         let (work, control) = Self::durable_traversal_snapshot(run_id, traversal);
         let semantic_state = semantic_projection(&traversal.checkpoint_state());
         let transition_source_counts = transition_source_counts(run_id, traversal);
@@ -701,12 +985,20 @@ impl ProductionCrawlJobHandler {
                     &[],
                 )
                 .await
-                .map_err(|_| ()),
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::PersistExecution,
+                        "TRAVERSAL_STATE_PERSIST_FAILED",
+                    )
+                }),
             // A checkpoint without its coupled traversal-control row is an
             // interrupted or pre-Task-9 state, not proof that initialization
             // completed. Do not recreate roots here: that would allow
             // recovery to proceed without the atomic Seed evidence phase.
-            Err(_) => Err(()),
+            Err(_) => Err(ProductionError::checkpoint(
+                ExecutionOperation::LoadCheckpoint,
+                "TRAVERSAL_CONTROL_MISSING",
+            )),
         }
     }
 
@@ -718,7 +1010,7 @@ impl ProductionCrawlJobHandler {
         evidence: &[DiscoveredUrlRecord],
         pages: &[DiscoveryPreviewPage],
         expected_work_generation: Option<u64>,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         let (mut work, control) = Self::durable_traversal_snapshot(run_id, traversal);
         for state in &mut work {
             for record in evidence.iter().filter(|record| {
@@ -849,7 +1141,12 @@ impl ProductionCrawlJobHandler {
                 &in_flight_work,
             )
             .await
-            .map_err(|_| ())
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "TRAVERSAL_STATE_PERSIST_FAILED",
+                )
+            })
     }
 
     fn durable_traversal_snapshot(
@@ -937,7 +1234,7 @@ impl ProductionCrawlJobHandler {
         run_id: CrawlRunId,
         traversal: &SemanticTraversal,
         provenance: &mut ExecutionProvenanceIds,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         let state = traversal.checkpoint_state();
         let seed_evidence = self.collect_discovery_delta(
             run_id,
@@ -1015,11 +1312,26 @@ impl ProductionCrawlJobHandler {
             }
         }
         let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
-            .map_err(|_| ())?
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::Serialization,
+                    "CHECKPOINT_BUILD_FAILED",
+                )
+            })?
             .to_envelope()
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::Serialization,
+                    "CHECKPOINT_ENVELOPE_FAILED",
+                )
+            })?;
         let (job_id, attempt_id, lease, created_at) =
-            context.checkpoint_lineage().await.map_err(|_| ())?;
+            context.checkpoint_lineage().await.map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_LINEAGE_LOAD_FAILED",
+                )
+            })?;
         CrawlTraversalRepository::new(&self.database)
             .initialize_run_state_with_checkpoint_and_evidence(
                 run_id,
@@ -1034,7 +1346,12 @@ impl ProductionCrawlJobHandler {
                 created_at,
             )
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::repository(
+                    ExecutionOperation::PersistExecution,
+                    "TRAVERSAL_STATE_INITIALIZATION_FAILED",
+                )
+            })?;
         context.mark_checkpoint_persisted();
         self.progress(context, "CHECKPOINT_SAVED", None).await
     }
@@ -1046,33 +1363,63 @@ impl ProductionCrawlJobHandler {
         snapshot: &CrawlRunSnapshot,
         semantic: &erabi_db::repositories::CrawlerSemanticSnapshot,
         selected_state_ids: Option<&BTreeSet<String>>,
-    ) -> Result<
-        (
-            SemanticTraversalCheckpoint,
-            Vec<SemanticTraversalQueueEntry>,
-        ),
-        (),
-    > {
+    ) -> ProductionResult<(
+        SemanticTraversalCheckpoint,
+        Vec<SemanticTraversalQueueEntry>,
+    )> {
         let durable = CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
             .await
-            .map_err(|_| ())?;
-        let queue_entry = |work: &CrawlUrlStateRecord| {
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
+                )
+            })?;
+        let checkpoint_error =
+            |code| ProductionError::checkpoint(ExecutionOperation::LoadCheckpoint, code);
+        let queue_entry = |work: &CrawlUrlStateRecord| -> Result<_, ProductionError> {
             Ok(SemanticTraversalQueueEntry {
                 requested_url: work.requested_url.clone(),
                 canonical_url: work.canonical_url.clone(),
-                depth: work.depth.ok_or(())?,
+                depth: work.depth.ok_or_else(|| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::LoadCheckpoint,
+                        "TRAVERSAL_DEPTH_MISSING",
+                    )
+                })?,
                 seed_ids: work
                     .seed_provenance
                     .iter()
-                    .map(|id| decode_id(id))
+                    .map(|id| {
+                        decode_id(id).map_err(|()| {
+                            ProductionError::checkpoint(
+                                ExecutionOperation::LoadCheckpoint,
+                                "TRAVERSAL_SEED_ID_INVALID",
+                            )
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
                 target_page_type_id: work
                     .target_page_type_id
                     .as_deref()
-                    .map(decode_id)
+                    .map(|id| {
+                        decode_id(id).map_err(|()| {
+                            ProductionError::checkpoint(
+                                ExecutionOperation::LoadCheckpoint,
+                                "TRAVERSAL_PAGE_TYPE_ID_INVALID",
+                            )
+                        })
+                    })
                     .transpose()?,
-                transition_id: work.transition_id.as_deref().map(decode_id).transpose()?,
+                transition_id: work
+                    .transition_id
+                    .as_deref()
+                    .map(|id| {
+                        decode_id(id)
+                            .map_err(|()| checkpoint_error("TRAVERSAL_TRANSITION_ID_INVALID"))
+                    })
+                    .transpose()?,
                 parent_canonical_url: work
                     .parent_url_state_id
                     .as_deref()
@@ -1080,7 +1427,12 @@ impl ProductionCrawlJobHandler {
                     .map(|parent| parent.canonical_url.clone()),
                 pagination: work.pagination,
                 discovered_url_id: work.first_discovered_url_id.clone(),
-                order: work.admission_sequence.ok_or(())?,
+                order: work.admission_sequence.ok_or_else(|| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::LoadCheckpoint,
+                        "TRAVERSAL_ADMISSION_SEQUENCE_MISSING",
+                    )
+                })?,
             })
         };
         let pending = durable
@@ -1091,7 +1443,7 @@ impl ProductionCrawlJobHandler {
                     && selected_state_ids.is_none_or(|ids| ids.contains(&work.id))
             })
             .map(queue_entry)
-            .collect::<Result<Vec<_>, ()>>()?;
+            .collect::<Result<Vec<_>, ProductionError>>()?;
         let recovery_entries = selected_state_ids
             .map(|ids| {
                 durable
@@ -1102,7 +1454,7 @@ impl ProductionCrawlJobHandler {
                             && work.current_work_state != Some(CrawlWorkState::Completed)
                     })
                     .map(queue_entry)
-                    .collect::<Result<Vec<_>, ()>>()
+                    .collect::<Result<Vec<_>, ProductionError>>()
             })
             .transpose()?
             .unwrap_or_default();
@@ -1170,12 +1522,14 @@ impl ProductionCrawlJobHandler {
                 .work
                 .iter()
                 .find(|work| work.id == count.source_url_state_id)
-                .ok_or(())?;
-            let transition_id = decode_id(&count.transition_id)?;
+                .ok_or_else(|| checkpoint_error("TRAVERSAL_SOURCE_STATE_MISSING"))?;
+            let transition_id = decode_id(&count.transition_id)
+                .map_err(|()| checkpoint_error("TRAVERSAL_TRANSITION_ID_INVALID"))?;
             transition_page_counts.push((
                 transition_id,
                 source.canonical_url.clone(),
-                u32::try_from(count.eligible_edge_count).map_err(|_| ())?,
+                u32::try_from(count.eligible_edge_count)
+                    .map_err(|_| checkpoint_error("TRAVERSAL_EDGE_COUNT_INVALID"))?,
             ));
             let entry = transition_counts
                 .entry(count.transition_id.clone())
@@ -1189,7 +1543,7 @@ impl ProductionCrawlJobHandler {
             .map(|transition| {
                 let (_, eligible_edges, source_pages) = transition_counts
                     .remove(&transition.transition.id.to_string())
-                    .ok_or(())?;
+                    .ok_or_else(|| checkpoint_error("TRAVERSAL_TRANSITION_COUNT_MISSING"))?;
                 Ok(SemanticTraversalTransitionState {
                     transition_id: transition.transition.id,
                     name: transition.transition.name.clone(),
@@ -1197,7 +1551,7 @@ impl ProductionCrawlJobHandler {
                     source_pages: source_pages.into_iter().collect(),
                 })
             })
-            .collect::<Result<Vec<_>, ()>>()?;
+            .collect::<Result<Vec<_>, ProductionError>>()?;
         let mut page_type_scheduled = BTreeMap::<String, u64>::new();
         for state in &durable.work {
             if state.admission_state == CrawlAdmissionState::Admitted
@@ -1211,22 +1565,35 @@ impl ProductionCrawlJobHandler {
         let page_type_sampled = durable
             .page_type_counts
             .iter()
-            .map(|count| Ok((decode_id(count.page_type_id.as_str())?, count.sampled_count)))
-            .collect::<Result<Vec<_>, ()>>()?;
+            .map(|count| {
+                Ok((
+                    decode_id(count.page_type_id.as_str())
+                        .map_err(|()| checkpoint_error("TRAVERSAL_PAGE_TYPE_ID_INVALID"))?,
+                    count.sampled_count,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProductionError>>()?;
         let page_type_discovered = durable
             .page_type_counts
             .iter()
             .map(|count| {
                 Ok((
-                    decode_id(count.page_type_id.as_str())?,
+                    decode_id(count.page_type_id.as_str())
+                        .map_err(|()| checkpoint_error("TRAVERSAL_PAGE_TYPE_ID_INVALID"))?,
                     count.discovered_count,
                 ))
             })
-            .collect::<Result<Vec<_>, ()>>()?;
+            .collect::<Result<Vec<_>, ProductionError>>()?;
         let page_type_scheduled = page_type_scheduled
             .into_iter()
-            .map(|(id, count)| Ok((decode_id(id.as_str())?, count)))
-            .collect::<Result<Vec<_>, ()>>()?;
+            .map(|(id, count)| {
+                Ok((
+                    decode_id(id.as_str())
+                        .map_err(|()| checkpoint_error("TRAVERSAL_PAGE_TYPE_ID_INVALID"))?,
+                    count,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProductionError>>()?;
         Ok((
             SemanticTraversalCheckpoint {
                 selected_seed_ids: snapshot.selected_seed_ids().to_vec(),
@@ -1240,14 +1607,16 @@ impl ProductionCrawlJobHandler {
                 ambiguous_canonical_urls: ambiguous,
                 in_scope_canonical_urls: in_scope,
                 consumed_bytes: durable.control.consumed_bytes,
-                pages_sampled: u64::try_from(sampled.len()).map_err(|_| ())?,
+                pages_sampled: u64::try_from(sampled.len())
+                    .map_err(|_| checkpoint_error("TRAVERSAL_SAMPLE_COUNT_INVALID"))?,
                 urls_discovered: durable.control.raw_link_count,
                 duplicates_prevented: durable.control.duplicate_count,
                 robots_excluded: durable.control.robots_excluded_count,
                 provider_errors: durable.control.provider_error_count,
                 external_urls: durable.control.external_url_count,
                 blocked_urls: durable.control.blocked_url_count,
-                newly_enqueued_urls: u64::try_from(admitted.len()).map_err(|_| ())?,
+                newly_enqueued_urls: u64::try_from(admitted.len())
+                    .map_err(|_| checkpoint_error("TRAVERSAL_ADMISSION_COUNT_INVALID"))?,
                 peak_new_from_page: durable.control.peak_expansion_count,
                 time_budget_hit: durable.control.time_budget_hit,
                 pagination_truncation_count: durable.control.pagination_truncation_count,
@@ -1270,13 +1639,28 @@ impl ProductionCrawlJobHandler {
         run_id: CrawlRunId,
         _traversal: &SemanticTraversal,
         _provenance: &ExecutionProvenanceIds,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
-            .map_err(|_| ())?;
+            .map_err(|_| {
+            ProductionError::checkpoint(
+                ExecutionOperation::Serialization,
+                "CHECKPOINT_BUILD_FAILED",
+            )
+        })?;
         context
-            .checkpoint(&checkpoint.to_envelope().map_err(|_| ())?)
+            .checkpoint(&checkpoint.to_envelope().map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::Serialization,
+                    "CHECKPOINT_ENVELOPE_FAILED",
+                )
+            })?)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                ProductionError::checkpoint(
+                    ExecutionOperation::LoadCheckpoint,
+                    "CHECKPOINT_PERSIST_FAILED",
+                )
+            })?;
         self.progress(context, "CHECKPOINT_SAVED", None).await
     }
 
@@ -1290,10 +1674,15 @@ impl ProductionCrawlJobHandler {
         attempts: &BTreeMap<String, ProductionPageAttempt>,
         work_generation: u64,
         ids: &mut ExecutionProvenanceIds,
-    ) -> Result<Vec<DiscoveredUrlRecord>, ()> {
+    ) -> ProductionResult<Vec<DiscoveredUrlRecord>> {
         let mut evidence = Vec::new();
         for seed in seeds {
-            let original_url = fragment_free_fetch_url(&seed.requested_url)?;
+            let original_url = fragment_free_fetch_url(&seed.requested_url).map_err(|()| {
+                ProductionError::projection(
+                    ExecutionOperation::Serialization,
+                    "DISCOVERY_URL_SERIALIZATION_FAILED",
+                )
+            })?;
             let status = if seed.duplicate_of_canonical_url.is_some() {
                 "CANONICAL_DUPLICATE"
             } else if seed.state == PreviewUrlState::InScopeMatched {
@@ -1321,7 +1710,13 @@ impl ProductionCrawlJobHandler {
                     status,
                     &detail,
                 ),
-            )?;
+            )
+            .map_err(|()| {
+                ProductionError::projection(
+                    ExecutionOperation::Serialization,
+                    "DISCOVERY_ID_BUILD_FAILED",
+                )
+            })?;
             evidence.push(DiscoveredUrlRecord {
                 id: id.clone(),
                 crawl_run_id: run_id,
@@ -1338,7 +1733,7 @@ impl ProductionCrawlJobHandler {
                 detail,
             });
             if seed.duplicate_of_canonical_url.is_none() {
-                insert_execution_provenance(ids, original_url, seed.canonical_url.clone(), id)?;
+                insert_execution_provenance(ids, original_url, seed.canonical_url.clone(), id);
             }
         }
         for path in paths {
@@ -1350,7 +1745,12 @@ impl ProductionCrawlJobHandler {
                 .resolved_original_url
                 .clone()
                 .unwrap_or_else(|| path.source_canonical_url.clone());
-            let original_url = fragment_free_fetch_url(&resolved_original_url)?;
+            let original_url = fragment_free_fetch_url(&resolved_original_url).map_err(|()| {
+                ProductionError::projection(
+                    ExecutionOperation::Serialization,
+                    "DISCOVERY_URL_SERIALIZATION_FAILED",
+                )
+            })?;
             let status = discovery_status(path);
             let detail = serde_json::json!({
                 "seed_ids": path.seed_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -1379,7 +1779,13 @@ impl ProductionCrawlJobHandler {
                     status,
                     &detail,
                 ),
-            )?;
+            )
+            .map_err(|()| {
+                ProductionError::projection(
+                    ExecutionOperation::Serialization,
+                    "DISCOVERY_ID_BUILD_FAILED",
+                )
+            })?;
             evidence.push(DiscoveredUrlRecord {
                 id: id.clone(),
                 crawl_run_id: run_id,
@@ -1396,7 +1802,7 @@ impl ProductionCrawlJobHandler {
                 detail,
             });
             if status == "ADMITTED" {
-                insert_execution_provenance(ids, original_url, canonical_url.clone(), id)?;
+                insert_execution_provenance(ids, original_url, canonical_url.clone(), id);
             }
         }
         for page in pages {
@@ -1404,7 +1810,12 @@ impl ProductionCrawlJobHandler {
                 .canonical_url
                 .clone()
                 .unwrap_or_else(|| page.requested_url.clone());
-            let original_url = fragment_free_fetch_url(&page.requested_url)?;
+            let original_url = fragment_free_fetch_url(&page.requested_url).map_err(|()| {
+                ProductionError::projection(
+                    ExecutionOperation::Serialization,
+                    "DISCOVERY_URL_SERIALIZATION_FAILED",
+                )
+            })?;
             let key = (original_url.clone(), canonical_url.clone());
             if !ids.contains_key(&key) {
                 let detail = serde_json::json!({
@@ -1420,7 +1831,13 @@ impl ProductionCrawlJobHandler {
                     "EXECUTION_RECONCILIATION",
                     work_generation,
                     &(original_url.clone(), canonical_url.clone(), &detail),
-                )?;
+                )
+                .map_err(|()| {
+                    ProductionError::projection(
+                        ExecutionOperation::Serialization,
+                        "DISCOVERY_ID_BUILD_FAILED",
+                    )
+                })?;
                 evidence.push(DiscoveredUrlRecord {
                     id: id.clone(),
                     crawl_run_id: run_id,
@@ -1436,7 +1853,7 @@ impl ProductionCrawlJobHandler {
                     ),
                     detail,
                 });
-                insert_execution_provenance(ids, original_url, canonical_url.clone(), id)?;
+                insert_execution_provenance(ids, original_url, canonical_url.clone(), id);
             }
             if page.state == PreviewUrlState::AmbiguousPageType {
                 let detail = serde_json::json!({
@@ -1449,7 +1866,13 @@ impl ProductionCrawlJobHandler {
                     "PAGE_TYPE_EVALUATION",
                     work_generation,
                     &(page.requested_url.clone(), canonical_url.clone(), &detail),
-                )?;
+                )
+                .map_err(|()| {
+                    ProductionError::projection(
+                        ExecutionOperation::Serialization,
+                        "DISCOVERY_ID_BUILD_FAILED",
+                    )
+                })?;
                 evidence.push(DiscoveredUrlRecord {
                     id: ambiguity_id,
                     crawl_run_id: run_id,
@@ -1484,9 +1907,16 @@ impl ProductionCrawlJobHandler {
         mut attempts: BTreeMap<String, ProductionPageAttempt>,
         expected_work_generation: Option<u64>,
         context: &JobExecutionContext,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         for page in pages {
-            let attempt = attempts.remove(&page.requested_url).ok_or(())?;
+            let attempt = attempts.remove(&page.requested_url).ok_or_else(|| {
+                ProductionError::new(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Invariant,
+                    ExecutionOperation::PersistExecution,
+                    ExecutionAction::Fail,
+                    "PAGE_ATTEMPT_MISSING",
+                ))
+            })?;
             match attempt {
                 ProductionPageAttempt::Observed { page: result, .. } => {
                     let canonical_url = page
@@ -1608,7 +2038,16 @@ impl ProductionCrawlJobHandler {
                 }
             }
         }
-        if attempts.is_empty() { Ok(()) } else { Err(()) }
+        if attempts.is_empty() {
+            Ok(())
+        } else {
+            Err(ProductionError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::PersistExecution,
+                ExecutionAction::Fail,
+                "PAGE_ATTEMPTS_UNCONSUMED",
+            )))
+        }
     }
 
     #[allow(dead_code, clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1620,10 +2059,17 @@ impl ProductionCrawlJobHandler {
         discovered_ids: &ExecutionProvenanceIds,
         attempts: &mut BTreeMap<String, ProductionPageAttempt>,
         context: &JobExecutionContext,
-    ) -> Result<PageAttemptCounts, ()> {
+    ) -> ProductionResult<PageAttemptCounts> {
         let mut counts = PageAttemptCounts::default();
         for page in &traversal.pages {
-            let attempt = attempts.remove(&page.requested_url).ok_or(())?;
+            let attempt = attempts.remove(&page.requested_url).ok_or_else(|| {
+                ProductionError::new(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Invariant,
+                    ExecutionOperation::PersistExecution,
+                    ExecutionAction::Fail,
+                    "PAGE_ATTEMPT_MISSING",
+                ))
+            })?;
             counts.attempted = counts.attempted.saturating_add(1);
             match attempt {
                 ProductionPageAttempt::Observed { page: result, .. } => {
@@ -1734,7 +2180,14 @@ impl ProductionCrawlJobHandler {
                 }
             }
         }
-        attempts.is_empty().then_some(counts).ok_or(())
+        attempts.is_empty().then_some(counts).ok_or_else(|| {
+            ProductionError::new(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Invariant,
+                ExecutionOperation::PersistExecution,
+                ExecutionAction::Fail,
+                "PAGE_ATTEMPTS_UNCONSUMED",
+            ))
+        })
     }
 
     async fn expected_generation_for_page(
@@ -1743,14 +2196,26 @@ impl ProductionCrawlJobHandler {
         page: &DiscoveryPreviewPage,
         canonical_url: &str,
         expected_work_generation: Option<u64>,
-    ) -> Result<u64, ()> {
+    ) -> ProductionResult<u64> {
         if page.requested_canonical_url == canonical_url {
-            expected_work_generation.ok_or(())
+            expected_work_generation.ok_or_else(|| {
+                ProductionError::new(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Invariant,
+                    ExecutionOperation::PersistExecution,
+                    ExecutionAction::Fail,
+                    "WORK_GENERATION_MISSING",
+                ))
+            })
         } else {
             CrawlTraversalRepository::new(&self.database)
                 .read_work_generation(run_id, &crawl_url_state_id(run_id, canonical_url))
                 .await
-                .map_err(|_| ())
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::PersistExecution,
+                        "WORK_GENERATION_LOAD_FAILED",
+                    )
+                })
         }
     }
 
@@ -1805,7 +2270,7 @@ impl ProductionCrawlJobHandler {
                     original_url,
                     seed.canonical_url.clone(),
                     id,
-                )?;
+                );
             }
         }
         for path in &traversal.discovery_paths {
@@ -1852,7 +2317,7 @@ impl ProductionCrawlJobHandler {
                 .await
                 .map_err(|_| ())?;
             if status == "ADMITTED" {
-                insert_execution_provenance(&mut execution_ids, original_url, canonical_url, id)?;
+                insert_execution_provenance(&mut execution_ids, original_url, canonical_url, id);
             }
         }
         self.persist_execution_reconciliations(run_id, traversal, attempts, &mut execution_ids)
@@ -1904,7 +2369,7 @@ impl ProductionCrawlJobHandler {
                 })
                 .await
                 .map_err(|_| ())?;
-            insert_execution_provenance(execution_ids, original_url, canonical_url, id)?;
+            insert_execution_provenance(execution_ids, original_url, canonical_url, id);
         }
         Ok(())
     }
@@ -1923,24 +2388,74 @@ impl ProductionCrawlJobHandler {
         self.network_policy
             .validate_and_resolve(&target)
             .await
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
-        let origin = OriginKey::from_url(&target)
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
-        let registration = self
-            .pacing
-            .register(origin, snapshot)
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure))?;
+            .map_err(|_| {
+                context.record_primary_diagnostic(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::NetworkAdmission,
+                    ExecutionOperation::AcquireAdmission,
+                    ExecutionAction::Fail,
+                    "NETWORK_TARGET_REJECTED",
+                ));
+                PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse)
+            })?;
+        let origin = OriginKey::from_url(&target).map_err(|_| {
+            context.record_primary_diagnostic(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::NetworkAdmission,
+                ExecutionOperation::AcquireAdmission,
+                ExecutionAction::Fail,
+                "ORIGIN_INVALID",
+            ));
+            PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse)
+        })?;
+        let registration = self.pacing.register(origin, snapshot).map_err(|_| {
+            context.record_primary_diagnostic(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::Pacing,
+                ExecutionOperation::AcquireAdmission,
+                ExecutionAction::Retry,
+                "PACING_REGISTRATION_FAILED",
+            ));
+            PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure)
+        })?;
         let pacing_cancel = PacingCancellation::new();
         let admission = tokio::select! {
-            value = self.robots.evaluate(&target, snapshot, &pacing_cancel) => value.map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RobotsExcluded)),
+            value = self.robots.evaluate(&target, snapshot, &pacing_cancel) => value.map_err(|error| {
+                context.record_primary_diagnostic(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::NetworkAdmission,
+                    ExecutionOperation::AcquireAdmission,
+                    ExecutionAction::Retry,
+                    "ROBOTS_POLICY_FAILED",
+                ));
+                if matches!(error, erabi_crawler::RobotsPolicyError::UnavailableWithPacing { .. }) {
+                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Pacing,
+                        ExecutionOperation::RecordOutcome,
+                        ExecutionAction::Continue,
+                        "ROBOTS_PACING_OUTCOME_RECORD_FAILED",
+                    ));
+                }
+                PageFailure::normal(CrawlExecutionErrorCode::RobotsExcluded)
+            }),
             () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
             () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
         }?;
         if admission.decision() == RobotsAdmissionDecision::Disallowed {
+            context.record_primary_diagnostic(ExecutionDiagnostic::new(
+                OrchestrationErrorCategory::NetworkAdmission,
+                ExecutionOperation::AcquireAdmission,
+                ExecutionAction::Fail,
+                "ROBOTS_EXCLUDED",
+            ));
             return Err(PageFailure::normal(CrawlExecutionErrorCode::RobotsExcluded));
         }
         let permit = tokio::select! {
-            value = registration.acquire(&admission, &pacing_cancel) => value.map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure)),
+            value = registration.acquire(&admission, &pacing_cancel) => value.map_err(|_| {
+                context.record_primary_diagnostic(ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Pacing,
+                    ExecutionOperation::AcquireAdmission,
+                    ExecutionAction::Retry,
+                    "PACING_PERMIT_ACQUISITION_FAILED",
+                ));
+                PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure)
+            }),
             () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
             () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
         }?;
@@ -1951,7 +2466,7 @@ impl ProductionCrawlJobHandler {
             .ok_or_else(PageFailure::duration_exhausted)?;
         self.progress(context, "PAGE_LOADING", None)
             .await
-            .map_err(|()| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure))?;
+            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure))?;
         let request = CrawlerExecuteRequest::try_new(
             target,
             timeout,
@@ -1982,13 +2497,37 @@ impl ProductionCrawlJobHandler {
         };
         let result = match result {
             Ok(result) => {
-                permit
-                    .record_outcome(PacingOutcome::Success)
-                    .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure))?;
+                if permit.record_outcome(PacingOutcome::Success).is_err() {
+                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Pacing,
+                        ExecutionOperation::RecordOutcome,
+                        ExecutionAction::Continue,
+                        "PACING_OUTCOME_RECORD_FAILED",
+                    ));
+                }
                 result
             }
             Err(error) => {
-                let _ = permit.record_outcome(PacingOutcome::from_adapter_error(&error));
+                context.record_primary_diagnostic(
+                    ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Provider,
+                        ExecutionOperation::ProviderExecution,
+                        ExecutionAction::Retry,
+                        crawl_execution_code_name(adapter_error_code(&error)),
+                    )
+                    .with_provider("crawler-adapter"),
+                );
+                if permit
+                    .record_outcome(PacingOutcome::from_adapter_error(&error))
+                    .is_err()
+                {
+                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::Pacing,
+                        ExecutionOperation::RecordOutcome,
+                        ExecutionAction::Continue,
+                        "PACING_OUTCOME_RECORD_FAILED",
+                    ));
+                }
                 return Err(PageFailure {
                     code: adapter_error_code(&error),
                     status: adapter_error_status(&error),
@@ -2030,7 +2569,7 @@ impl ProductionCrawlJobHandler {
         context: &JobExecutionContext,
         expected_work_generation: Option<u64>,
         historical_alias_if_current: bool,
-    ) -> Result<(), ()> {
+    ) -> ProductionResult<()> {
         let work_state = match record.outcome {
             CrawlExecutionOutcome::Completed => CrawlWorkState::Completed,
             CrawlExecutionOutcome::Partial => CrawlWorkState::Partial,
@@ -2046,7 +2585,12 @@ impl ProductionCrawlJobHandler {
                     &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
                 )
                 .await
-                .map_err(|_| ())?,
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::PersistExecution,
+                        "WORK_GENERATION_LOAD_FAILED",
+                    )
+                })?,
         };
         let result = executions
             .persist_current_work(
@@ -2072,9 +2616,17 @@ impl ProductionCrawlJobHandler {
                         context.ownership_now(),
                     )
                     .await
-                    .map_err(|_| ())
+                    .map_err(|_| {
+                        ProductionError::repository(
+                            ExecutionOperation::PersistExecution,
+                            "HISTORICAL_EXECUTION_PERSIST_FAILED",
+                        )
+                    })
             }
-            Err(_) => Err(()),
+            Err(_) => Err(ProductionError::repository(
+                ExecutionOperation::PersistExecution,
+                "EXECUTION_PERSIST_FAILED",
+            )),
         }
     }
 
@@ -2084,7 +2636,7 @@ impl ProductionCrawlJobHandler {
         created_at: &str,
         artifacts: Vec<CrawlerArtifactEvidence>,
         retain: bool,
-    ) -> Result<Vec<CrawlExecutionArtifact>, ()> {
+    ) -> ProductionResult<Vec<CrawlExecutionArtifact>> {
         if !retain {
             return Ok(Vec::new());
         }
@@ -2094,7 +2646,12 @@ impl ProductionCrawlJobHandler {
             let stored = self
                 .artifact_store
                 .write_bytes(format!("production/{run_id}"), name, bytes)
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    ProductionError::artifact(
+                        ExecutionOperation::PersistArtifact,
+                        "ARTIFACT_WRITE_FAILED",
+                    )
+                })?;
             ArtifactRepository::new(&self.database)
                 .record(
                     &stored,
@@ -2105,7 +2662,12 @@ impl ProductionCrawlJobHandler {
                     &serde_json::json!({"kind":artifact_kind_name(kind)}),
                 )
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| {
+                    ProductionError::artifact(
+                        ExecutionOperation::PersistArtifact,
+                        "ARTIFACT_RECORD_FAILED",
+                    )
+                })?;
             saved.push(CrawlExecutionArtifact {
                 artifact_id: stored.id,
                 kind: execution_artifact_kind(kind),
@@ -2119,34 +2681,81 @@ impl ProductionCrawlJobHandler {
         context: &JobExecutionContext,
         key: &str,
         terminal: Option<ProgressTerminalState>,
-    ) -> Result<(), ()> {
-        let attempt = ProgressAttemptId::new(context.attempt_id().to_owned()).map_err(|_| ())?;
+    ) -> ProductionResult<()> {
+        let attempt = ProgressAttemptId::new(context.attempt_id().to_owned()).map_err(|_| {
+            ProductionError::progress(
+                ExecutionOperation::Serialization,
+                "PROGRESS_ATTEMPT_INVALID",
+            )
+        })?;
+        let terminal_event = terminal.is_some();
         let event = match terminal {
             Some(state) => NewProgressEvent::terminal(
                 context.job_id().clone(),
                 state,
                 ProgressMetadata::default(),
             )
-            .map_err(|_| ())?,
+            .map_err(|_| {
+                ProductionError::progress(
+                    ExecutionOperation::Serialization,
+                    "PROGRESS_EVENT_INVALID",
+                )
+            })?,
             None => NewProgressEvent::new(
                 context.job_id().clone(),
-                ProgressKey::new(key).map_err(|_| ())?,
+                ProgressKey::new(key).map_err(|_| {
+                    ProductionError::progress(
+                        ExecutionOperation::Serialization,
+                        "PROGRESS_KEY_INVALID",
+                    )
+                })?,
                 ProgressMetadata::default(),
             ),
         }
         .with_attempt(attempt);
         let service = ProgressService::new(&self.database);
         match &self.progress_live_hub {
-            Some(hub) => service
+            Some(hub) => match service
                 .append_and_publish_at(hub, &event, epoch_seconds())
                 .await
-                .map(|_| ())
-                .map_err(|_| ()),
+            {
+                Ok(ProgressPublication::Published(_)) => {
+                    if terminal_event {
+                        context.mark_terminal_progress_durable();
+                    }
+                    Ok(())
+                }
+                Ok(ProgressPublication::DurableOnly { .. }) => {
+                    if terminal_event {
+                        context.mark_terminal_progress_durable();
+                    }
+                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::ProgressPublication,
+                        ExecutionOperation::PublishProgress,
+                        ExecutionAction::Publish,
+                        "PROGRESS_LIVE_PUBLICATION_FAILED",
+                    ));
+                    Ok(())
+                }
+                Err(_) => Err(ProductionError::progress(
+                    ExecutionOperation::AppendProgress,
+                    "PROGRESS_DURABLE_APPEND_FAILED",
+                )),
+            },
             None => service
                 .append_at(&event, epoch_seconds())
                 .await
-                .map(|_| ())
-                .map_err(|_| ()),
+                .map(|_| {
+                    if terminal_event {
+                        context.mark_terminal_progress_durable();
+                    }
+                })
+                .map_err(|_| {
+                    ProductionError::progress(
+                        ExecutionOperation::AppendProgress,
+                        "PROGRESS_DURABLE_APPEND_FAILED",
+                    )
+                }),
         }
     }
 }
@@ -2158,10 +2767,13 @@ impl JobHandler for ProductionCrawlJobHandler {
     ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
         let handler = self.clone();
         async move {
-            handler
-                .execute_inner(context)
-                .await
-                .map_err(|()| JobExecutionError)
+            match handler.execute_inner(context.clone()).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    context.record_diagnostics(error.diagnostics);
+                    Err(JobExecutionError)
+                }
+            }
         }
     }
 }
@@ -2438,6 +3050,24 @@ fn production_limits(
     })
 }
 
+fn crawl_execution_code_name(code: CrawlExecutionErrorCode) -> &'static str {
+    match code {
+        CrawlExecutionErrorCode::AccessDenied => "ACCESS_DENIED",
+        CrawlExecutionErrorCode::NotFound => "NOT_FOUND",
+        CrawlExecutionErrorCode::Timeout => "TIMEOUT",
+        CrawlExecutionErrorCode::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
+        CrawlExecutionErrorCode::InvalidResponse => "INVALID_RESPONSE",
+        CrawlExecutionErrorCode::RateLimited => "RATE_LIMITED",
+        CrawlExecutionErrorCode::RemoteFailure => "REMOTE_FAILURE",
+        CrawlExecutionErrorCode::UnsupportedCapability => "UNSUPPORTED_CAPABILITY",
+        CrawlExecutionErrorCode::PartialResult => "PARTIAL_RESULT",
+        CrawlExecutionErrorCode::Cancelled => "CANCELLED",
+        CrawlExecutionErrorCode::RobotsExcluded => "ROBOTS_EXCLUDED",
+        CrawlExecutionErrorCode::PageTypeAmbiguous => "PAGE_TYPE_AMBIGUOUS",
+        CrawlExecutionErrorCode::StoragePressure => "STORAGE_PRESSURE",
+    }
+}
+
 /// A checkpoint is required to recover interrupted frontier state, not to
 /// repeat a run whose every admitted unit is already represented by durable
 /// discovery and execution evidence.  The provenance tuple prevents a
@@ -2544,15 +3174,13 @@ fn decode_id<T: DeserializeOwned>(value: &str) -> Result<T, ()> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| ())
 }
 
-#[allow(clippy::unnecessary_wraps)]
 fn insert_execution_provenance(
     ids: &mut ExecutionProvenanceIds,
     original_url: String,
     canonical_url: String,
     id: String,
-) -> Result<(), ()> {
+) {
     ids.insert((original_url, canonical_url), id);
-    Ok(())
 }
 
 fn discovered_at(

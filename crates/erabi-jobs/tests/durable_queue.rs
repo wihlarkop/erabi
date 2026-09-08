@@ -829,7 +829,7 @@ async fn cancelling_one_job_leaves_unrelated_queued_work_executable()
 
     assert!(matches!(
         runtime.execute_next_at(&DelayedSuccess, 0).await?,
-        WorkerTurn::Succeeded { job_id } if job_id == unrelated.id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == unrelated.id
     ));
     assert_eq!(
         repository.job(&cancelled.id).await?.state,

@@ -5,16 +5,17 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use erabi_crawler::{
     ContentEvidence, ContentProbeDecision, ContentProbeExecutor, CrawlerAdapter,
     CrawlerAdapterError, CrawlerArtifactEvidence, CrawlerCapabilities, CrawlerExecuteRequest,
     CrawlerExecuteResult, CrawlerFuture, CrawlerHealth, CrawlerHealthStatus, CrawlerMediaType,
-    CrawlerResponseMetadata, DirectFileKind, NetworkTargetPolicy, PacingService,
-    QuickScrapeSubmissionRequest, QuickScrapeSubmissionService, RetryAfterTiming,
-    RobotsHttpResponse, RobotsPolicyService, RobotsTransport, StaticNetworkResolver,
-    ValidatedNetworkTarget,
+    CrawlerResponseMetadata, DirectFileKind, NetworkTargetPolicy, PacingClock, PacingService,
+    PacingSleepFuture, QuickScrapeSubmissionRequest, QuickScrapeSubmissionService,
+    RetryAfterTiming, RobotsHttpResponse, RobotsPolicyService, RobotsTransport,
+    StaticNetworkResolver, ValidatedNetworkTarget,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase, MigrationRunner,
@@ -28,7 +29,8 @@ use erabi_domain::{
     SnapshotOperationalSettings,
 };
 use erabi_jobs::{
-    CancellationController, JobActionService, JobRuntime, QuickScrapeJobHandler,
+    CancellationController, JobActionService, JobRuntime, OrchestrationErrorCategory,
+    ProgressLiveHub, ProgressReplayRequest, ProgressRepository, QuickScrapeJobHandler,
     StoragePressureMonitor, StoragePressurePolicy, StorageProbe, StorageProbeError, WorkerPolicy,
     WorkerTurn,
 };
@@ -49,6 +51,7 @@ impl ContentProbeExecutor for FixedProbe {
 #[derive(Clone, Copy)]
 enum AdapterMode {
     Complete,
+    RateLimited,
     Unavailable,
     AccessDenied,
     Cancelled,
@@ -83,6 +86,9 @@ impl CrawlerAdapter for FixtureAdapter {
         let mode = self.mode;
         Box::pin(async move {
             match mode {
+                AdapterMode::RateLimited => Err(CrawlerAdapterError::RateLimited {
+                    retry_after_ms: None,
+                }),
                 AdapterMode::Unavailable => Err(CrawlerAdapterError::Unavailable),
                 AdapterMode::AccessDenied => Err(CrawlerAdapterError::AccessDenied),
                 AdapterMode::Cancelled => Err(CrawlerAdapterError::Cancelled),
@@ -132,6 +138,76 @@ impl RobotsTransport for AllowRobots {
                 RetryAfterTiming::Absent,
             ))
         })
+    }
+}
+
+struct FailingRobots;
+
+impl RobotsTransport for FailingRobots {
+    fn fetch<'transport>(
+        &'transport self,
+        _target: &'transport ValidatedNetworkTarget,
+        _user_agent: &'transport str,
+    ) -> erabi_crawler::RobotsFetchFuture<'transport> {
+        Box::pin(async {
+            Ok(RobotsHttpResponse::new(
+                500,
+                Vec::new(),
+                RetryAfterTiming::Absent,
+            ))
+        })
+    }
+}
+
+struct RateLimitedRobots;
+
+impl RobotsTransport for RateLimitedRobots {
+    fn fetch<'transport>(
+        &'transport self,
+        _target: &'transport ValidatedNetworkTarget,
+        _user_agent: &'transport str,
+    ) -> erabi_crawler::RobotsFetchFuture<'transport> {
+        Box::pin(async {
+            Ok(RobotsHttpResponse::new(
+                429,
+                Vec::new(),
+                RetryAfterTiming::Absent,
+            ))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct OverflowClock;
+
+impl PacingClock for OverflowClock {
+    fn now(&self) -> tokio::time::Instant {
+        let origin = std::time::Instant::now();
+        let mut low = 0_u64;
+        let mut high = 1_u64;
+        while origin.checked_add(Duration::from_secs(high)).is_some() {
+            low = high;
+            if high == u64::MAX {
+                break;
+            }
+            high = high.saturating_mul(2);
+        }
+        while low.saturating_add(1) < high {
+            let middle = low + (high - low) / 2;
+            if origin.checked_add(Duration::from_secs(middle)).is_some() {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        let instant = origin
+            .checked_add(Duration::from_secs(low))
+            .unwrap_or(origin);
+        tokio::time::Instant::from_std(instant)
+    }
+
+    fn sleep_until(&self, _deadline: tokio::time::Instant) -> PacingSleepFuture<'_> {
+        Box::pin(async {})
     }
 }
 
@@ -219,11 +295,53 @@ fn handler(
     adapter: Arc<dyn CrawlerAdapter>,
     artifact_store: ArtifactStore,
 ) -> QuickScrapeJobHandler {
-    let pacing = PacingService::new();
+    handler_with_transport(database, adapter, artifact_store, Arc::new(AllowRobots))
+}
+
+fn handler_with_transport(
+    database: ErabiDatabase,
+    adapter: Arc<dyn CrawlerAdapter>,
+    artifact_store: ArtifactStore,
+    transport: Arc<dyn RobotsTransport>,
+) -> QuickScrapeJobHandler {
+    handler_with_pacing(
+        database,
+        adapter,
+        artifact_store,
+        transport,
+        PacingService::new(),
+    )
+}
+
+fn handler_with_pacing(
+    database: ErabiDatabase,
+    adapter: Arc<dyn CrawlerAdapter>,
+    artifact_store: ArtifactStore,
+    transport: Arc<dyn RobotsTransport>,
+    pacing: PacingService,
+) -> QuickScrapeJobHandler {
+    handler_with_pacing_services(
+        database,
+        adapter,
+        artifact_store,
+        transport,
+        pacing.clone(),
+        pacing,
+    )
+}
+
+fn handler_with_pacing_services(
+    database: ErabiDatabase,
+    adapter: Arc<dyn CrawlerAdapter>,
+    artifact_store: ArtifactStore,
+    transport: Arc<dyn RobotsTransport>,
+    pacing: PacingService,
+    robots_pacing: PacingService,
+) -> QuickScrapeJobHandler {
     QuickScrapeJobHandler::new(
         database,
         adapter,
-        RobotsPolicyService::with_transport(policy(), pacing.clone(), Arc::new(AllowRobots)),
+        RobotsPolicyService::with_transport(policy(), robots_pacing, transport),
         pacing,
         policy(),
         artifact_store,
@@ -285,6 +403,273 @@ async fn normal_execution_persists_provider_evidence_through_the_adapter()
         records[0].observed_final_url.as_deref(),
         Some("https://example.test/page")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn robots_admission_is_primary_without_provider_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 2).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let handler = handler_with_transport(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+        Arc::new(FailingRobots),
+    );
+    let runtime = runtime(&database, "quick-robots-primary")?;
+    let turn = runtime.execute_next_at(&handler, 100).await?;
+    let WorkerTurn::RetryScheduled { diagnostics, .. } = turn else {
+        return Err("robots failure did not schedule a retry".into());
+    };
+    let primary = diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.primary.as_ref())
+        .ok_or("robots primary diagnostic was missing")?;
+    assert_eq!(
+        primary.category,
+        OrchestrationErrorCategory::NetworkAdmission
+    );
+    assert_eq!(
+        primary.operation,
+        erabi_jobs::ExecutionOperation::AcquireAdmission
+    );
+    assert!(primary.provider.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let _ = accepted;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_failure_keeps_pacing_accounting_secondary_at_runtime_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 2).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let handler = handler_with_pacing_services(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::RateLimited,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+        Arc::new(AllowRobots),
+        PacingService::with_clock(Arc::new(OverflowClock)),
+        PacingService::new(),
+    );
+    let turn = runtime(&database, "quick-provider-pacing")?
+        .execute_next_at(&handler, 100)
+        .await?;
+    let diagnostics = match turn {
+        WorkerTurn::RetryScheduled { diagnostics, .. } | WorkerTurn::Failed { diagnostics, .. } => {
+            diagnostics
+        }
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let diagnostics = diagnostics.ok_or("provider diagnostics were missing")?;
+    assert_eq!(
+        diagnostics
+            .primary
+            .as_ref()
+            .map(|diagnostic| diagnostic.category),
+        Some(OrchestrationErrorCategory::Provider)
+    );
+    assert!(diagnostics.secondary.iter().any(|diagnostic| {
+        diagnostic.category == OrchestrationErrorCategory::Pacing
+            && diagnostic.operation == erabi_jobs::ExecutionOperation::RecordOutcome
+    }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let run_records = CrawlExecutionRepository::new(&database)
+        .list_for_run(accepted.run_id)
+        .await?;
+    assert_eq!(run_records.len(), 1);
+    assert_eq!(
+        run_records[0].error_code,
+        Some(CrawlExecutionErrorCode::RateLimited)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn robots_admission_failure_keeps_pacing_secondary_at_runtime_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 2).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let pacing = PacingService::with_clock(Arc::new(OverflowClock));
+    let handler = handler_with_pacing(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+        Arc::new(RateLimitedRobots),
+        pacing,
+    );
+    let turn = runtime(&database, "quick-robots-pacing")?
+        .execute_next_at(&handler, 100)
+        .await?;
+    let diagnostics = match turn {
+        WorkerTurn::RetryScheduled { diagnostics, .. } | WorkerTurn::Failed { diagnostics, .. } => {
+            diagnostics
+        }
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let diagnostics = diagnostics.ok_or("robots diagnostics were missing")?;
+    assert_eq!(
+        diagnostics
+            .primary
+            .as_ref()
+            .map(|diagnostic| diagnostic.category),
+        Some(OrchestrationErrorCategory::NetworkAdmission)
+    );
+    assert!(diagnostics.secondary.iter().any(|diagnostic| {
+        diagnostic.category == OrchestrationErrorCategory::Pacing
+            && diagnostic.operation == erabi_jobs::ExecutionOperation::RecordOutcome
+    }));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let run_records = CrawlExecutionRepository::new(&database)
+        .list_for_run(accepted.run_id)
+        .await?;
+    assert_eq!(run_records.len(), 1);
+    assert_eq!(
+        run_records[0].error_code,
+        Some(CrawlExecutionErrorCode::RemoteFailure)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_terminal_progress_repair_failure_is_repaired_from_db_without_rerun()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 2).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+    )
+    .with_terminal_progress_append_failure_for_test();
+    let runtime = runtime(&database, "quick-terminal-repair")?
+        .with_terminal_progress_repair_failure_for_test(
+            erabi_db::repositories::JobRepositoryError::StorageAdmissionBlocked,
+        );
+    let turn = runtime.execute_next_at(&handler, 100).await?;
+    let diagnostics = match turn {
+        WorkerTurn::Succeeded { diagnostics, .. } => diagnostics,
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let diagnostics = diagnostics.ok_or("terminal repair diagnostics were missing")?;
+    assert!(diagnostics.secondary.iter().any(|diagnostic| {
+        diagnostic.category == OrchestrationErrorCategory::ProgressPublication
+            && diagnostic.operation == erabi_jobs::ExecutionOperation::AppendProgress
+    }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let job_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .status(accepted.run_id)
+            .await?,
+        erabi_domain::CrawlRunStatus::Succeeded
+    );
+    assert_eq!(
+        JobRepository::new(&database).job(&job_id).await?.state,
+        erabi_db::repositories::JobState::Succeeded
+    );
+    let before_repair = ProgressRepository::new(&database)
+        .replay(&job_id, ProgressReplayRequest::new(None, 64)?)
+        .await?;
+    assert!(
+        before_repair
+            .events
+            .iter()
+            .all(|event| event.terminal.is_none())
+    );
+
+    let repository = JobRepository::new(&database);
+    repository.reconcile_terminal_crawl_runs(101).await?;
+    repository.reconcile_terminal_crawl_runs(102).await?;
+    let after_repair = ProgressRepository::new(&database)
+        .replay(&job_id, ProgressReplayRequest::new(None, 64)?)
+        .await?;
+    assert_eq!(
+        after_repair
+            .events
+            .iter()
+            .filter(|event| event.terminal == Some(erabi_jobs::ProgressTerminalState::Succeeded))
+            .count(),
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_only_terminal_publication_needs_no_repair()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 2).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+    )
+    .with_progress_live_hub(ProgressLiveHub::failing_for_test());
+    let turn = match runtime(&database, "quick-durable-only")?
+        .execute_next_at(&handler, 100)
+        .await
+    {
+        Ok(turn) => turn,
+        Err(error) => return Err(error.into()),
+    };
+    let diagnostics = match turn {
+        WorkerTurn::Succeeded { diagnostics, .. } => diagnostics,
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let diagnostics = diagnostics.ok_or("durable-only diagnostics were missing")?;
+    assert!(diagnostics.secondary.iter().any(|diagnostic| {
+        diagnostic.category == OrchestrationErrorCategory::ProgressPublication
+            && diagnostic.operation == erabi_jobs::ExecutionOperation::PublishProgress
+    }));
+    let job_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    let replay = ProgressRepository::new(&database)
+        .replay(&job_id, ProgressReplayRequest::new(None, 64)?)
+        .await?;
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .filter(|event| event.terminal == Some(erabi_jobs::ProgressTerminalState::Succeeded))
+            .count(),
+        1
+    );
+    JobRepository::new(&database)
+        .reconcile_terminal_crawl_runs(101)
+        .await?;
+    let replay_after_reconcile = ProgressRepository::new(&database)
+        .replay(&job_id, ProgressReplayRequest::new(None, 64)?)
+        .await?;
+    assert_eq!(replay_after_reconcile.events, replay.events);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -357,9 +742,28 @@ async fn provider_unavailability_retries_same_run_then_preserves_terminal_failur
     let first_turn = runtime.execute_next_at(&handler, 100).await?;
     let after_first = jobs.job(&job_id).await?;
     assert!(
-        matches!(first_turn, WorkerTurn::RetryScheduled { .. }),
+        matches!(&first_turn, WorkerTurn::RetryScheduled { .. }),
         "unexpected first worker turn: {first_turn:?}; job before: {before_first:?}; job after: {after_first:?}; adapter calls: {}",
         calls.load(Ordering::SeqCst),
+    );
+    let WorkerTurn::RetryScheduled { diagnostics, .. } = &first_turn else {
+        return Err("provider failure did not produce a retry turn".into());
+    };
+    let diagnostics = diagnostics
+        .as_ref()
+        .ok_or("provider failure diagnostics were not preserved")?;
+    let primary = diagnostics
+        .primary
+        .as_ref()
+        .ok_or("provider failure primary diagnostic was missing")?;
+    assert_eq!(primary.category, OrchestrationErrorCategory::Provider);
+    assert_eq!(primary.code, "PROVIDER_UNAVAILABLE");
+    assert!(primary.run_id.is_some());
+    assert!(primary.execution_id.is_some());
+    assert!(
+        diagnostics.secondary.iter().all(|diagnostic| {
+            diagnostic.job_attempt_id.is_some() && diagnostic.code.len() <= 64
+        })
     );
     let second_turn = runtime.execute_next_at(&handler, 110).await?;
     let job = jobs.job(&job_id).await?;
@@ -431,7 +835,7 @@ async fn explicit_quick_retry_advances_current_generation_once_and_reuses_curren
         successful_runtime
             .execute_next_at(&successful_handler, 120)
             .await?,
-        WorkerTurn::Succeeded { job_id } if job_id == action.job_id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == action.job_id
     ));
     let durable = CrawlTraversalRepository::new(&database)
         .reconstruct_recovery_state(accepted.run_id)
@@ -502,7 +906,7 @@ async fn quick_recovery_skips_completed_current_work_from_a_stale_checkpoint()
         action_runtime
             .execute_next_at(&action_handler, 120)
             .await?,
-        WorkerTurn::Succeeded { job_id } if job_id == action.id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == action.id
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -616,7 +1020,7 @@ async fn quick_restart_finalizes_current_success_over_historical_failure()
         successful_runtime
             .execute_next_at(&successful_handler, 120)
             .await?,
-        WorkerTurn::Succeeded { job_id } if job_id == action.job_id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == action.job_id
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let durable = CrawlTraversalRepository::new(&database)

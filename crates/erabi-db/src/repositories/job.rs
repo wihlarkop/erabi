@@ -329,6 +329,15 @@ pub struct StaleJobRecovery {
     pub unsafe_checkpoints: u32,
 }
 
+/// The durable Job/JobAttempt result selected from an authoritative terminal
+/// `CrawlRun`. Terminal progress is repaired in a separate transaction so a
+/// projection failure cannot roll back this lifecycle truth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalJobReconciliation {
+    pub state: JobState,
+    pub progress: ProgressTerminalState,
+}
+
 /// A rebuilt in-memory scheduling view derived only from durable queue rows.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConcurrencyState {
@@ -1299,7 +1308,7 @@ impl<'database> JobRepository<'database> {
         let result = async {
             let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
             if let Some(run_id) = job.crawl_run_id.as_deref()
-                && let Some(state) = finish_after_terminal_crawl_run(
+                && let Some(reconciliation) = finish_after_terminal_crawl_run(
                     &transaction,
                     job_id,
                     lease,
@@ -1308,7 +1317,7 @@ impl<'database> JobRepository<'database> {
                 )
                 .await?
             {
-                return Ok(state);
+                return Ok(Some(reconciliation));
             }
             let has_current_attempt_checkpoint =
                 has_checkpoint_for_current_attempt(&transaction, job_id, lease).await?;
@@ -1347,15 +1356,26 @@ impl<'database> JobRepository<'database> {
             if next_state == JobState::Failed && job.crawl_run_id.is_some() {
                 finalize_crawl_failure_in_transaction(&transaction, &job, now).await?;
             }
-            Ok(next_state)
+            Ok(None::<TerminalJobReconciliation>)
         }
         .await;
         match result {
-            Ok(state) => transaction
-                .commit()
-                .await
-                .map(|()| state)
-                .map_err(JobRepositoryError::database),
+            Ok(reconciliation) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(JobRepositoryError::database)?;
+                if let Some(reconciliation) = reconciliation {
+                    self.append_terminal_progress_if_missing(job_id, reconciliation.progress, now)
+                        .await?;
+                    Ok(reconciliation.state)
+                } else {
+                    // The normal pressure transition returns its state through
+                    // the durable row; re-read it only after commit so this
+                    // branch remains independent of projection repair.
+                    Ok(self.job(job_id).await?.state)
+                }
+            }
             Err(error) => {
                 let _ = transaction.rollback().await;
                 Err(error)
@@ -1449,14 +1469,174 @@ impl<'database> JobRepository<'database> {
             recover_expired_in_transaction(&transaction, now).await
         }
         .await;
-        match result {
+        let recovery = match result {
             Ok(recovery) => {
                 transaction
                     .commit()
                     .await
                     .map_err(JobRepositoryError::database)?;
-                Ok(recovery)
+                recovery
             }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+        // This scan is deliberately derived from durable rows. It repairs
+        // terminal progress after a process restart even when the worker had
+        // already released the Job lease before the append failed.
+        self.reconcile_terminal_crawl_runs(now).await?;
+        Ok(recovery)
+    }
+
+    /// Reconciles every durable Job linked to a terminal `CrawlRun`, then
+    /// idempotently repairs that Job's terminal progress event. No handler or
+    /// provider is invoked by this path.
+    ///
+    /// # Errors
+    /// Returns a typed queue/progress error. Job and attempt reconciliation is
+    /// committed before a later progress-projection error is returned.
+    pub async fn reconcile_terminal_crawl_runs(&self, now: i64) -> Result<(), JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            let mut rows = transaction
+                .query(
+                    "SELECT jobs.id, crawl_runs.status FROM jobs JOIN crawl_runs ON crawl_runs.id = jobs.crawl_run_id WHERE crawl_runs.status IN ('SUCCEEDED', 'PARTIAL_RESULT', 'FAILED', 'CANCELLED') ORDER BY jobs.id",
+                    (),
+                )
+                .await
+                .map_err(JobRepositoryError::database)?;
+            let mut repairs = Vec::new();
+            while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
+                let job_id = JobId(row.get(0).map_err(JobRepositoryError::database)?);
+                let run_status = row
+                    .get::<String>(1)
+                    .map_err(JobRepositoryError::database)?;
+                if let Some(reconciliation) = reconcile_terminal_job_in_transaction(
+                    &transaction,
+                    &job_id,
+                    &run_status,
+                    now,
+                )
+                .await?
+                {
+                    repairs.push((job_id, reconciliation.progress));
+                }
+            }
+            Ok::<_, JobRepositoryError>(repairs)
+        }
+        .await;
+        let repairs = match result {
+            Ok(repairs) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(JobRepositoryError::database)?;
+                repairs
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+        for (job_id, terminal) in repairs {
+            self.append_terminal_progress_if_missing(&job_id, terminal, now)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Commits Job/JobAttempt reconciliation for one handler that already
+    /// durably finalized its `CrawlRun`. Progress repair is intentionally a
+    /// separate call so it cannot rewrite the run or re-execute work.
+    ///
+    /// # Errors
+    /// Returns an ownership, queue, or terminal-run invariant error.
+    pub async fn reconcile_terminal_crawl_run(
+        &self,
+        job_id: &JobId,
+        lease: &JobLease,
+        run_id: &str,
+        now: i64,
+    ) -> Result<TerminalJobReconciliation, JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result = async {
+            let run_status = select_crawl_run_status(&transaction, run_id)
+                .await?
+                .ok_or(JobRepositoryError::QueueInvariant)?;
+            let current_job = select_job(&transaction, job_id).await?;
+            if current_job.crawl_run_id.as_deref() != Some(run_id) {
+                return Err(JobRepositoryError::QueueInvariant);
+            }
+            if current_job.state == JobState::Running && current_job.lease.as_ref() != Some(lease) {
+                return Err(JobRepositoryError::LeaseLost);
+            }
+            let reconciliation =
+                reconcile_terminal_job_in_transaction(&transaction, job_id, &run_status, now)
+                    .await?
+                    .ok_or(JobRepositoryError::QueueInvariant)?;
+            Ok(reconciliation)
+        }
+        .await;
+        match result {
+            Ok(reconciliation) => transaction
+                .commit()
+                .await
+                .map(|()| reconciliation)
+                .map_err(JobRepositoryError::database),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Repairs one terminal progress projection in its own immediate
+    /// transaction. Existing matching terminal progress is a no-op; a
+    /// contradictory terminal event is an invariant error and is never
+    /// overwritten.
+    ///
+    /// # Errors
+    /// Returns a typed progress or database error.
+    pub async fn append_terminal_progress_if_missing(
+        &self,
+        job_id: &JobId,
+        terminal: ProgressTerminalState,
+        now: i64,
+    ) -> Result<(), JobRepositoryError> {
+        let mut connection = self
+            .database
+            .connection()
+            .await
+            .map_err(JobRepositoryError::from_db)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(JobRepositoryError::database)?;
+        let result =
+            append_terminal_progress_if_missing_in_transaction(&transaction, job_id, terminal, now)
+                .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(JobRepositoryError::database),
             Err(error) => {
                 let _ = transaction.rollback().await;
                 Err(error)
@@ -2084,11 +2264,28 @@ async fn finish_after_terminal_crawl_run(
     lease: &JobLease,
     run_id: &str,
     now: i64,
-) -> Result<Option<JobState>, JobRepositoryError> {
+) -> Result<Option<TerminalJobReconciliation>, JobRepositoryError> {
     let Some(run_status) = select_crawl_run_status(connection, run_id).await? else {
         return Ok(None);
     };
-    let (state, outcome, failure, terminal) = match run_status.as_str() {
+    let Some(reconciliation) =
+        reconcile_terminal_job_in_transaction(connection, job_id, &run_status, now).await?
+    else {
+        return Ok(None);
+    };
+    let _ = lease;
+    Ok(Some(reconciliation))
+}
+
+/// Maps a terminal `CrawlRun` to the durable Job/JobAttempt outcome. It does not
+/// touch the progress projection, which must be independently repairable.
+async fn reconcile_terminal_job_in_transaction(
+    connection: &Connection,
+    job_id: &JobId,
+    run_status: &str,
+    now: i64,
+) -> Result<Option<TerminalJobReconciliation>, JobRepositoryError> {
+    let (state, outcome, failure, progress) = match run_status {
         "SUCCEEDED" | "PARTIAL_RESULT" => (
             JobState::Succeeded,
             AttemptOutcome::Succeeded,
@@ -2109,16 +2306,31 @@ async fn finish_after_terminal_crawl_run(
         ),
         _ => return Ok(None),
     };
-    finish_attempt_in_transaction(connection, job_id, lease, now, outcome, failure).await?;
-    finish_job_after_terminal_run(connection, job_id, lease, now, state, failure).await?;
-    append_terminal_progress_if_missing(connection, job_id, terminal, now).await?;
-    Ok(Some(state))
+    let job = select_job(connection, job_id).await?;
+    match job.state {
+        JobState::Running => {
+            let lease = job
+                .lease
+                .as_ref()
+                .ok_or(JobRepositoryError::QueueInvariant)?;
+            finish_attempt_in_transaction(connection, job_id, lease, now, outcome, failure).await?;
+            finish_job_after_terminal_run(connection, job_id, lease, now, state, failure).await?;
+        }
+        JobState::Succeeded if state == JobState::Succeeded => {}
+        JobState::Failed if state == JobState::Failed => {}
+        JobState::Cancelled if state == JobState::Cancelled => {}
+        JobState::Queued => return Err(JobRepositoryError::QueueInvariant),
+        JobState::Succeeded | JobState::Failed | JobState::Cancelled => {
+            return Err(JobRepositoryError::QueueInvariant);
+        }
+    }
+    Ok(Some(TerminalJobReconciliation { state, progress }))
 }
 
-/// Completes a progress stream exactly once while stale-job reconciliation is
-/// repairing a terminal CrawlRun/active Job crash window. A different prior
-/// terminal state is durable corruption rather than a state to overwrite.
-async fn append_terminal_progress_if_missing(
+/// Completes a progress stream exactly once while reconciliation is repairing
+/// a terminal `CrawlRun`. A different prior terminal state is durable corruption
+/// rather than a state to overwrite.
+async fn append_terminal_progress_if_missing_in_transaction(
     connection: &Connection,
     job_id: &JobId,
     terminal: ProgressTerminalState,
@@ -2126,21 +2338,21 @@ async fn append_terminal_progress_if_missing(
 ) -> Result<(), JobRepositoryError> {
     let mut rows = connection
         .query(
-            "SELECT payload_json FROM job_progress_events WHERE job_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            "SELECT sequence, payload_json FROM job_progress_events WHERE job_id = ?1 ORDER BY sequence ASC",
             [job_id.as_str()],
         )
         .await
         .map_err(JobRepositoryError::database)?;
-    let existing = rows
-        .next()
-        .await
-        .map_err(JobRepositoryError::database)?
-        .map(|row| row.get::<String>(0).map_err(JobRepositoryError::database))
-        .transpose()?;
-    if let Some(payload) = existing {
+    let mut terminal_count = 0_u8;
+    while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
+        let _sequence = row.get::<i64>(0).map_err(JobRepositoryError::database)?;
+        let payload = row.get::<String>(1).map_err(JobRepositoryError::database)?;
         let payload: serde_json::Value =
             serde_json::from_str(&payload).map_err(|_| JobRepositoryError::QueueInvariant)?;
-        if let Some(value) = payload.get("terminal") {
+        if let Some(value) = payload.get("terminal")
+            && !value.is_null()
+        {
+            terminal_count = terminal_count.saturating_add(1);
             let expected = match terminal {
                 ProgressTerminalState::Succeeded => "SUCCEEDED",
                 ProgressTerminalState::Failed => "FAILED",
@@ -2149,8 +2361,13 @@ async fn append_terminal_progress_if_missing(
             if value.as_str() != Some(expected) {
                 return Err(JobRepositoryError::QueueInvariant);
             }
-            return Ok(());
         }
+    }
+    if terminal_count > 1 {
+        return Err(JobRepositoryError::QueueInvariant);
+    }
+    if terminal_count == 1 {
+        return Ok(());
     }
     let event = NewProgressEvent::terminal(job_id.clone(), terminal, ProgressMetadata::default())
         .map_err(|_| JobRepositoryError::QueueInvariant)?;

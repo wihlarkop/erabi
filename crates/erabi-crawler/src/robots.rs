@@ -131,6 +131,11 @@ pub enum RobotsPolicyError {
     Admission(#[source] AdmissionError),
     #[error("robots policy was unavailable: {0}")]
     Unavailable(#[source] RobotsUnavailable),
+    #[error("robots policy was unavailable and pacing outcome accounting failed")]
+    UnavailableWithPacing {
+        failure: RobotsUnavailable,
+        pacing: AdmissionError,
+    },
     #[error("robots policy was invalid: {0}")]
     Invalid(#[source] RobotsInvalidPolicy),
 }
@@ -745,6 +750,7 @@ impl RobotsPolicyService {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn fetch_document(
         &self,
         target: &Url,
@@ -811,26 +817,35 @@ impl RobotsPolicyService {
                 return Err(RobotsPolicyError::Unavailable(RobotsUnavailable::Redirect));
             }
             429 => {
-                permit
-                    .record_outcome(PacingOutcome::RateLimited {
+                return Err(
+                    match permit.record_outcome(PacingOutcome::RateLimited {
                         retry_after: response.retry_after,
-                    })
-                    .map_err(RobotsPolicyError::Admission)?;
-                return Err(RobotsPolicyError::Unavailable(
-                    RobotsUnavailable::RateLimited,
-                ));
+                    }) {
+                        Ok(()) => RobotsPolicyError::Unavailable(RobotsUnavailable::RateLimited),
+                        Err(pacing) => RobotsPolicyError::UnavailableWithPacing {
+                            failure: RobotsUnavailable::RateLimited,
+                            pacing,
+                        },
+                    },
+                );
             }
             500..=599 => {
-                let _ = permit.record_outcome(PacingOutcome::Failed);
-                return Err(RobotsPolicyError::Unavailable(
-                    RobotsUnavailable::ServerFailure,
-                ));
+                return Err(match permit.record_outcome(PacingOutcome::Failed) {
+                    Ok(()) => RobotsPolicyError::Unavailable(RobotsUnavailable::ServerFailure),
+                    Err(pacing) => RobotsPolicyError::UnavailableWithPacing {
+                        failure: RobotsUnavailable::ServerFailure,
+                        pacing,
+                    },
+                });
             }
             _ => {
-                let _ = permit.record_outcome(PacingOutcome::Failed);
-                return Err(RobotsPolicyError::Unavailable(
-                    RobotsUnavailable::OtherStatus,
-                ));
+                return Err(match permit.record_outcome(PacingOutcome::Failed) {
+                    Ok(()) => RobotsPolicyError::Unavailable(RobotsUnavailable::OtherStatus),
+                    Err(pacing) => RobotsPolicyError::UnavailableWithPacing {
+                        failure: RobotsUnavailable::OtherStatus,
+                        pacing,
+                    },
+                });
             }
         };
         permit

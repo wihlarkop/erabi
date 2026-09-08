@@ -44,6 +44,7 @@ pub use job::{
     AcquiredJob, ActionRunAssociation, AttemptOutcome, ConcurrencyState, JobAttempt,
     JobFailureCode, JobId, JobKind, JobLease, JobRecord, JobRepository, JobRepositoryError,
     JobState, JobStorageClass, NewJob, ProductionRunJob, QuickScrapeRunJob, StaleJobRecovery,
+    TerminalJobReconciliation,
 };
 pub use progress::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
