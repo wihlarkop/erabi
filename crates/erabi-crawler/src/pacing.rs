@@ -18,6 +18,7 @@ use std::{
 };
 
 use erabi_domain::CrawlRunSnapshot;
+use erabi_observability::{CorrelationContext, EventOutcome, SemanticEvent, emit};
 use tokio::{sync::Notify, time::Instant};
 use url::Url;
 
@@ -755,6 +756,25 @@ impl PacingRegistration {
     }
 
     async fn acquire_with_delay(
+        &self,
+        robots_delay: Option<Duration>,
+        cancellation: &PacingCancellation,
+    ) -> Result<AdmissionPermit, AdmissionError> {
+        let started = Instant::now();
+        let result = Box::pin(self.acquire_with_delay_inner(robots_delay, cancellation)).await;
+        emit(SemanticEvent::PacingAcquireCompleted {
+            context: CorrelationContext::new(),
+            outcome: if result.is_ok() {
+                EventOutcome::Success
+            } else {
+                EventOutcome::Failure
+            },
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
+        result
+    }
+
+    async fn acquire_with_delay_inner(
         &self,
         robots_delay: Option<Duration>,
         cancellation: &PacingCancellation,

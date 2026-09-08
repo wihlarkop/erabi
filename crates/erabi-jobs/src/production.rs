@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use erabi_crawler::{
@@ -40,6 +40,10 @@ use erabi_domain::{
     DiscoveryPreviewSeed, DiscoveryTransitionId, EffectiveDiscoveryPreviewLimits,
     EffectiveTransitionPreviewTotalLimit, PageTypeId, PreviewBudgetKind, PreviewUrlState,
     TestDiagnostic,
+};
+use erabi_observability::{
+    ArtifactKind, CrawlExecutionSpan, EventOutcome, ProviderToken, SemanticEvent, TelemetryCode,
+    emit,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -1376,6 +1380,16 @@ impl ProductionCrawlJobHandler {
                     "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
                 )
             })?;
+        emit(SemanticEvent::RecoveryReconstructed {
+            context: crate::telemetry_id(&run_id.to_string())
+                .map_or(erabi_observability::CorrelationContext::new(), |id| {
+                    erabi_observability::CorrelationContext::new().with_crawl_run_id(id)
+                }),
+            action: erabi_observability::RecoveryAction::Reconstructed,
+            generation: 0,
+            recovered_count: u64::try_from(durable.work.len()).unwrap_or(u64::MAX),
+            outcome: EventOutcome::Reconstructed,
+        });
         let checkpoint_error =
             |code| ProductionError::checkpoint(ExecutionOperation::LoadCheckpoint, code);
         let queue_entry = |work: &CrawlUrlStateRecord| -> Result<_, ProductionError> {
@@ -1647,20 +1661,29 @@ impl ProductionCrawlJobHandler {
                 "CHECKPOINT_BUILD_FAILED",
             )
         })?;
-        context
-            .checkpoint(&checkpoint.to_envelope().map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::Serialization,
-                    "CHECKPOINT_ENVELOPE_FAILED",
-                )
-            })?)
-            .await
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_PERSIST_FAILED",
-                )
-            })?;
+        let envelope = checkpoint.to_envelope().map_err(|_| {
+            ProductionError::checkpoint(
+                ExecutionOperation::Serialization,
+                "CHECKPOINT_ENVELOPE_FAILED",
+            )
+        })?;
+        context.checkpoint(&envelope).await.map_err(|_| {
+            ProductionError::checkpoint(
+                ExecutionOperation::LoadCheckpoint,
+                "CHECKPOINT_PERSIST_FAILED",
+            )
+        })?;
+        emit(SemanticEvent::CheckpointPersisted {
+            context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+            version: checkpoint.payload_version,
+            phase: crate::telemetry_checkpoint_phase(CrawlRecoveryPhase::Traversing),
+            bytes: envelope
+                .payload
+                .as_ref()
+                .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
+            work_generation: 0,
+            outcome: EventOutcome::Durable,
+        });
         self.progress(context, "CHECKPOINT_SAVED", None).await
     }
 
@@ -1934,6 +1957,7 @@ impl ProductionCrawlJobHandler {
                     );
                     let artifacts = self
                         .persist_artifacts(
+                            context,
                             run_id,
                             snapshot.created_at(),
                             result.artifacts.clone(),
@@ -2086,6 +2110,7 @@ impl ProductionCrawlJobHandler {
                         page_type_id.and_then(|id| transition_for(&canonical_url, id, traversal));
                     let artifacts = self
                         .persist_artifacts(
+                            context,
                             run_id,
                             snapshot.created_at(),
                             result.artifacts.clone(),
@@ -2491,10 +2516,28 @@ impl ProductionCrawlJobHandler {
         )
         .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
         let result = tokio::select! {
-            value = self.adapter.execute(request) => value,
+            value = async {
+                let started = Instant::now();
+                let result = self.adapter.execute(request).await;
+                (started.elapsed(), result)
+            } => value,
             () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
             () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
         };
+        let (provider_duration, result) = result;
+        emit(SemanticEvent::ProviderExecuteCompleted {
+            context: crate::telemetry_job_context(context),
+            provider: ProviderToken::Crawl4Ai,
+            outcome: if result.is_ok() {
+                EventOutcome::Success
+            } else {
+                EventOutcome::Failure
+            },
+            duration_ms: u64::try_from(provider_duration.as_millis()).unwrap_or(u64::MAX),
+            code: result.as_ref().err().map(|error| {
+                TelemetryCode::from_static(crawl_execution_code_name(adapter_error_code(error)))
+            }),
+        });
         let result = match result {
             Ok(result) => {
                 if permit.record_outcome(PacingOutcome::Success).is_err() {
@@ -2632,6 +2675,7 @@ impl ProductionCrawlJobHandler {
 
     async fn persist_artifacts(
         &self,
+        context: &JobExecutionContext,
         run_id: CrawlRunId,
         created_at: &str,
         artifacts: Vec<CrawlerArtifactEvidence>,
@@ -2668,6 +2712,13 @@ impl ProductionCrawlJobHandler {
                         "ARTIFACT_RECORD_FAILED",
                     )
                 })?;
+            emit(SemanticEvent::ArtifactPersisted {
+                context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+                kind: telemetry_artifact_kind(kind),
+                count: 1,
+                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                outcome: EventOutcome::Success,
+            });
             saved.push(CrawlExecutionArtifact {
                 artifact_id: stored.id,
                 kind: execution_artifact_kind(kind),
@@ -2722,12 +2773,24 @@ impl ProductionCrawlJobHandler {
                 Ok(ProgressPublication::Published(_)) => {
                     if terminal_event {
                         context.mark_terminal_progress_durable();
+                        if let Some(terminal) = terminal {
+                            emit(SemanticEvent::ProgressTerminalPublished {
+                                context: crate::telemetry_job_context(context),
+                                status: crate::telemetry_progress_status(terminal),
+                            });
+                        }
                     }
                     Ok(())
                 }
                 Ok(ProgressPublication::DurableOnly { .. }) => {
                     if terminal_event {
                         context.mark_terminal_progress_durable();
+                        if let Some(terminal) = terminal {
+                            emit(SemanticEvent::ProgressTerminalDurableOnly {
+                                context: crate::telemetry_job_context(context),
+                                status: crate::telemetry_progress_status(terminal),
+                            });
+                        }
                     }
                     context.record_secondary_diagnostic(ExecutionDiagnostic::new(
                         OrchestrationErrorCategory::ProgressPublication,
@@ -2760,6 +2823,16 @@ impl ProductionCrawlJobHandler {
     }
 }
 
+fn telemetry_artifact_kind(kind: CrawlerArtifactKind) -> ArtifactKind {
+    match kind {
+        CrawlerArtifactKind::RawHtml
+        | CrawlerArtifactKind::CleanedHtml
+        | CrawlerArtifactKind::RenderedHtml => ArtifactKind::Html,
+        CrawlerArtifactKind::Screenshot => ArtifactKind::Screenshot,
+        CrawlerArtifactKind::Markdown => ArtifactKind::Other,
+    }
+}
+
 impl JobHandler for ProductionCrawlJobHandler {
     fn execute(
         &self,
@@ -2767,7 +2840,12 @@ impl JobHandler for ProductionCrawlJobHandler {
     ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
         let handler = self.clone();
         async move {
-            match handler.execute_inner(context.clone()).await {
+            let telemetry_context = crate::telemetry_job_context(&context);
+            let span = CrawlExecutionSpan::new(&telemetry_context);
+            match span
+                .run(Box::pin(handler.execute_inner(context.clone())))
+                .await
+            {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     context.record_diagnostics(error.diagnostics);

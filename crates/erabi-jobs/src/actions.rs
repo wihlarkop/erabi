@@ -14,6 +14,9 @@ use erabi_domain::{
     CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunType, RobotsAudit, RobotsDecision,
     SnapshotError,
 };
+use erabi_observability::{
+    CorrelationContext, EventOutcome, JobActionToken, RecoveryAction, SemanticEvent, emit,
+};
 
 use crate::{CancellationController, JobRuntimeError, request_job_cancellation};
 
@@ -551,13 +554,68 @@ impl JobActionResult {
 }
 
 fn result(action: JobAction, job: JobRecord, failed_part_count: Option<usize>) -> JobActionResult {
-    JobActionResult {
+    let result = JobActionResult {
         action,
         job_id: job.id,
         parent_job_id: job.parent_job_id,
         crawl_run_id: job.crawl_run_id,
         state: job.state,
         failed_part_count,
+    };
+    let mut context = CorrelationContext::new();
+    if let Some(source) = result
+        .parent_job_id
+        .as_ref()
+        .and_then(|value| crate::telemetry_id(value.as_str()))
+    {
+        context = context.with_source_job_id(source);
+    }
+    if let Some(run) = result.crawl_run_id.as_deref().and_then(crate::telemetry_id) {
+        context = context.with_crawl_run_id(run);
+    }
+    if result.parent_job_id.is_some()
+        && let Some(action_job) = crate::telemetry_id(result.job_id.as_str())
+    {
+        context = context.with_action_job_id(action_job);
+        emit(SemanticEvent::JobActionEnqueued {
+            context,
+            action: telemetry_action(action),
+        });
+        if let Some(recovery_action) = recovery_action(action) {
+            emit(SemanticEvent::JobRecoveryPrepared {
+                context,
+                action: recovery_action,
+                generation: 0,
+                recovered_count: u64::try_from(result.failed_part_count.unwrap_or(0))
+                    .unwrap_or(u64::MAX),
+                outcome: EventOutcome::Accepted,
+            });
+        }
+    }
+    result
+}
+
+const fn telemetry_action(action: JobAction) -> JobActionToken {
+    match action {
+        JobAction::RetryFailedParts => JobActionToken::RetryFailedParts,
+        JobAction::RerunFullCrawl => JobActionToken::RerunFullCrawl,
+        JobAction::ResumeCheckpoint => JobActionToken::ResumeCheckpoint,
+        JobAction::RestartFromBeginning => JobActionToken::RestartFromBeginning,
+        JobAction::Retry => JobActionToken::Retry,
+        JobAction::Cancel => JobActionToken::Cancel,
+        JobAction::Reprioritize => JobActionToken::Reprioritize,
+        JobAction::Remove => JobActionToken::Remove,
+    }
+}
+
+const fn recovery_action(action: JobAction) -> Option<RecoveryAction> {
+    match action {
+        JobAction::RetryFailedParts
+        | JobAction::RerunFullCrawl
+        | JobAction::ResumeCheckpoint
+        | JobAction::RestartFromBeginning
+        | JobAction::Retry => Some(RecoveryAction::Prepared),
+        JobAction::Cancel | JobAction::Reprioritize | JobAction::Remove => None,
     }
 }
 

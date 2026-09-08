@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
+erabi-observability = { version = "0.1.0", path = "../erabi-observability" }
 reqwest = { version = "0.13.4", default-features = false, features = [
   "rustls",
   "stream",

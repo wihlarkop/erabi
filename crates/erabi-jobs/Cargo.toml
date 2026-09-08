@@ -11,6 +11,7 @@ workspace = true
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
+erabi-observability = { version = "0.1.0", path = "../erabi-observability" }
 fs4 = { version = "1", default-features = false, features = ["sync"] }
 futures-util = "0.3.34"
 serde = { version = "1.0.229", features = ["derive"] }

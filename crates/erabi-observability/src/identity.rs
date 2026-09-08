@@ -60,6 +60,13 @@ impl TelemetryId {
         }
         Ok(Self(uuid))
     }
+
+    pub(crate) fn as_string(&self) -> String {
+        // Formatting is bounded to the canonical UUID representation. The
+        // string is only used by the internal tracing renderer; callers cannot
+        // obtain arbitrary identity text from this type.
+        self.0.to_string()
+    }
 }
 
 /// The request-header correlation identity. It is intentionally separate from

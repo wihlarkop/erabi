@@ -21,6 +21,14 @@ use erabi_db::{
     },
 };
 use erabi_domain::{CrawlExecutionId, CrawlRunId, CrawlRunStatus};
+use erabi_observability::{
+    CheckpointPhase, CorrelationContext, DiagnosticFields,
+    ExecutionAction as TelemetryExecutionAction, ExecutionCategory as TelemetryExecutionCategory,
+    ExecutionOperation as TelemetryExecutionOperation, JobAttemptSpan, JobStateToken,
+    SemanticEvent, TelemetryCode, TelemetryId, TerminalStatus,
+    WorkerRuntimeDisposition as TelemetryWorkerRuntimeDisposition,
+    WorkerTurnOutcome as TelemetryWorkerTurnOutcome, emit,
+};
 use futures_util::FutureExt;
 use tokio::{
     sync::RwLock,
@@ -83,6 +91,261 @@ pub enum OrchestrationErrorCategory {
     Finalization,
     ProgressPublication,
     Invariant,
+}
+
+pub(crate) const fn telemetry_operation(
+    operation: ExecutionOperation,
+) -> TelemetryExecutionOperation {
+    match operation {
+        ExecutionOperation::LoadJob => TelemetryExecutionOperation::LoadJob,
+        ExecutionOperation::LoadRunSnapshot => TelemetryExecutionOperation::LoadRunSnapshot,
+        ExecutionOperation::LoadCheckpoint => TelemetryExecutionOperation::LoadCheckpoint,
+        ExecutionOperation::TransitionRun => TelemetryExecutionOperation::TransitionRun,
+        ExecutionOperation::AcquireAdmission => TelemetryExecutionOperation::AcquireAdmission,
+        ExecutionOperation::ProviderExecution => TelemetryExecutionOperation::ProviderExecution,
+        ExecutionOperation::RecordOutcome => TelemetryExecutionOperation::RecordOutcome,
+        ExecutionOperation::PersistArtifact => TelemetryExecutionOperation::PersistArtifact,
+        ExecutionOperation::PersistExecution => TelemetryExecutionOperation::PersistExecution,
+        ExecutionOperation::FinalizeRun => TelemetryExecutionOperation::FinalizeRun,
+        ExecutionOperation::AppendProgress => TelemetryExecutionOperation::AppendProgress,
+        ExecutionOperation::PublishProgress => TelemetryExecutionOperation::PublishProgress,
+        ExecutionOperation::ReconcileTerminality => {
+            TelemetryExecutionOperation::ReconcileTerminality
+        }
+        ExecutionOperation::QueueLifecycle => TelemetryExecutionOperation::QueueLifecycle,
+        ExecutionOperation::Serialization => TelemetryExecutionOperation::Serialization,
+    }
+}
+
+pub(crate) const fn telemetry_category(
+    category: OrchestrationErrorCategory,
+) -> TelemetryExecutionCategory {
+    match category {
+        OrchestrationErrorCategory::Repository => TelemetryExecutionCategory::Repository,
+        OrchestrationErrorCategory::LeaseClaim => TelemetryExecutionCategory::LeaseClaim,
+        OrchestrationErrorCategory::CheckpointRecovery => {
+            TelemetryExecutionCategory::CheckpointRecovery
+        }
+        OrchestrationErrorCategory::Provider => TelemetryExecutionCategory::Provider,
+        OrchestrationErrorCategory::NetworkAdmission => {
+            TelemetryExecutionCategory::NetworkAdmission
+        }
+        OrchestrationErrorCategory::Pacing => TelemetryExecutionCategory::Pacing,
+        OrchestrationErrorCategory::Artifact => TelemetryExecutionCategory::Artifact,
+        OrchestrationErrorCategory::SerializationProjection => {
+            TelemetryExecutionCategory::SerializationProjection
+        }
+        OrchestrationErrorCategory::Finalization => TelemetryExecutionCategory::Finalization,
+        OrchestrationErrorCategory::ProgressPublication => {
+            TelemetryExecutionCategory::ProgressPublication
+        }
+        OrchestrationErrorCategory::Invariant => TelemetryExecutionCategory::Invariant,
+    }
+}
+
+pub(crate) const fn telemetry_action(action: ExecutionAction) -> TelemetryExecutionAction {
+    match action {
+        ExecutionAction::Continue => TelemetryExecutionAction::Continue,
+        ExecutionAction::Retry => TelemetryExecutionAction::Retry,
+        ExecutionAction::Fail => TelemetryExecutionAction::Fail,
+        ExecutionAction::Reconcile => TelemetryExecutionAction::Reconcile,
+        ExecutionAction::Publish => TelemetryExecutionAction::Publish,
+    }
+}
+
+pub(crate) const fn telemetry_runtime_disposition(
+    disposition: WorkerRuntimeDisposition,
+) -> TelemetryWorkerRuntimeDisposition {
+    match disposition {
+        WorkerRuntimeDisposition::Continue => TelemetryWorkerRuntimeDisposition::Continue,
+        WorkerRuntimeDisposition::LeaseLost => TelemetryWorkerRuntimeDisposition::LeaseLost,
+        WorkerRuntimeDisposition::Fatal => TelemetryWorkerRuntimeDisposition::Fatal,
+    }
+}
+
+pub(crate) fn telemetry_code(code: &'static str) -> TelemetryCode {
+    TelemetryCode::from_static(code)
+}
+
+pub(crate) fn telemetry_id(value: &str) -> Option<TelemetryId> {
+    TelemetryId::parse(value).ok()
+}
+
+pub(crate) fn telemetry_job_context(context: &JobExecutionContext) -> CorrelationContext {
+    let telemetry = CorrelationContext::new();
+    let telemetry =
+        telemetry_id(context.job_id.as_str()).map_or(telemetry, |id| telemetry.with_job_id(id));
+    telemetry_id(context.attempt_id.as_str()).map_or(telemetry, |id| telemetry.with_attempt_id(id))
+}
+
+pub(crate) fn telemetry_crawl_context(
+    context: &JobExecutionContext,
+    run_id: Option<&str>,
+    execution_id: Option<&str>,
+) -> CorrelationContext {
+    let mut telemetry = telemetry_job_context(context);
+    if let Some(value) = run_id.and_then(telemetry_id) {
+        telemetry = telemetry.with_crawl_run_id(value);
+    }
+    if let Some(value) = execution_id.and_then(telemetry_id) {
+        telemetry = telemetry.with_crawl_execution_id(value);
+    }
+    telemetry
+}
+
+fn telemetry_job_context_from_acquired(acquired: &AcquiredJob) -> CorrelationContext {
+    let telemetry = telemetry_id(acquired.job.id.as_str())
+        .map_or(CorrelationContext::new(), |id| {
+            CorrelationContext::new().with_job_id(id)
+        });
+    telemetry_id(&acquired.attempt.id).map_or(telemetry, |id| telemetry.with_attempt_id(id))
+}
+
+pub(crate) fn telemetry_diagnostic(diagnostic: &ExecutionDiagnostic) -> DiagnosticFields {
+    let telemetry = DiagnosticFields::new(
+        telemetry_code(diagnostic.code),
+        telemetry_operation(diagnostic.operation),
+        telemetry_category(diagnostic.category),
+        telemetry_action(diagnostic.action),
+    );
+    let telemetry = match diagnostic.provider {
+        Some("crawler-adapter" | "crawl4ai" | "CRAWL4AI") => {
+            telemetry.with_provider(erabi_observability::ProviderToken::Crawl4Ai)
+        }
+        Some(_) => telemetry.with_provider(erabi_observability::ProviderToken::Unavailable),
+        None => telemetry,
+    };
+    match diagnostic
+        .terminal_outcome
+        .and_then(telemetry_terminal_status)
+    {
+        Some(status) => telemetry.with_terminal_status(status),
+        None => telemetry,
+    }
+}
+
+pub(crate) fn telemetry_terminal_status(status: CrawlRunStatus) -> Option<TerminalStatus> {
+    match status {
+        CrawlRunStatus::Succeeded => Some(TerminalStatus::Succeeded),
+        CrawlRunStatus::PartialResult => Some(TerminalStatus::PartialResult),
+        CrawlRunStatus::Failed => Some(TerminalStatus::Failed),
+        CrawlRunStatus::Cancelled => Some(TerminalStatus::Cancelled),
+        CrawlRunStatus::Queued | CrawlRunStatus::Running => None,
+    }
+}
+
+pub(crate) const fn telemetry_job_state(state: JobState) -> JobStateToken {
+    match state {
+        JobState::Queued => JobStateToken::Queued,
+        JobState::Running => JobStateToken::Running,
+        JobState::Succeeded => JobStateToken::Succeeded,
+        JobState::Failed => JobStateToken::Failed,
+        JobState::Cancelled => JobStateToken::Cancelled,
+    }
+}
+
+pub(crate) const fn telemetry_progress_status(status: ProgressTerminalState) -> TerminalStatus {
+    match status {
+        ProgressTerminalState::Succeeded => TerminalStatus::Succeeded,
+        ProgressTerminalState::Failed => TerminalStatus::Failed,
+        ProgressTerminalState::Cancelled => TerminalStatus::Cancelled,
+    }
+}
+
+pub(crate) const fn telemetry_checkpoint_phase(
+    phase: erabi_crawler::CrawlRecoveryPhase,
+) -> CheckpointPhase {
+    match phase {
+        erabi_crawler::CrawlRecoveryPhase::Initialized => CheckpointPhase::Initialized,
+        erabi_crawler::CrawlRecoveryPhase::Traversing => CheckpointPhase::Running,
+        erabi_crawler::CrawlRecoveryPhase::Finalizing => CheckpointPhase::Finalizing,
+    }
+}
+
+pub(crate) const fn telemetry_turn_outcome(turn: &WorkerTurn) -> TelemetryWorkerTurnOutcome {
+    match turn {
+        WorkerTurn::Idle => TelemetryWorkerTurnOutcome::Idle,
+        WorkerTurn::Succeeded { .. } => TelemetryWorkerTurnOutcome::Succeeded,
+        WorkerTurn::RetryScheduled { .. } => TelemetryWorkerTurnOutcome::RetryScheduled,
+        WorkerTurn::Failed { .. } => TelemetryWorkerTurnOutcome::Failed,
+        WorkerTurn::Cancelled { .. } => TelemetryWorkerTurnOutcome::Cancelled,
+        WorkerTurn::StoragePressure { .. } => TelemetryWorkerTurnOutcome::StoragePressure,
+    }
+}
+
+pub(crate) fn telemetry_failure_code(failure: JobFailureCode) -> TelemetryCode {
+    telemetry_code(match failure {
+        JobFailureCode::HandlerFailed => "HANDLER_FAILED",
+        JobFailureCode::HandlerPanicked => "HANDLER_PANICKED",
+        JobFailureCode::LeaseExpired => "LEASE_EXPIRED",
+        JobFailureCode::Cancelled => "CANCELLED",
+        JobFailureCode::StoragePressure => "STORAGE_PRESSURE",
+    })
+}
+
+pub(crate) fn emit_turn_telemetry(context: &CorrelationContext, turn: &WorkerTurn) {
+    let (failure_code, diagnostics) = match turn {
+        WorkerTurn::RetryScheduled {
+            failure,
+            diagnostics,
+            ..
+        }
+        | WorkerTurn::Failed {
+            failure,
+            diagnostics,
+            ..
+        } => (Some(telemetry_failure_code(*failure)), diagnostics.as_ref()),
+        WorkerTurn::Succeeded { diagnostics, .. } | WorkerTurn::Cancelled { diagnostics, .. } => {
+            (None, diagnostics.as_ref())
+        }
+        WorkerTurn::Idle | WorkerTurn::StoragePressure { .. } => (None, None),
+    };
+    let primary = diagnostics.and_then(|value| value.primary.as_ref().map(telemetry_diagnostic));
+    let secondary_count = diagnostics.map_or(0, |value| value.secondary.len());
+    emit(SemanticEvent::WorkerTurnCompleted {
+        context: *context,
+        outcome: telemetry_turn_outcome(turn),
+        failure_code,
+        primary,
+        secondary_count: u8::try_from(secondary_count).unwrap_or(u8::MAX),
+    });
+    if let Some(diagnostics) = diagnostics {
+        for diagnostic in &diagnostics.secondary {
+            let diagnostic_context = diagnostic_context(context, diagnostic);
+            emit(SemanticEvent::ExecutionSecondaryFailure {
+                context: diagnostic_context,
+                diagnostic: telemetry_diagnostic(diagnostic),
+            });
+        }
+    }
+    match turn {
+        WorkerTurn::RetryScheduled { failure, .. } => emit(SemanticEvent::JobRetryScheduled {
+            context: *context,
+            failure_code: telemetry_failure_code(*failure),
+        }),
+        WorkerTurn::Cancelled { .. } => emit(SemanticEvent::JobCancelled { context: *context }),
+        _ => {}
+    }
+}
+
+fn diagnostic_context(
+    base: &CorrelationContext,
+    diagnostic: &ExecutionDiagnostic,
+) -> CorrelationContext {
+    let mut context = *base;
+    if let Some(value) = diagnostic
+        .run_id
+        .and_then(|value| telemetry_id(&value.to_string()))
+    {
+        context = context.with_crawl_run_id(value);
+    }
+    if let Some(value) = diagnostic
+        .execution_id
+        .and_then(|value| telemetry_id(&value.to_string()))
+    {
+        context = context.with_crawl_execution_id(value);
+    }
+    context
 }
 
 /// Safe operation names attached to a bounded execution diagnostic.
@@ -729,6 +992,11 @@ impl JobRuntimeError {
             },
         }
     }
+
+    #[must_use]
+    pub fn telemetry_disposition(&self) -> TelemetryWorkerRuntimeDisposition {
+        telemetry_runtime_disposition(self.disposition())
+    }
 }
 
 fn db_error_disposition(error: &DbError) -> WorkerRuntimeDisposition {
@@ -881,8 +1149,15 @@ impl<'database> JobRuntime<'database> {
             .await
             .map_err(JobRuntimeError::Repository)?
         else {
+            emit(SemanticEvent::WorkerPollIdle);
             return Ok(WorkerTurn::Idle);
         };
+        let telemetry_context = telemetry_job_context_from_acquired(&acquired);
+        emit(SemanticEvent::WorkerJobAcquired {
+            context: telemetry_context,
+            attempt_number: acquired.attempt.attempt_number,
+            lease_generation: acquired.attempt.lease_generation,
+        });
         let cancellation = self.cancellation.register(&acquired.job.id);
         let storage_pressure = self
             .storage_pressure
@@ -927,7 +1202,15 @@ impl<'database> JobRuntime<'database> {
             diagnostics: Arc::new(Mutex::new(ExecutionDiagnostics::new())),
             terminal_crawl_run: Arc::new(Mutex::new(None)),
         };
-        let outcome = self.execute_acquired(handler, context, now, started).await;
+        let attempt_span = JobAttemptSpan::new(&telemetry_context, acquired.attempt.attempt_number);
+        let outcome = attempt_span
+            .run(Box::pin(
+                self.execute_acquired(handler, context, now, started),
+            ))
+            .await;
+        if let Ok(turn) = &outcome {
+            emit_turn_telemetry(&telemetry_context, turn);
+        }
         self.cancellation.release(
             &acquired.job.id,
             matches!(
@@ -1072,6 +1355,7 @@ impl<'database> JobRuntime<'database> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn reconcile_terminal_commit(
         &self,
         context: &JobExecutionContext,
@@ -1098,7 +1382,28 @@ impl<'database> JobRuntime<'database> {
             .reconcile_terminal_crawl_run(&context.job_id, lease, &commit.run_id.to_string(), now)
             .await
             .map_err(JobRuntimeError::Repository)?;
+        let telemetry_context = telemetry_id(&commit.run_id.to_string())
+            .map_or(telemetry_job_context(context), |id| {
+                telemetry_job_context(context).with_crawl_run_id(id)
+            });
+        if let Some(status) = telemetry_terminal_status(commit.status) {
+            emit(SemanticEvent::CrawlRunTerminalCommitted {
+                context: telemetry_context,
+                status,
+            });
+            emit(SemanticEvent::JobTerminalReconciled {
+                context: telemetry_context,
+                job_state: telemetry_job_state(reconciliation.state),
+                run_status: status,
+            });
+        }
         if !commit.terminal_progress_durable {
+            if let Some(status) = telemetry_terminal_status(commit.status) {
+                emit(SemanticEvent::ProgressTerminalRepairPending {
+                    context: telemetry_context,
+                    status,
+                });
+            }
             let injected_failure = self
                 .terminal_progress_repair_failure_for_test
                 .lock()
@@ -1115,25 +1420,48 @@ impl<'database> JobRuntime<'database> {
                     )
                     .await
             };
-            if let Err(error) = repair {
-                let runtime_error = JobRuntimeError::Repository(error);
-                if runtime_error.disposition() == WorkerRuntimeDisposition::Fatal {
-                    // The CrawlRun and Job/Attempt reconciliation above is
-                    // already committed and remains authoritative. A fatal
-                    // repair error is a worker invariant, not a projection
-                    // diagnostic to demote or retry through provider work.
-                    return Err(runtime_error);
+            match repair {
+                Ok(()) => {
+                    if let Some(status) = telemetry_terminal_status(commit.status) {
+                        emit(SemanticEvent::ProgressTerminalRepaired {
+                            context: telemetry_context,
+                            status,
+                        });
+                    }
                 }
-                diagnostics.add_secondary(
-                    ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::ProgressPublication,
-                        ExecutionOperation::AppendProgress,
-                        ExecutionAction::Reconcile,
-                        "TERMINAL_PROGRESS_REPAIR_FAILED",
-                    )
-                    .with_run(commit.run_id)
-                    .with_terminal_outcome(commit.status),
-                );
+                Err(error) => {
+                    if matches!(error, JobRepositoryError::QueueInvariant)
+                        && terminal_progress_contradiction(
+                            &self.database,
+                            &context.job_id,
+                            reconciliation.progress,
+                        )
+                        .await
+                    {
+                        emit(SemanticEvent::ProgressTerminalContradiction {
+                            context: telemetry_context,
+                            code: telemetry_code("TERMINAL_PROGRESS_CONTRADICTION"),
+                        });
+                    }
+                    let runtime_error = JobRuntimeError::Repository(error);
+                    if runtime_error.disposition() == WorkerRuntimeDisposition::Fatal {
+                        // The CrawlRun and Job/Attempt reconciliation above is
+                        // already committed and remains authoritative. A fatal
+                        // repair error is a worker invariant, not a projection
+                        // diagnostic to demote or retry through provider work.
+                        return Err(runtime_error);
+                    }
+                    diagnostics.add_secondary(
+                        ExecutionDiagnostic::new(
+                            OrchestrationErrorCategory::ProgressPublication,
+                            ExecutionOperation::AppendProgress,
+                            ExecutionAction::Reconcile,
+                            "TERMINAL_PROGRESS_REPAIR_FAILED",
+                        )
+                        .with_run(commit.run_id)
+                        .with_terminal_outcome(commit.status),
+                    );
+                }
             }
         }
         let diagnostics = (!diagnostics.is_empty()).then_some(diagnostics);
@@ -1255,6 +1583,31 @@ impl<'database> JobRuntime<'database> {
             .map_err(|_| JobRuntimeError::Repository(JobRepositoryError::QueueInvariant))?;
         Ok(snapshot.run_type() == erabi_domain::CrawlRunType::ProductionRun)
     }
+}
+
+async fn terminal_progress_contradiction(
+    database: &ErabiDatabase,
+    job_id: &JobId,
+    expected: ProgressTerminalState,
+) -> bool {
+    let Ok(request) = ProgressReplayRequest::new(None, 256) else {
+        return false;
+    };
+    let Ok(page) = ProgressRepository::new(database)
+        .replay(job_id, request)
+        .await
+    else {
+        return false;
+    };
+    let mut terminal = None;
+    for event in page.events {
+        if let Some(status) = event.terminal
+            && (terminal.replace(status).is_some() || status != expected)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Shared Task 3 cancellation boundary used by both workers and explicit API

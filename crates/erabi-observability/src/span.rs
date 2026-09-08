@@ -3,12 +3,99 @@ use std::{future::Future, time::Duration};
 use tracing::{Instrument, Span, field};
 
 use crate::{
-    HttpMethod, RequestTraceId, RouteTemplate,
+    CorrelationContext, HttpMethod, RequestTraceId, RouteTemplate,
     fields::{
         FIELD_DURATION_MS, FIELD_HTTP_METHOD, FIELD_ROUTE_TEMPLATE, FIELD_STATUS_CODE,
         FIELD_TRACE_ID, HTTP_REQUEST_SPAN_NAME,
     },
 };
+
+/// Async-safe process-owned worker lifecycle span.
+pub struct WorkerLifecycleSpan {
+    span: Span,
+}
+
+impl WorkerLifecycleSpan {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            span: tracing::info_span!(
+                target: crate::fields::ERABI_TELEMETRY_TARGET,
+                "worker.lifecycle"
+            ),
+        }
+    }
+
+    pub async fn run<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        future.instrument(self.span.clone()).await
+    }
+}
+
+impl Default for WorkerLifecycleSpan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Async-safe span for one durably acquired job attempt.
+pub struct JobAttemptSpan {
+    span: Span,
+}
+
+impl JobAttemptSpan {
+    #[must_use]
+    pub fn new(context: &CorrelationContext, attempt_number: u32) -> Self {
+        Self {
+            span: tracing::info_span!(
+                target: crate::fields::ERABI_TELEMETRY_TARGET,
+                "job.attempt",
+                job_id = ?context.job_id(),
+                attempt_id = ?context.attempt_id(),
+                attempt_number = attempt_number,
+            ),
+        }
+    }
+
+    pub async fn run<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        future.instrument(self.span.clone()).await
+    }
+}
+
+/// Async-safe span for one semantic crawl execution.
+pub struct CrawlExecutionSpan {
+    span: Span,
+}
+
+impl CrawlExecutionSpan {
+    #[must_use]
+    pub fn new(context: &CorrelationContext) -> Self {
+        Self {
+            span: tracing::debug_span!(
+                target: crate::fields::ERABI_TELEMETRY_TARGET,
+                "crawl.execution",
+                job_id = ?context.job_id(),
+                attempt_id = ?context.attempt_id(),
+                crawl_run_id = ?context.crawl_run_id(),
+                crawl_execution_id = ?context.crawl_execution_id(),
+                crawler_id = ?context.crawler_id(),
+                crawler_version_id = ?context.crawler_version_id(),
+            ),
+        }
+    }
+
+    pub async fn run<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        future.instrument(self.span.clone()).await
+    }
+}
 
 /// Narrow async-safe instrumentation for an HTTP request.
 pub struct HttpRequestSpan {
