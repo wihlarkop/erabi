@@ -6,19 +6,21 @@
 use std::{
     panic::AssertUnwindSafe,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use erabi_db::{
-    ErabiDatabase,
+    DbError, ErabiDatabase,
     repositories::{
-        ConcurrencyState, CrawlRunRepository, JobFailureCode, JobId, JobKind, JobLease,
-        JobRepository, JobRepositoryError, JobState, StaleJobRecovery,
+        CheckpointRepositoryError as DbCheckpointRepositoryError, ConcurrencyState,
+        CrawlRunRepository, JobFailureCode, JobId, JobKind, JobLease, JobRepository,
+        JobRepositoryError, JobState, StaleJobRecovery,
     },
 };
+use erabi_domain::{CrawlExecutionId, CrawlRunId, CrawlRunStatus};
 use futures_util::FutureExt;
 use tokio::{
     sync::RwLock,
@@ -64,6 +66,185 @@ pub use erabi_db::repositories::{
     ProgressReplayPage, ProgressReplayRequest, ProgressRepository, ProgressRepositoryError,
     ProgressSequence, ProgressTerminalState,
 };
+
+/// Bounded categories for execution diagnostics. These are intentionally
+/// local to the jobs/runtime boundary rather than a workspace-wide error
+/// hierarchy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrchestrationErrorCategory {
+    Repository,
+    LeaseClaim,
+    CheckpointRecovery,
+    Provider,
+    NetworkAdmission,
+    Pacing,
+    Artifact,
+    SerializationProjection,
+    Finalization,
+    ProgressPublication,
+    Invariant,
+}
+
+/// Safe operation names attached to a bounded execution diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionOperation {
+    LoadJob,
+    LoadRunSnapshot,
+    LoadCheckpoint,
+    TransitionRun,
+    AcquireAdmission,
+    ProviderExecution,
+    RecordOutcome,
+    PersistArtifact,
+    PersistExecution,
+    FinalizeRun,
+    AppendProgress,
+    PublishProgress,
+    ReconcileTerminality,
+    QueueLifecycle,
+    Serialization,
+}
+
+/// Safe action selected by the orchestration boundary after an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionAction {
+    Continue,
+    Retry,
+    Fail,
+    Reconcile,
+    Publish,
+}
+
+/// Bounded, non-content diagnostic data for one orchestration failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionDiagnostic {
+    pub run_id: Option<CrawlRunId>,
+    pub job_id: Option<JobId>,
+    pub job_attempt_id: Option<String>,
+    pub execution_id: Option<CrawlExecutionId>,
+    pub work_generation: Option<u64>,
+    pub operation: ExecutionOperation,
+    pub category: OrchestrationErrorCategory,
+    pub action: ExecutionAction,
+    pub provider: Option<&'static str>,
+    pub attempt: Option<u32>,
+    pub terminal_outcome: Option<CrawlRunStatus>,
+    pub code: &'static str,
+}
+
+impl ExecutionDiagnostic {
+    #[must_use]
+    pub const fn new(
+        category: OrchestrationErrorCategory,
+        operation: ExecutionOperation,
+        action: ExecutionAction,
+        code: &'static str,
+    ) -> Self {
+        Self {
+            run_id: None,
+            job_id: None,
+            job_attempt_id: None,
+            execution_id: None,
+            work_generation: None,
+            operation,
+            category,
+            action,
+            provider: None,
+            attempt: None,
+            terminal_outcome: None,
+            code,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context(mut self, context: &JobExecutionContext) -> Self {
+        self.job_id = Some(context.job_id.clone());
+        self.job_attempt_id = Some(context.attempt_id.clone());
+        self.attempt = Some(context.attempt_number);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_run(mut self, run_id: CrawlRunId) -> Self {
+        self.run_id = Some(run_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_execution(mut self, execution_id: CrawlExecutionId) -> Self {
+        self.execution_id = Some(execution_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_work_generation(mut self, work_generation: u64) -> Self {
+        self.work_generation = Some(work_generation);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_provider(mut self, provider: &'static str) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_terminal_outcome(mut self, outcome: CrawlRunStatus) -> Self {
+        self.terminal_outcome = Some(outcome);
+        self
+    }
+}
+
+/// Primary and secondary typed diagnostics for one worker outcome. Secondary
+/// diagnostics never replace the primary business/execution failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionDiagnostics {
+    pub primary: Option<ExecutionDiagnostic>,
+    pub secondary: Vec<ExecutionDiagnostic>,
+}
+
+impl ExecutionDiagnostics {
+    const MAX_SECONDARY: usize = 8;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            primary: None,
+            secondary: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.secondary.is_empty()
+    }
+
+    fn add_primary(&mut self, diagnostic: ExecutionDiagnostic) {
+        if self.primary.is_none() {
+            self.primary = Some(diagnostic);
+        } else {
+            self.add_secondary(diagnostic);
+        }
+    }
+
+    fn add_secondary(&mut self, diagnostic: ExecutionDiagnostic) {
+        if self.secondary.len() < Self::MAX_SECONDARY {
+            self.secondary.push(diagnostic);
+        }
+    }
+}
+
+impl Default for ExecutionDiagnostics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalCrawlRunCommit {
+    run_id: CrawlRunId,
+    status: CrawlRunStatus,
+    terminal_progress_durable: bool,
+}
 pub use production::ProductionCrawlJobHandler;
 pub use quick_scrape::QuickScrapeJobHandler;
 
@@ -180,6 +361,8 @@ pub struct JobExecutionContext {
     storage_pressure: StoragePressureToken,
     checkpoint_writer: CheckpointWriter,
     terminal_failure: Arc<AtomicBool>,
+    diagnostics: Arc<Mutex<ExecutionDiagnostics>>,
+    terminal_crawl_run: Arc<Mutex<Option<TerminalCrawlRunCommit>>>,
 }
 
 impl JobExecutionContext {
@@ -272,6 +455,78 @@ impl JobExecutionContext {
     fn terminal_failure_requested(&self) -> bool {
         self.terminal_failure.load(Ordering::Acquire)
     }
+
+    pub(crate) fn record_primary_diagnostic(&self, diagnostic: ExecutionDiagnostic) {
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.add_primary(diagnostic.with_context(self));
+        }
+    }
+
+    pub(crate) fn record_secondary_diagnostic(&self, diagnostic: ExecutionDiagnostic) {
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.add_secondary(diagnostic.with_context(self));
+        }
+    }
+
+    pub(crate) fn record_diagnostics(&self, mut incoming: ExecutionDiagnostics) {
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            if let Some(primary) = incoming.primary.take() {
+                let primary = primary.with_context(self);
+                if diagnostics.primary.as_ref() != Some(&primary) {
+                    diagnostics.add_primary(primary);
+                }
+            }
+            for secondary in incoming.secondary {
+                diagnostics.add_secondary(secondary.with_context(self));
+            }
+        }
+    }
+
+    pub(crate) fn record_secondary_diagnostics(&self, incoming: ExecutionDiagnostics) {
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            if let Some(primary) = incoming.primary {
+                let primary = primary.with_context(self);
+                if diagnostics.primary.as_ref() != Some(&primary) {
+                    diagnostics.add_secondary(primary);
+                }
+            }
+            for secondary in incoming.secondary {
+                diagnostics.add_secondary(secondary.with_context(self));
+            }
+        }
+    }
+
+    fn take_diagnostics(&self) -> Option<ExecutionDiagnostics> {
+        self.diagnostics.lock().ok().and_then(|mut diagnostics| {
+            let taken = std::mem::take(&mut *diagnostics);
+            (!taken.is_empty()).then_some(taken)
+        })
+    }
+
+    pub(crate) fn mark_terminal_crawl_run(&self, run_id: CrawlRunId, status: CrawlRunStatus) {
+        if let Ok(mut terminal) = self.terminal_crawl_run.lock() {
+            *terminal = Some(TerminalCrawlRunCommit {
+                run_id,
+                status,
+                terminal_progress_durable: false,
+            });
+        }
+    }
+
+    pub(crate) fn mark_terminal_progress_durable(&self) {
+        if let Ok(mut terminal) = self.terminal_crawl_run.lock()
+            && let Some(terminal) = terminal.as_mut()
+        {
+            terminal.terminal_progress_durable = true;
+        }
+    }
+
+    fn take_terminal_crawl_run(&self) -> Option<TerminalCrawlRunCommit> {
+        self.terminal_crawl_run
+            .lock()
+            .ok()
+            .and_then(|mut terminal| terminal.take())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -350,24 +605,39 @@ pub enum WorkerTurn {
     Idle,
     Succeeded {
         job_id: JobId,
+        diagnostics: Option<ExecutionDiagnostics>,
     },
     RetryScheduled {
         job_id: JobId,
         failure: JobFailureCode,
+        diagnostics: Option<ExecutionDiagnostics>,
     },
     Failed {
         job_id: JobId,
         failure: JobFailureCode,
+        diagnostics: Option<ExecutionDiagnostics>,
     },
     Cancelled {
         job_id: JobId,
         checkpoint_persisted: bool,
+        diagnostics: Option<ExecutionDiagnostics>,
     },
     StoragePressure {
         job_id: JobId,
         state: JobState,
         checkpoint_persisted: bool,
     },
+}
+
+/// Control disposition for an error at the generic worker boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerRuntimeDisposition {
+    /// The worker may continue polling after a transient infrastructure issue.
+    Continue,
+    /// Another owner won the lease; the worker may continue polling normally.
+    LeaseLost,
+    /// Durable invariants or runtime policy are unsafe; the worker must stop.
+    Fatal,
 }
 
 /// Failure that prevents the generic worker boundary from safely proceeding.
@@ -377,6 +647,96 @@ pub enum JobRuntimeError {
     InvalidPolicy,
     #[error("durable job queue operation failed")]
     Repository(#[source] JobRepositoryError),
+}
+
+impl JobRuntimeError {
+    #[must_use]
+    pub fn disposition(&self) -> WorkerRuntimeDisposition {
+        match self {
+            Self::InvalidPolicy => WorkerRuntimeDisposition::Fatal,
+            Self::Repository(error) => match error {
+                JobRepositoryError::LeaseLost
+                | JobRepositoryError::Checkpoint(DbCheckpointRepositoryError::LeaseLost) => {
+                    WorkerRuntimeDisposition::LeaseLost
+                }
+                JobRepositoryError::Database(error)
+                | JobRepositoryError::Checkpoint(DbCheckpointRepositoryError::Database(error)) => {
+                    db_error_disposition(error)
+                }
+                JobRepositoryError::InvalidJobKind
+                | JobRepositoryError::InvalidMaxAttempts
+                | JobRepositoryError::NotFound
+                | JobRepositoryError::IllegalTransition
+                | JobRepositoryError::AttemptsExhausted
+                | JobRepositoryError::RemovalUnsafe
+                | JobRepositoryError::NotReprioritizable
+                | JobRepositoryError::ActionAlreadyActive
+                | JobRepositoryError::RetryAlreadyContinued
+                | JobRepositoryError::QueueInvariant
+                | JobRepositoryError::Checkpoint(
+                    DbCheckpointRepositoryError::InvalidEnvelope
+                    | DbCheckpointRepositoryError::PayloadTooLarge
+                    | DbCheckpointRepositoryError::Malformed
+                    | DbCheckpointRepositoryError::Inconsistent
+                    | DbCheckpointRepositoryError::Serialization
+                    | DbCheckpointRepositoryError::NotFound,
+                ) => WorkerRuntimeDisposition::Fatal,
+                JobRepositoryError::StorageAdmissionBlocked => WorkerRuntimeDisposition::Continue,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn safe_code(&self) -> &'static str {
+        match self {
+            Self::InvalidPolicy => "WORKER_POLICY_INVALID",
+            Self::Repository(error) => match error {
+                JobRepositoryError::Database(error) if error.is_durable_invariant() => {
+                    "DATABASE_INVARIANT"
+                }
+                JobRepositoryError::Checkpoint(DbCheckpointRepositoryError::Database(error)) => {
+                    if error.is_durable_invariant() {
+                        "DATABASE_INVARIANT"
+                    } else {
+                        "JOB_REPOSITORY_RUNTIME_ERROR"
+                    }
+                }
+                JobRepositoryError::QueueInvariant => "QUEUE_INVARIANT",
+                JobRepositoryError::InvalidJobKind | JobRepositoryError::InvalidMaxAttempts => {
+                    "JOB_REPOSITORY_INVARIANT"
+                }
+                JobRepositoryError::LeaseLost
+                | JobRepositoryError::Checkpoint(DbCheckpointRepositoryError::LeaseLost) => {
+                    "LEASE_LOST"
+                }
+                JobRepositoryError::Checkpoint(
+                    DbCheckpointRepositoryError::InvalidEnvelope
+                    | DbCheckpointRepositoryError::PayloadTooLarge
+                    | DbCheckpointRepositoryError::Malformed
+                    | DbCheckpointRepositoryError::Inconsistent
+                    | DbCheckpointRepositoryError::Serialization
+                    | DbCheckpointRepositoryError::NotFound,
+                ) => "CHECKPOINT_RUNTIME_ERROR",
+                JobRepositoryError::StorageAdmissionBlocked
+                | JobRepositoryError::NotFound
+                | JobRepositoryError::IllegalTransition
+                | JobRepositoryError::AttemptsExhausted
+                | JobRepositoryError::RemovalUnsafe
+                | JobRepositoryError::NotReprioritizable
+                | JobRepositoryError::ActionAlreadyActive
+                | JobRepositoryError::RetryAlreadyContinued
+                | JobRepositoryError::Database(_) => "JOB_REPOSITORY_RUNTIME_ERROR",
+            },
+        }
+    }
+}
+
+fn db_error_disposition(error: &DbError) -> WorkerRuntimeDisposition {
+    if error.is_durable_invariant() {
+        WorkerRuntimeDisposition::Fatal
+    } else {
+        WorkerRuntimeDisposition::Continue
+    }
 }
 
 /// Generic Tokio-ready single-worker runtime. A caller can run one turn from a
@@ -389,6 +749,7 @@ pub struct JobRuntime<'database> {
     policy: WorkerPolicy,
     cancellation: CancellationController,
     storage_pressure: StoragePressureMonitor,
+    terminal_progress_repair_failure_for_test: Arc<Mutex<Option<JobRepositoryError>>>,
 }
 
 impl<'database> JobRuntime<'database> {
@@ -457,6 +818,7 @@ impl<'database> JobRuntime<'database> {
             policy,
             cancellation,
             storage_pressure,
+            terminal_progress_repair_failure_for_test: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -465,6 +827,18 @@ impl<'database> JobRuntime<'database> {
     #[must_use]
     pub fn cancellation_controller(&self) -> CancellationController {
         self.cancellation.clone()
+    }
+
+    /// Injects one typed terminal-progress repair result for an integration
+    /// boundary test. It does not alter the durable CrawlRun or queue truth.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_terminal_progress_repair_failure_for_test(
+        mut self,
+        error: JobRepositoryError,
+    ) -> Self {
+        self.terminal_progress_repair_failure_for_test = Arc::new(Mutex::new(Some(error)));
+        self
     }
 
     /// Requests cancellation for one job. Queued work is durably cancelled so
@@ -550,6 +924,8 @@ impl<'database> JobRuntime<'database> {
             storage_pressure,
             checkpoint_writer,
             terminal_failure: Arc::new(AtomicBool::new(false)),
+            diagnostics: Arc::new(Mutex::new(ExecutionDiagnostics::new())),
+            terminal_crawl_run: Arc::new(Mutex::new(None)),
         };
         let outcome = self.execute_acquired(handler, context, now, started).await;
         self.cancellation.release(
@@ -565,6 +941,7 @@ impl<'database> JobRuntime<'database> {
         outcome
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_acquired<H: JobHandler>(
         &self,
         handler: &H,
@@ -607,9 +984,13 @@ impl<'database> JobRuntime<'database> {
                         Err(error) => {
                             // Lease loss revokes durable authority first, then signals
                             // the handler to reach its existing cooperative boundary.
-                            // Its eventual result is intentionally discarded.
+                            // The lease is already revoked, so the handler result
+                            // cannot change durable state. Observe every completion
+                            // branch explicitly rather than silently discarding it.
                             context.cancellation.cancel();
-                            let _ = handler.await;
+                            match handler.await {
+                                Ok(Ok(()) | Err(JobExecutionError)) | Err(_) => {}
+                            }
                             return Err(JobRuntimeError::Repository(error));
                         }
                     }
@@ -617,6 +998,19 @@ impl<'database> JobRuntime<'database> {
             }
         };
         let completed_at = current_queue_time(now, started)?;
+        let diagnostics = context.take_diagnostics();
+        if let Some(commit) = context.take_terminal_crawl_run() {
+            return self
+                .reconcile_terminal_commit(
+                    &context,
+                    &current_lease,
+                    completed_at,
+                    commit,
+                    diagnostics,
+                    result,
+                )
+                .await;
+        }
         if context.cancellation.is_cancelled() {
             let checkpoint_persisted = context.checkpoint_writer.persisted();
             self.repository
@@ -626,6 +1020,7 @@ impl<'database> JobRuntime<'database> {
             return Ok(WorkerTurn::Cancelled {
                 job_id: context.job_id,
                 checkpoint_persisted,
+                diagnostics,
             });
         }
         if context.storage_pressure.is_signalled() {
@@ -649,6 +1044,7 @@ impl<'database> JobRuntime<'database> {
                     .map_err(JobRuntimeError::Repository)?;
                 Ok(WorkerTurn::Succeeded {
                     job_id: context.job_id,
+                    diagnostics,
                 })
             }
             Ok(Err(JobExecutionError)) => {
@@ -658,6 +1054,7 @@ impl<'database> JobRuntime<'database> {
                     completed_at,
                     JobFailureCode::HandlerFailed,
                     context.terminal_failure_requested(),
+                    diagnostics,
                 )
                 .await
             }
@@ -668,9 +1065,96 @@ impl<'database> JobRuntime<'database> {
                     completed_at,
                     JobFailureCode::HandlerPanicked,
                     false,
+                    diagnostics,
                 )
                 .await
             }
+        }
+    }
+
+    async fn reconcile_terminal_commit(
+        &self,
+        context: &JobExecutionContext,
+        lease: &JobLease,
+        now: i64,
+        commit: TerminalCrawlRunCommit,
+        diagnostics: Option<ExecutionDiagnostics>,
+        result: Result<Result<(), JobExecutionError>, Box<dyn std::any::Any + Send>>,
+    ) -> Result<WorkerTurn, JobRuntimeError> {
+        let mut diagnostics = diagnostics.unwrap_or_default();
+        if matches!(result, Ok(Err(_)) | Err(_)) && diagnostics.primary.is_none() {
+            diagnostics.add_primary(
+                ExecutionDiagnostic::new(
+                    OrchestrationErrorCategory::Finalization,
+                    ExecutionOperation::ReconcileTerminality,
+                    ExecutionAction::Reconcile,
+                    "HANDLER_FAILED_AFTER_TERMINAL_COMMIT",
+                )
+                .with_run(commit.run_id),
+            );
+        }
+        let reconciliation = self
+            .repository
+            .reconcile_terminal_crawl_run(&context.job_id, lease, &commit.run_id.to_string(), now)
+            .await
+            .map_err(JobRuntimeError::Repository)?;
+        if !commit.terminal_progress_durable {
+            let injected_failure = self
+                .terminal_progress_repair_failure_for_test
+                .lock()
+                .ok()
+                .and_then(|mut failure| failure.take());
+            let repair = if let Some(error) = injected_failure {
+                Err(error)
+            } else {
+                self.repository
+                    .append_terminal_progress_if_missing(
+                        &context.job_id,
+                        reconciliation.progress,
+                        now,
+                    )
+                    .await
+            };
+            if let Err(error) = repair {
+                let runtime_error = JobRuntimeError::Repository(error);
+                if runtime_error.disposition() == WorkerRuntimeDisposition::Fatal {
+                    // The CrawlRun and Job/Attempt reconciliation above is
+                    // already committed and remains authoritative. A fatal
+                    // repair error is a worker invariant, not a projection
+                    // diagnostic to demote or retry through provider work.
+                    return Err(runtime_error);
+                }
+                diagnostics.add_secondary(
+                    ExecutionDiagnostic::new(
+                        OrchestrationErrorCategory::ProgressPublication,
+                        ExecutionOperation::AppendProgress,
+                        ExecutionAction::Reconcile,
+                        "TERMINAL_PROGRESS_REPAIR_FAILED",
+                    )
+                    .with_run(commit.run_id)
+                    .with_terminal_outcome(commit.status),
+                );
+            }
+        }
+        let diagnostics = (!diagnostics.is_empty()).then_some(diagnostics);
+        match reconciliation.state {
+            JobState::Succeeded => Ok(WorkerTurn::Succeeded {
+                job_id: context.job_id.clone(),
+                diagnostics,
+            }),
+            JobState::Failed => Ok(WorkerTurn::Failed {
+                job_id: context.job_id.clone(),
+                failure: JobFailureCode::HandlerFailed,
+                diagnostics,
+            }),
+            JobState::Cancelled => Ok(WorkerTurn::Cancelled {
+                job_id: context.job_id.clone(),
+                checkpoint_persisted: context.checkpoint_writer.persisted(),
+                diagnostics,
+            }),
+            JobState::Queued | JobState::Running => Err(JobRuntimeError::Repository(
+                JobRepositoryError::QueueInvariant,
+            )),
         }
     }
 
@@ -681,6 +1165,7 @@ impl<'database> JobRuntime<'database> {
         now: i64,
         failure: JobFailureCode,
         terminal: bool,
+        diagnostics: Option<ExecutionDiagnostics>,
     ) -> Result<WorkerTurn, JobRuntimeError> {
         if self.is_production_context(context).await? {
             self.repository
@@ -690,6 +1175,7 @@ impl<'database> JobRuntime<'database> {
             return Ok(WorkerTurn::Failed {
                 job_id: context.job_id.clone(),
                 failure,
+                diagnostics,
             });
         }
         if terminal {
@@ -700,6 +1186,7 @@ impl<'database> JobRuntime<'database> {
             return Ok(WorkerTurn::Failed {
                 job_id: context.job_id.clone(),
                 failure,
+                diagnostics,
             });
         }
         let retry_at = now
@@ -714,10 +1201,12 @@ impl<'database> JobRuntime<'database> {
             JobState::Queued => Ok(WorkerTurn::RetryScheduled {
                 job_id: context.job_id.clone(),
                 failure,
+                diagnostics,
             }),
             JobState::Failed => Ok(WorkerTurn::Failed {
                 job_id: context.job_id.clone(),
                 failure,
+                diagnostics,
             }),
             _ => Err(JobRuntimeError::Repository(
                 JobRepositoryError::QueueInvariant,
@@ -816,4 +1305,398 @@ pub async fn recover_and_rebuild_at(
     let recovery = repository.recover_stale_jobs(now).await?;
     let concurrency = repository.rebuild_concurrency_state(now).await?;
     Ok((recovery, concurrency))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, future::Future, path::Path};
+
+    use erabi_db::{
+        DbError, ErabiDatabase, MigrationFailure, MigrationFailureState, MigrationRunner,
+        repositories::{
+            CheckpointRepositoryError, CrawlExecutionRepository, CrawlExecutionSummary,
+            CrawlRunRepository, JobKind, JobRepository, JobState, NewJob, ProgressRepository,
+        },
+    };
+    use erabi_domain::{
+        CrawlRunId, CrawlRunSnapshot, CrawlRunSnapshotDraft, CrawlRunStatus, CrawlRunType,
+        ResolvedValue, RobotsAudit, RunConfiguration, SettingSource, SnapshotOperationalSettings,
+    };
+
+    use super::*;
+
+    #[test]
+    fn worker_runtime_dispositions_keep_transient_errors_pollable() {
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::Database(DbError::Invariant(
+                "test".to_owned(),
+            )))
+            .disposition(),
+            WorkerRuntimeDisposition::Fatal
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::StorageAdmissionBlocked).disposition(),
+            WorkerRuntimeDisposition::Continue
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::LeaseLost).disposition(),
+            WorkerRuntimeDisposition::LeaseLost
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::Checkpoint(
+                CheckpointRepositoryError::LeaseLost,
+            ))
+            .disposition(),
+            WorkerRuntimeDisposition::LeaseLost
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::QueueInvariant).disposition(),
+            WorkerRuntimeDisposition::Fatal
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::Checkpoint(
+                CheckpointRepositoryError::Malformed,
+            ))
+            .disposition(),
+            WorkerRuntimeDisposition::Fatal
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::Database(DbError::Serialization(
+                "test".to_owned()
+            ),))
+            .disposition(),
+            WorkerRuntimeDisposition::Fatal
+        );
+        assert_eq!(
+            JobRuntimeError::Repository(JobRepositoryError::Database(DbError::MigrationFailure {
+                failure: MigrationFailure {
+                    version: None,
+                    state: MigrationFailureState::ChecksumMismatch,
+                    message: "test".to_owned(),
+                },
+            },))
+            .disposition(),
+            WorkerRuntimeDisposition::Fatal
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_enqueue_raw_constraint_is_a_fatal_database_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = ErabiDatabase::in_memory().await?;
+        MigrationRunner::default().apply(&database).await?;
+        let job = NewJob::new(JobKind::new("TYPED_TRANSIENT")?, 0, 0, 1)?;
+        let repository = JobRepository::new(&database);
+        repository.enqueue(&job, 0).await?;
+        let error = match repository.enqueue(&job, 1).await {
+            Ok(()) => return Err("duplicate enqueue unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            JobRepositoryError::Database(DbError::Turso(_))
+        ));
+        assert_eq!(
+            JobRuntimeError::Repository(error).disposition(),
+            WorkerRuntimeDisposition::Fatal
+        );
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    struct HealthyStorageProbe;
+
+    impl StorageProbe for HealthyStorageProbe {
+        fn free_bytes(&self, _path: &Path) -> Result<u64, StorageProbeError> {
+            Ok(u64::MAX)
+        }
+    }
+
+    struct ContradictoryTerminalHandler {
+        database: ErabiDatabase,
+        run_id: CrawlRunId,
+        contradictory: bool,
+    }
+
+    impl JobHandler for ContradictoryTerminalHandler {
+        fn execute(
+            &self,
+            context: JobExecutionContext,
+        ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
+            let database = self.database.clone();
+            let run_id = self.run_id;
+            let contradictory = self.contradictory;
+            async move {
+                CrawlExecutionRepository::new(&database)
+                    .finalize(
+                        &CrawlExecutionSummary {
+                            crawl_run_id: run_id,
+                            in_scope_pages_planned: 0,
+                            in_scope_pages_completed: 0,
+                            pagination_truncation_count: 0,
+                            unresolved_partial_work_count: 0,
+                            page_type_ambiguity_count: 0,
+                        },
+                        CrawlRunStatus::Succeeded,
+                    )
+                    .await
+                    .map_err(|_| JobExecutionError)?;
+                if contradictory {
+                    ProgressRepository::new(&database)
+                        .append_at(
+                            &NewProgressEvent::terminal(
+                                context.job_id().clone(),
+                                ProgressTerminalState::Failed,
+                                ProgressMetadata::default(),
+                            )
+                            .map_err(|_| JobExecutionError)?,
+                            1,
+                        )
+                        .await
+                        .map_err(|_| JobExecutionError)?;
+                }
+                context.mark_terminal_crawl_run(run_id, CrawlRunStatus::Succeeded);
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_fails_fatally_on_contradictory_terminal_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn resolved<T>(value: T) -> ResolvedValue<T> {
+            ResolvedValue {
+                value,
+                source: SettingSource::BuiltInDefault,
+            }
+        }
+
+        let database = ErabiDatabase::in_memory().await?;
+        MigrationRunner::default().apply(&database).await?;
+        let run_id = CrawlRunId::new();
+        let snapshot = CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
+            run_type: CrawlRunType::QuickScrape,
+            configuration: RunConfiguration::QuickScrape {
+                target_url: "https://example.test/item".parse()?,
+                ad_hoc_configuration: BTreeMap::new(),
+            },
+            selected_seed_ids: Vec::new(),
+            run_profile_id: None,
+            settings: SnapshotOperationalSettings {
+                max_pages: resolved(1),
+                max_depth: resolved(0),
+                max_duration_seconds: resolved(60),
+                concurrency: resolved(1),
+                request_delay_ms: resolved(0),
+                timeout_ms: resolved(1_000),
+                screenshot: resolved(false),
+                asset_download_limit_bytes: resolved(1_000_000),
+                retain_artifacts: resolved(false),
+                user_agent: resolved("Erabi/0.1".to_owned()),
+            },
+            robots: RobotsAudit::respect(
+                "operator",
+                "unix:1",
+                "https://example.test",
+                "Erabi/0.1",
+                None,
+            ),
+            actor: "operator".to_owned(),
+            created_at: "unix:1".to_owned(),
+        })?;
+        CrawlRunRepository::new(&database)
+            .create(run_id, CrawlRunStatus::Queued, &snapshot)
+            .await?;
+        let mut job = NewJob::new(JobKind::new("TEST_WORK")?, 0, 0, 1)?;
+        job.crawl_run_id = Some(run_id.to_string());
+        JobRepository::new(&database).enqueue(&job, 0).await?;
+
+        let runtime = JobRuntime::with_storage_pressure_monitor(
+            &database,
+            "contradictory-terminal-worker",
+            WorkerPolicy::conservative(),
+            CancellationController::default(),
+            StoragePressureMonitor::new(
+                HealthyStorageProbe,
+                "contradictory-terminal-worker-data",
+                StoragePressurePolicy::default(),
+            ),
+        )?;
+        let result = runtime
+            .execute_next_at(
+                &ContradictoryTerminalHandler {
+                    database: database.clone(),
+                    run_id,
+                    contradictory: true,
+                },
+                2,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(JobRuntimeError::Repository(
+                JobRepositoryError::QueueInvariant
+            ))
+        ));
+        assert_eq!(
+            CrawlRunRepository::new(&database).status(run_id).await?,
+            CrawlRunStatus::Succeeded
+        );
+        assert_eq!(
+            JobRepository::new(&database).job(&job.id).await?.state,
+            JobState::Succeeded
+        );
+        let progress = ProgressRepository::new(&database)
+            .replay(&job.id, ProgressReplayRequest::new(None, 16)?)
+            .await?;
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| event.terminal.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            progress.events[0].terminal,
+            Some(ProgressTerminalState::Failed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_fails_fatally_on_database_invariant_during_terminal_repair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn resolved<T>(value: T) -> ResolvedValue<T> {
+            ResolvedValue {
+                value,
+                source: SettingSource::BuiltInDefault,
+            }
+        }
+
+        let database = ErabiDatabase::in_memory().await?;
+        MigrationRunner::default().apply(&database).await?;
+        let run_id = CrawlRunId::new();
+        let snapshot = CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
+            run_type: CrawlRunType::QuickScrape,
+            configuration: RunConfiguration::QuickScrape {
+                target_url: "https://example.test/item".parse()?,
+                ad_hoc_configuration: BTreeMap::new(),
+            },
+            selected_seed_ids: Vec::new(),
+            run_profile_id: None,
+            settings: SnapshotOperationalSettings {
+                max_pages: resolved(1),
+                max_depth: resolved(0),
+                max_duration_seconds: resolved(60),
+                concurrency: resolved(1),
+                request_delay_ms: resolved(0),
+                timeout_ms: resolved(1_000),
+                screenshot: resolved(false),
+                asset_download_limit_bytes: resolved(1_000_000),
+                retain_artifacts: resolved(false),
+                user_agent: resolved("Erabi/0.1".to_owned()),
+            },
+            robots: RobotsAudit::respect(
+                "operator",
+                "unix:1",
+                "https://example.test",
+                "Erabi/0.1",
+                None,
+            ),
+            actor: "operator".to_owned(),
+            created_at: "unix:1".to_owned(),
+        })?;
+        CrawlRunRepository::new(&database)
+            .create(run_id, CrawlRunStatus::Queued, &snapshot)
+            .await?;
+        let mut job = NewJob::new(JobKind::new("TEST_WORK")?, 0, 0, 1)?;
+        job.crawl_run_id = Some(run_id.to_string());
+        JobRepository::new(&database).enqueue(&job, 0).await?;
+
+        let runtime = JobRuntime::with_storage_pressure_monitor(
+            &database,
+            "fatal-terminal-repair-worker",
+            WorkerPolicy::conservative(),
+            CancellationController::default(),
+            StoragePressureMonitor::new(
+                HealthyStorageProbe,
+                "fatal-terminal-repair-worker-data",
+                StoragePressurePolicy::default(),
+            ),
+        )?
+        .with_terminal_progress_repair_failure_for_test(JobRepositoryError::Database(
+            DbError::Invariant("terminal repair invariant".to_owned()),
+        ));
+        let result = runtime
+            .execute_next_at(
+                &ContradictoryTerminalHandler {
+                    database: database.clone(),
+                    run_id,
+                    contradictory: false,
+                },
+                2,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(JobRuntimeError::Repository(JobRepositoryError::Database(
+                DbError::Invariant(_)
+            )))
+        ));
+        assert_eq!(
+            CrawlRunRepository::new(&database).status(run_id).await?,
+            CrawlRunStatus::Succeeded
+        );
+        assert_eq!(
+            JobRepository::new(&database).job(&job.id).await?.state,
+            JobState::Succeeded
+        );
+        assert!(
+            ProgressRepository::new(&database)
+                .replay(&job.id, ProgressReplayRequest::new(None, 16)?)
+                .await?
+                .events
+                .iter()
+                .all(|event| event.terminal.is_none())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn primary_diagnostics_are_preserved_when_secondary_failures_follow() {
+        let provider = ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Provider,
+            ExecutionOperation::ProviderExecution,
+            ExecutionAction::Retry,
+            "PROVIDER_REMOTE_FAILURE",
+        )
+        .with_provider("crawler-adapter");
+        let pacing = ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::Pacing,
+            ExecutionOperation::RecordOutcome,
+            ExecutionAction::Continue,
+            "PACING_OUTCOME_RECORD_FAILED",
+        );
+        let progress = ExecutionDiagnostic::new(
+            OrchestrationErrorCategory::ProgressPublication,
+            ExecutionOperation::AppendProgress,
+            ExecutionAction::Reconcile,
+            "PROGRESS_DURABLE_APPEND_FAILED",
+        );
+        let mut diagnostics = ExecutionDiagnostics::new();
+        diagnostics.add_primary(provider.clone());
+        diagnostics.add_secondary(pacing.clone());
+        diagnostics.add_primary(progress.clone());
+
+        assert_eq!(diagnostics.primary, Some(provider));
+        assert_eq!(diagnostics.secondary, vec![pacing, progress]);
+        assert_eq!(diagnostics.secondary.len(), 2);
+        assert!(
+            diagnostics
+                .secondary
+                .iter()
+                .all(|diagnostic| diagnostic.code != "PROVIDER_REMOTE_FAILURE")
+        );
+    }
 }

@@ -7,8 +7,8 @@ use erabi_crawler::{
 use erabi_db::repositories::{
     CheckpointEnvelope, CheckpointIdentity, CrawlExecutionRecord, CrawlExecutionRepository,
     CrawlExecutionSummary, CrawlRunRepository, CrawlerRepository, JobFailureCode, JobId, JobKind,
-    JobRepository, JobState, NewJob, ProgressReplayRequest, ProgressRepository,
-    ProgressTerminalState,
+    JobRepository, JobState, NewJob, NewProgressEvent, ProgressMetadata, ProgressReplayRequest,
+    ProgressRepository, ProgressTerminalState,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
@@ -572,6 +572,126 @@ async fn stale_running_job_reconciles_each_terminal_crawl_run_status_idempotentl
 }
 
 #[tokio::test]
+async fn db_derived_terminal_progress_repair_is_idempotent_and_does_not_execute_work()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job, run_id, _) = run_backed_job(&database, 1).await?;
+    let repository = JobRepository::new(&database);
+    let acquired = repository
+        .acquire_next("terminal-repair-worker", 0, 30)
+        .await?
+        .ok_or("terminal repair job was not acquired")?;
+    let lease = acquired.job.lease.clone().ok_or("lease missing")?;
+
+    CrawlExecutionRepository::new(&database)
+        .finalize(
+            &CrawlExecutionSummary {
+                crawl_run_id: run_id,
+                in_scope_pages_planned: 0,
+                in_scope_pages_completed: 0,
+                pagination_truncation_count: 0,
+                unresolved_partial_work_count: 0,
+                page_type_ambiguity_count: 0,
+            },
+            CrawlRunStatus::Succeeded,
+        )
+        .await?;
+    let reconciliation = repository
+        .reconcile_terminal_crawl_run(&job.id, &lease, &run_id.to_string(), 1)
+        .await?;
+    assert_eq!(reconciliation.state, JobState::Succeeded);
+    assert!(
+        ProgressRepository::new(&database)
+            .replay(&job.id, ProgressReplayRequest::new(None, 32)?)
+            .await?
+            .events
+            .iter()
+            .all(|event| event.terminal.is_none())
+    );
+    assert!(
+        CrawlExecutionRepository::new(&database)
+            .list_for_run(run_id)
+            .await?
+            .is_empty()
+    );
+
+    repository.reconcile_terminal_crawl_runs(2).await?;
+    repository.reconcile_terminal_crawl_runs(3).await?;
+    let progress = ProgressRepository::new(&database)
+        .replay(&job.id, ProgressReplayRequest::new(None, 32)?)
+        .await?;
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.terminal == Some(ProgressTerminalState::Succeeded))
+            .count(),
+        1
+    );
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Succeeded);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_progress_contradiction_is_an_invariant_after_business_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job, run_id, _) = run_backed_job(&database, 1).await?;
+    let repository = JobRepository::new(&database);
+    let acquired = repository
+        .acquire_next("terminal-contradiction-worker", 0, 30)
+        .await?
+        .ok_or("terminal contradiction job was not acquired")?;
+    let lease = acquired.job.lease.clone().ok_or("lease missing")?;
+
+    CrawlExecutionRepository::new(&database)
+        .finalize(
+            &CrawlExecutionSummary {
+                crawl_run_id: run_id,
+                in_scope_pages_planned: 0,
+                in_scope_pages_completed: 0,
+                pagination_truncation_count: 0,
+                unresolved_partial_work_count: 0,
+                page_type_ambiguity_count: 0,
+            },
+            CrawlRunStatus::Succeeded,
+        )
+        .await?;
+    ProgressRepository::new(&database)
+        .append_at(
+            &NewProgressEvent::terminal(
+                job.id.clone(),
+                ProgressTerminalState::Failed,
+                ProgressMetadata::default(),
+            )?,
+            1,
+        )
+        .await?;
+
+    repository
+        .reconcile_terminal_crawl_run(&job.id, &lease, &run_id.to_string(), 2)
+        .await?;
+    assert_eq!(repository.job(&job.id).await?.state, JobState::Succeeded);
+    assert!(matches!(
+        repository
+            .append_terminal_progress_if_missing(&job.id, ProgressTerminalState::Succeeded, 3)
+            .await,
+        Err(erabi_db::repositories::JobRepositoryError::QueueInvariant)
+    ));
+    assert_eq!(
+        ProgressRepository::new(&database)
+            .replay(&job.id, ProgressReplayRequest::new(None, 32)?)
+            .await?
+            .events
+            .iter()
+            .filter(|event| event.terminal.is_some())
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn terminal_production_system_failure_fails_run_from_queued_or_running()
 -> Result<(), Box<dyn std::error::Error>> {
     for mark_running in [false, true] {
@@ -603,6 +723,7 @@ async fn terminal_production_system_failure_fails_run_from_queued_or_running()
             WorkerTurn::Failed {
                 job_id: job_id.clone(),
                 failure: JobFailureCode::HandlerFailed,
+                diagnostics: None,
             }
         );
         assert_eq!(

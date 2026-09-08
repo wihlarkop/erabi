@@ -665,13 +665,13 @@ impl PacingService {
         }
     }
 
-    /// Builds a service backed by the same process-wide registry with an
-    /// explicit monotonic clock for crate-local deterministic tests.
-    #[cfg(test)]
+    /// Builds an isolated bounded service with an explicit monotonic clock for
+    /// deterministic boundary tests. Production callers use [`Self::new`]
+    /// and its process-wide registry.
     #[must_use]
-    pub(crate) fn with_clock(clock: Arc<dyn PacingClock>) -> Self {
+    pub fn with_clock(clock: Arc<dyn PacingClock>) -> Self {
         Self {
-            registry: process_origin_registry(),
+            registry: Arc::new(OriginRegistry::new(MAX_ORIGIN_PACING_STATES)),
             clock,
         }
     }

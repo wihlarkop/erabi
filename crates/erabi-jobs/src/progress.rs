@@ -37,6 +37,7 @@ pub enum ProgressLiveHubError {
 #[derive(Clone, Debug)]
 pub struct ProgressLiveHub {
     sender: broadcast::Sender<ProgressEvent>,
+    publication_failure: bool,
 }
 
 impl ProgressLiveHub {
@@ -57,7 +58,23 @@ impl ProgressLiveHub {
         }
         let (sender, receiver) = broadcast::channel(capacity);
         drop(receiver);
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            publication_failure: false,
+        })
+    }
+
+    /// Builds a deterministic live-publication failure seam for handler
+    /// boundary tests. Durable progress remains fully functional.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn failing_for_test() -> Self {
+        let (sender, receiver) = broadcast::channel(DEFAULT_PROGRESS_LIVE_CAPACITY);
+        drop(receiver);
+        Self {
+            sender,
+            publication_failure: true,
+        }
     }
 
     /// Subscribes before durable replay so concurrent publication cannot fall
@@ -79,7 +96,10 @@ impl Default for ProgressLiveHub {
     fn default() -> Self {
         let (sender, receiver) = broadcast::channel(DEFAULT_PROGRESS_LIVE_CAPACITY);
         drop(receiver);
-        Self { sender }
+        Self {
+            sender,
+            publication_failure: false,
+        }
     }
 }
 
@@ -98,6 +118,9 @@ impl ProgressPublisher for ProgressLiveHub {
         &self,
         event: ProgressEvent,
     ) -> impl Future<Output = Result<(), ProgressPublisherError>> + Send {
+        if self.publication_failure {
+            return std::future::ready(Err(ProgressPublisherError::NotificationFailed));
+        }
         // A receiver-free broadcast is not a failure: durable replay remains
         // authoritative and a later subscriber can reconnect by sequence.
         let _ = self.sender.send(event);

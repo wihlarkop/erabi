@@ -10,10 +10,10 @@ use erabi_crawler::{
     CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
     CrawlerArtifactEvidence, CrawlerCapabilities, CrawlerExecuteRequest, CrawlerExecuteResult,
     CrawlerFuture, CrawlerHealth, CrawlerHealthStatus, CrawlerMediaType, CrawlerResponseMetadata,
-    ManualPreviewClock, NetworkTargetPolicy, ObservedLink, PacingService, PaginationObservation,
-    ProductionRunSubmissionRequest, ProductionRunSubmissionService, RetryAfterTiming,
-    RobotsHttpResponse, RobotsPolicyService, RobotsTransport, StaticNetworkResolver,
-    ValidatedNetworkTarget,
+    ManualPreviewClock, NetworkTargetPolicy, ObservedLink, PacingClock, PacingService,
+    PacingSleepFuture, PaginationObservation, ProductionRunSubmissionRequest,
+    ProductionRunSubmissionService, RetryAfterTiming, RobotsHttpResponse, RobotsPolicyService,
+    RobotsTransport, StaticNetworkResolver, ValidatedNetworkTarget,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase, MigrationRunner,
@@ -31,8 +31,9 @@ use erabi_domain::{
 };
 use erabi_jobs::{
     CancellationController, JobActionError, JobActionService, JobRuntime,
-    ProductionCrawlJobHandler, ProgressReplayRequest, ProgressRepository, StoragePressureMonitor,
-    StoragePressurePolicy, StorageProbe, StorageProbeError, WorkerPolicy, WorkerTurn,
+    OrchestrationErrorCategory, ProductionCrawlJobHandler, ProgressReplayRequest,
+    ProgressRepository, StoragePressureMonitor, StoragePressurePolicy, StorageProbe,
+    StorageProbeError, WorkerPolicy, WorkerTurn,
 };
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -220,6 +221,76 @@ impl RobotsTransport for AllowRobots {
     }
 }
 
+struct FailingRobots;
+
+impl RobotsTransport for FailingRobots {
+    fn fetch<'transport>(
+        &'transport self,
+        _target: &'transport ValidatedNetworkTarget,
+        _user_agent: &'transport str,
+    ) -> erabi_crawler::RobotsFetchFuture<'transport> {
+        Box::pin(async {
+            Ok(RobotsHttpResponse::new(
+                500,
+                Vec::new(),
+                RetryAfterTiming::Absent,
+            ))
+        })
+    }
+}
+
+struct RateLimitedRobots;
+
+impl RobotsTransport for RateLimitedRobots {
+    fn fetch<'transport>(
+        &'transport self,
+        _target: &'transport ValidatedNetworkTarget,
+        _user_agent: &'transport str,
+    ) -> erabi_crawler::RobotsFetchFuture<'transport> {
+        Box::pin(async {
+            Ok(RobotsHttpResponse::new(
+                429,
+                Vec::new(),
+                RetryAfterTiming::Absent,
+            ))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct OverflowClock;
+
+impl PacingClock for OverflowClock {
+    fn now(&self) -> tokio::time::Instant {
+        let origin = std::time::Instant::now();
+        let mut low = 0_u64;
+        let mut high = 1_u64;
+        while origin.checked_add(Duration::from_secs(high)).is_some() {
+            low = high;
+            if high == u64::MAX {
+                break;
+            }
+            high = high.saturating_mul(2);
+        }
+        while low.saturating_add(1) < high {
+            let middle = low + (high - low) / 2;
+            if origin.checked_add(Duration::from_secs(middle)).is_some() {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        let instant = origin
+            .checked_add(Duration::from_secs(low))
+            .unwrap_or(origin);
+        tokio::time::Instant::from_std(instant)
+    }
+
+    fn sleep_until(&self, _deadline: tokio::time::Instant) -> PacingSleepFuture<'_> {
+        Box::pin(async {})
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HealthyStorageProbe;
 
@@ -242,11 +313,44 @@ fn handler(
     artifact_store: ArtifactStore,
     clock: Option<Arc<ManualPreviewClock>>,
 ) -> ProductionCrawlJobHandler {
-    let pacing = PacingService::new();
+    handler_with_transport(
+        database,
+        adapter,
+        artifact_store,
+        clock,
+        Arc::new(AllowRobots),
+    )
+}
+
+fn handler_with_transport(
+    database: ErabiDatabase,
+    adapter: Arc<dyn CrawlerAdapter>,
+    artifact_store: ArtifactStore,
+    clock: Option<Arc<ManualPreviewClock>>,
+    transport: Arc<dyn RobotsTransport>,
+) -> ProductionCrawlJobHandler {
+    handler_with_pacing(
+        database,
+        adapter,
+        artifact_store,
+        clock,
+        transport,
+        PacingService::new(),
+    )
+}
+
+fn handler_with_pacing(
+    database: ErabiDatabase,
+    adapter: Arc<dyn CrawlerAdapter>,
+    artifact_store: ArtifactStore,
+    clock: Option<Arc<ManualPreviewClock>>,
+    transport: Arc<dyn RobotsTransport>,
+    pacing: PacingService,
+) -> ProductionCrawlJobHandler {
     let value = ProductionCrawlJobHandler::new(
         database,
         adapter,
-        RobotsPolicyService::with_transport(policy(), pacing.clone(), Arc::new(AllowRobots)),
+        RobotsPolicyService::with_transport(policy(), pacing.clone(), transport),
         pacing,
         policy(),
         artifact_store,
@@ -563,6 +667,104 @@ async fn production_handler_executes_two_pages_and_emits_durable_progress()
 }
 
 #[tokio::test]
+async fn production_robots_admission_is_primary_without_provider_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version_id, _) = published_graph(
+        &database,
+        vec![seed("https://example.test/listing/a")?],
+        GraphOptions::default(),
+    )
+    .await?;
+    let _accepted = ProductionRunSubmissionService::new(database.clone())
+        .submit(request(&crawler, version_id, 10, 60, 30_000), 100)
+        .await?;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let temporary = tempfile::tempdir()?;
+    let root = handler_with_transport(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            pages: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+            clock: None,
+        }),
+        ArtifactStore::new(temporary.path())?,
+        None,
+        Arc::new(FailingRobots),
+    );
+    let turn = runtime(&database)?.execute_next_at(&root, 100).await?;
+    let diagnostics = match turn {
+        WorkerTurn::Succeeded { diagnostics, .. }
+        | WorkerTurn::RetryScheduled { diagnostics, .. }
+        | WorkerTurn::Failed { diagnostics, .. }
+        | WorkerTurn::Cancelled { diagnostics, .. } => diagnostics,
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let primary = diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.primary.as_ref())
+        .ok_or("robots primary diagnostic was missing")?;
+    assert_eq!(
+        primary.category,
+        OrchestrationErrorCategory::NetworkAdmission
+    );
+    assert!(primary.provider.is_none());
+    assert!(calls.lock().map_err(|_| "calls lock poisoned")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_robots_admission_keeps_pacing_failure_secondary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version_id, _) = published_graph(
+        &database,
+        vec![seed("https://example.test/listing/a")?],
+        GraphOptions::default(),
+    )
+    .await?;
+    let _accepted = ProductionRunSubmissionService::new(database.clone())
+        .submit(request(&crawler, version_id, 10, 60, 30_000), 100)
+        .await?;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let temporary = tempfile::tempdir()?;
+    let root = handler_with_pacing(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            pages: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+            clock: None,
+        }),
+        ArtifactStore::new(temporary.path())?,
+        None,
+        Arc::new(RateLimitedRobots),
+        PacingService::with_clock(Arc::new(OverflowClock)),
+    );
+    let turn = runtime(&database)?.execute_next_at(&root, 100).await?;
+    let diagnostics = match turn {
+        WorkerTurn::Succeeded { diagnostics, .. }
+        | WorkerTurn::RetryScheduled { diagnostics, .. }
+        | WorkerTurn::Failed { diagnostics, .. }
+        | WorkerTurn::Cancelled { diagnostics, .. } => diagnostics,
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let diagnostics = diagnostics.ok_or("robots diagnostics were missing")?;
+    assert_eq!(
+        diagnostics
+            .primary
+            .as_ref()
+            .map(|diagnostic| diagnostic.category),
+        Some(OrchestrationErrorCategory::NetworkAdmission)
+    );
+    assert!(diagnostics.secondary.iter().any(|diagnostic| {
+        diagnostic.category == OrchestrationErrorCategory::Pacing
+            && diagnostic.operation == erabi_jobs::ExecutionOperation::RecordOutcome
+    }));
+    assert!(calls.lock().map_err(|_| "calls lock poisoned")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn retry_failed_parts_dispatches_only_current_failed_and_partial_work()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -725,7 +927,7 @@ async fn retry_failed_parts_dispatches_only_current_failed_and_partial_work()
     let turn = runtime(&database)?
         .execute_next_at(&action_handler, 3)
         .await?;
-    assert!(matches!(turn, WorkerTurn::Succeeded { job_id } if job_id == action.job_id));
+    assert!(matches!(turn, WorkerTurn::Succeeded { job_id, .. } if job_id == action.job_id));
     let calls = match calls.lock() {
         Ok(calls) => calls.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -944,7 +1146,7 @@ async fn frontier_newer_than_checkpoint_is_recovered_from_durable_state()
         .await?;
     assert!(matches!(
         turn,
-        WorkerTurn::Succeeded { job_id } if job_id == recovery_action.id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == recovery_action.id
     ));
     let calls = match calls.lock() {
         Ok(calls) => calls.clone(),
@@ -1258,7 +1460,7 @@ async fn production_recovery_restores_zero_transition_page_schedule_and_preserve
     assert!(
         matches!(
             &turn,
-            WorkerTurn::Succeeded { job_id } if job_id == &recovery_action.id
+            WorkerTurn::Succeeded { job_id, .. } if job_id == &recovery_action.id
         ),
         "{turn:?}"
     );
@@ -1657,7 +1859,7 @@ async fn redirect_final_url_is_authoritative_for_children_and_deduplication()
         .await?;
     assert!(matches!(
         recovery_turn,
-        WorkerTurn::Succeeded { job_id } if job_id == recovery_action.id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == recovery_action.id
     ));
     let calls_after_recovery = match calls.lock() {
         Ok(calls) => calls.clone(),

@@ -411,10 +411,10 @@ async fn critical_admission_blocks_heavy_without_attempt_or_lease_but_runs_light
     };
 
     assert!(
-        matches!(runtime.execute_next_at(&handler, 1).await?, WorkerTurn::Succeeded { job_id } if job_id == first_light.id)
+        matches!(runtime.execute_next_at(&handler, 1).await?, WorkerTurn::Succeeded { job_id, .. } if job_id == first_light.id)
     );
     assert!(
-        matches!(runtime.execute_next_at(&handler, 1).await?, WorkerTurn::Succeeded { job_id } if job_id == second_light.id)
+        matches!(runtime.execute_next_at(&handler, 1).await?, WorkerTurn::Succeeded { job_id, .. } if job_id == second_light.id)
     );
     assert!(matches!(
         runtime.execute_next_at(&handler, 1).await?,
@@ -831,11 +831,11 @@ async fn critical_pressure_blocks_run_backed_task_four_children_but_not_control_
 
     assert!(matches!(
         runtime.execute_next_at(&handler, 2).await?,
-        WorkerTurn::Succeeded { job_id } if job_id == first_light.id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == first_light.id
     ));
     assert!(matches!(
         runtime.execute_next_at(&handler, 2).await?,
-        WorkerTurn::Succeeded { job_id } if job_id == second_light.id
+        WorkerTurn::Succeeded { job_id, .. } if job_id == second_light.id
     ));
     assert!(matches!(
         runtime.execute_next_at(&handler, 2).await?,
