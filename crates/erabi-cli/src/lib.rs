@@ -5,6 +5,7 @@ pub mod process_lock;
 pub mod runtime;
 pub mod shutdown;
 pub mod startup;
+pub mod telemetry;
 
 pub use config::{
     BindMode, BootstrapConfig, BootstrapConfigError, Crawl4AiBootstrapConfig, SafeUrl,

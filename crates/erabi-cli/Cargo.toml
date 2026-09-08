@@ -15,6 +15,7 @@ erabi-crawl4ai = { version = "0.1.0", path = "../erabi-crawl4ai" }
 erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }
+erabi-observability = { version = "0.1.0", path = "../erabi-observability" }
 secrecy = "0.10.3"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = [
