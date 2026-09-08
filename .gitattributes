@@ -1,0 +1,2 @@
+# Migration checksums are byte-sensitive; keep SQL checkout bytes stable across platforms.
+migrations/*.sql text eol=lf
