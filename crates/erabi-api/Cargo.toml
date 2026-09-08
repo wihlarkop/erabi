@@ -13,6 +13,7 @@ erabi-crawler = { version = "0.1.0", path = "../erabi-crawler" }
 erabi-db = { version = "0.1.0", path = "../erabi-db" }
 erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }
+erabi-observability = { version = "0.1.0", path = "../erabi-observability" }
 futures-util = "0.3.34"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,11 +22,11 @@ subtle = "2.6.1"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["sync"] }
 tower = { version = "0.5.3", features = ["util"] }
-tracing = "0.1.44"
 url = "2.5.8"
 uuid = { version = "1.26.0", features = ["v7"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+erabi-observability = { version = "0.1.0", path = "../erabi-observability", features = ["test-support"] }
 turso = { version = "0.7.2", default-features = false }

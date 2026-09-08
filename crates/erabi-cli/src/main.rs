@@ -2,6 +2,8 @@
 
 #[tokio::main]
 async fn main() {
+    let _ = erabi::telemetry::install_from_process_environment();
+
     let command = std::env::args().nth(1);
     if command.as_deref().is_some_and(|command| command != "serve") {
         eprintln!("usage: erabi [serve]");

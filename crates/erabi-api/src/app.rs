@@ -2,17 +2,17 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Extension, State},
+    extract::{DefaultBodyLimit, Extension, MatchedPath, State},
     http::{HeaderName, HeaderValue, Request, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
     routing::{any, delete, get, post},
 };
+use erabi_observability::{HttpMethod, HttpRequestSpan, RequestTraceId, RouteTemplate};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use tracing::Instrument;
-use uuid::Uuid;
+use std::time::Instant;
 
 use crate::{
     AppState, Crawl4AiAvailability, MutationAdmission, RuntimeMode, SecurityConfig,
@@ -52,27 +52,26 @@ use crate::{
 const TRACE_HEADER: HeaderName = HeaderName::from_static("x-erabi-trace-id");
 
 /// Safe request trace identity generated or propagated by the outer shell layer.
-#[derive(Clone, Debug)]
-pub(crate) struct TraceId(String);
+#[derive(Clone)]
+pub(crate) struct TraceId(RequestTraceId);
 
 impl TraceId {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self("test-trace-id".into())
+        Self(RequestTraceId::from_incoming(Some("test-trace-id")))
     }
 
     fn from_request(request: &Request<axum::body::Body>) -> Self {
-        let trace_id = request
-            .headers()
-            .get(&TRACE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| is_safe_trace_id(value))
-            .map_or_else(|| Uuid::now_v7().to_string(), ToOwned::to_owned);
-        Self(trace_id)
+        Self(RequestTraceId::from_incoming(
+            request
+                .headers()
+                .get(&TRACE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        ))
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
@@ -369,17 +368,19 @@ async fn static_asset_boundary() -> Response {
 
 async fn trace_request(mut request: Request<axum::body::Body>, next: middleware::Next) -> Response {
     let trace_id = TraceId::from_request(&request);
-    let method = request.method().clone();
-    let path = request.uri().path().to_owned();
+    let method = observed_http_method(request.method());
+    let route_template = route_template_for(
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str),
+    );
+    let span = HttpRequestSpan::new(&trace_id.0, method, &route_template);
     request.extensions_mut().insert(trace_id.clone());
 
-    let span = tracing::info_span!(
-        "erabi.http.request",
-        trace_id = %trace_id.as_str(),
-        method = %method,
-        path = %path,
-    );
-    let mut response = next.run(request).instrument(span).await;
+    let started_at = Instant::now();
+    let mut response = span.run(next.run(request)).await;
+    span.record_outcome(response.status().as_u16(), started_at.elapsed());
     response.headers_mut().insert(
         TRACE_HEADER,
         HeaderValue::from_str(trace_id.as_str())
@@ -393,15 +394,160 @@ async fn trace_request(mut request: Request<axum::body::Body>, next: middleware:
 pub(crate) fn trace_id_for(request: &Request<axum::body::Body>) -> String {
     request.extensions().get::<TraceId>().map_or_else(
         || "trace-unavailable".to_owned(),
-        |trace_id| trace_id.0.clone(),
+        |trace_id| trace_id.as_str().to_owned(),
     )
 }
 
-fn is_safe_trace_id(value: &str) -> bool {
-    (8..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+fn observed_http_method(method: &axum::http::Method) -> HttpMethod {
+    if method == axum::http::Method::GET {
+        HttpMethod::Get
+    } else if method == axum::http::Method::POST {
+        HttpMethod::Post
+    } else if method == axum::http::Method::PUT {
+        HttpMethod::Put
+    } else if method == axum::http::Method::PATCH {
+        HttpMethod::Patch
+    } else if method == axum::http::Method::DELETE {
+        HttpMethod::Delete
+    } else if method == axum::http::Method::HEAD {
+        HttpMethod::Head
+    } else if method == axum::http::Method::OPTIONS {
+        HttpMethod::Options
+    } else if method == axum::http::Method::CONNECT {
+        HttpMethod::Connect
+    } else if method == axum::http::Method::TRACE {
+        HttpMethod::Trace
+    } else {
+        HttpMethod::Other
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn route_template_for(matched_path: Option<&str>) -> RouteTemplate {
+    match matched_path {
+        Some("/api/v1/health") => RouteTemplate::ApiV1Health,
+        Some("/api/v1/openapi.json") => RouteTemplate::ApiV1OpenapiJson,
+        Some("/api/v1/readiness") => RouteTemplate::ApiV1Readiness,
+        Some("/api/v1/diagnostics/status") => RouteTemplate::ApiV1DiagnosticsStatus,
+        Some("/api/v1/quick-scrapes") => RouteTemplate::ApiV1QuickScrapes,
+        Some("/api/v1/quick-scrapes/batch") => RouteTemplate::ApiV1QuickScrapesBatch,
+        Some("/api/v1/crawlers") => RouteTemplate::ApiV1Crawlers,
+        Some("/api/v1/crawlers/{crawler_id}") => RouteTemplate::ApiV1CrawlersCrawlerId,
+        Some("/api/v1/crawlers/{crawler_id}/versions") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersions
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionId
+        }
+        Some("/api/v1/crawlers/{crawler_id}/drafts") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdDrafts
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdPublish
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdPublishValidation
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdReactivate
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdPageTypes
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdPageTypesPageTypeId
+        }
+        Some(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers",
+        ) => RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdPageTypesPageTypeIdMatchers,
+        Some(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers/{matcher_id}",
+        ) => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdPageTypesPageTypeIdMatchersMatcherId
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/match-page-type") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdMatchPageType
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalization") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdCanonicalization
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalize-url") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdCanonicalizeUrl
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/domain-scope") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdDomainScope
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/classify-domain-scope") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdClassifyDomainScope
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/guardrails") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdGuardrails
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdTransitions
+        }
+        Some(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions/{transition_id}",
+        ) => RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdTransitionsTransitionId,
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-lab/tests") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdTestLabTests
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdDiscoveryPreview
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/production-runs") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdProductionRuns
+        }
+        Some("/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence") => {
+            RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdTestEvidence
+        }
+        Some(
+            "/api/v1/crawlers/{crawler_id}/versions/{version_id}/test-evidence/{evidence_id}",
+        ) => RouteTemplate::ApiV1CrawlersCrawlerIdVersionsVersionIdTestEvidenceEvidenceId,
+        Some("/api/v1/diagnostics/{*path}") => RouteTemplate::ApiV1DiagnosticsWildcard,
+        Some("/api/v1/events/jobs/{job_id}/progress") => {
+            RouteTemplate::ApiV1EventsJobsJobIdProgress
+        }
+        Some("/api/v1/jobs/{job_id}/retry-failed-parts") => {
+            RouteTemplate::ApiV1JobsJobIdRetryFailedParts
+        }
+        Some("/api/v1/jobs/{job_id}/rerun-full-crawl") => {
+            RouteTemplate::ApiV1JobsJobIdRerunFullCrawl
+        }
+        Some("/api/v1/jobs/{job_id}/resume") => RouteTemplate::ApiV1JobsJobIdResume,
+        Some("/api/v1/jobs/{job_id}/restart") => RouteTemplate::ApiV1JobsJobIdRestart,
+        Some("/api/v1/jobs/{job_id}/retry") => RouteTemplate::ApiV1JobsJobIdRetry,
+        Some("/api/v1/jobs/{job_id}/cancel") => RouteTemplate::ApiV1JobsJobIdCancel,
+        Some("/api/v1/jobs/{job_id}/priority") => RouteTemplate::ApiV1JobsJobIdPriority,
+        Some("/api/v1/jobs/{job_id}") => RouteTemplate::ApiV1JobsJobId,
+        Some("/api/v1/events/{*path}") => RouteTemplate::ApiV1EventsWildcard,
+        Some("/api/v1/assets/{*path}") => RouteTemplate::ApiV1AssetsWildcard,
+        Some("/api/v1/exports/{*path}") => RouteTemplate::ApiV1ExportsWildcard,
+        Some("/api/v1/backups/{*path}") => RouteTemplate::ApiV1BackupsWildcard,
+        Some("/api/v1/artifacts/{*path}") => RouteTemplate::ApiV1ArtifactsWildcard,
+        Some("/api/v1/{*path}") => RouteTemplate::ApiV1Wildcard,
+        Some("/assets/{*path}") => RouteTemplate::AssetsWildcard,
+        Some("/") => RouteTemplate::Root,
+        Some("/{*path}") => RouteTemplate::RootWildcard,
+        None | Some(_) => RouteTemplate::UNKNOWN,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrecognized_matched_route_becomes_unknown_route() {
+        let route = route_template_for(Some("/api/v1/artifacts/DO_NOT_LOG_SECRET_PATH_74291"));
+        assert!(route == RouteTemplate::UNKNOWN);
+    }
+
+    #[test]
+    fn recognized_matched_route_uses_static_contract() {
+        let route = route_template_for(Some("/api/v1/artifacts/{*path}"));
+        assert!(route == RouteTemplate::ApiV1ArtifactsWildcard);
+    }
 }
 
 #[derive(Serialize)]

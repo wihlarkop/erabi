@@ -376,6 +376,39 @@ async fn safe_trace_ids_propagate_into_headers_and_error_envelopes()
 }
 
 #[tokio::test]
+async fn unsafe_trace_ids_are_replaced_without_changing_error_envelope_behavior()
+-> Result<(), Box<dyn std::error::Error>> {
+    let unsafe_trace_id = "trace~id1";
+    let response = remote_router()?
+        .oneshot(
+            request("GET", "/api/v1/readiness")
+                .header("x-erabi-trace-id", unsafe_trace_id)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response_trace_id = response
+        .headers()
+        .get("x-erabi-trace-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or("generated trace header was missing")?
+        .to_owned();
+    assert_ne!(response_trace_id, unsafe_trace_id);
+    assert_eq!(response_trace_id.len(), 36);
+    assert!(
+        response_trace_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["trace_id"], response_trace_id);
+    Ok(())
+}
+
+#[tokio::test]
 async fn recovery_mode_blocks_mutations_but_keeps_safe_diagnostics_available()
 -> Result<(), Box<dyn std::error::Error>> {
     let address: SocketAddr = "127.0.0.1:7878".parse()?;
