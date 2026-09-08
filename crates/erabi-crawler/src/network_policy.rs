@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+use erabi_observability::{
+    AdmissionOutcome, CorrelationContext, SemanticEvent, TelemetryCode, emit,
+};
 use reqwest::ClientBuilder;
 use tokio::net::lookup_host;
 use url::{Host, Url};
@@ -206,6 +209,26 @@ impl NetworkTargetPolicy {
         &self,
         url: &Url,
     ) -> Result<ValidatedNetworkTarget, NetworkTargetError> {
+        let result = self.validate_and_resolve_inner(url).await;
+        emit(SemanticEvent::NetworkAdmissionDecided {
+            context: CorrelationContext::new(),
+            outcome: if result.is_ok() {
+                AdmissionOutcome::Allowed
+            } else {
+                AdmissionOutcome::Rejected
+            },
+            code: result
+                .as_ref()
+                .err()
+                .map(|error| network_error_code(*error)),
+        });
+        result
+    }
+
+    async fn validate_and_resolve_inner(
+        &self,
+        url: &Url,
+    ) -> Result<ValidatedNetworkTarget, NetworkTargetError> {
         self.validate_url(url)?;
         let host = url.host_str().ok_or(NetworkTargetError::MissingHost)?;
         let port = url
@@ -248,6 +271,22 @@ impl NetworkTargetPolicy {
             addresses: addresses.into_boxed_slice(),
         })
     }
+}
+
+fn network_error_code(error: NetworkTargetError) -> TelemetryCode {
+    TelemetryCode::from_static(match error {
+        NetworkTargetError::UnsupportedScheme => "UNSUPPORTED_SCHEME",
+        NetworkTargetError::MissingHost => "MISSING_HOST",
+        NetworkTargetError::CredentialsNotAllowed => "CREDENTIALS_NOT_ALLOWED",
+        NetworkTargetError::FragmentNotAllowed => "FRAGMENT_NOT_ALLOWED",
+        NetworkTargetError::InvalidPort => "INVALID_PORT",
+        NetworkTargetError::ProhibitedLiteralAddress => "PROHIBITED_LITERAL_ADDRESS",
+        NetworkTargetError::ResolutionFailed => "RESOLUTION_FAILED",
+        NetworkTargetError::ResolutionTimedOut => "RESOLUTION_TIMED_OUT",
+        NetworkTargetError::EmptyResolution => "EMPTY_RESOLUTION",
+        NetworkTargetError::TooManyAddresses => "TOO_MANY_ADDRESSES",
+        NetworkTargetError::ProhibitedResolvedAddress => "PROHIBITED_RESOLVED_ADDRESS",
+    })
 }
 
 /// A target that has passed the shared outbound network policy.

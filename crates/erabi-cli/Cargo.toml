@@ -30,5 +30,6 @@ tokio = { version = "1.53.1", features = [
 url = "2.5.8"
 
 [dev-dependencies]
+erabi-observability = { version = "0.1.0", path = "../erabi-observability", features = ["test-support"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "test-util", "time"] }
 turso = { version = "0.7.2", default-features = false }

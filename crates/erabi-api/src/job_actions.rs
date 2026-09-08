@@ -13,6 +13,9 @@ use axum::{
 };
 use erabi_db::repositories::JobId;
 use erabi_jobs::{JobAction, JobActionError, JobActionResult, RerunFullCrawlInput};
+use erabi_observability::{
+    CorrelationContext, JobActionToken, SemanticEvent, TelemetryCode, TelemetryId, emit,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -37,9 +40,13 @@ pub(crate) async fn retry_failed_parts(
     Path(raw_job_id): Path<String>,
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
 ) -> Response {
-    action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service.retry_failed_parts(&job_id, now()).await
-    })
+    action_response(
+        state,
+        raw_job_id,
+        trace,
+        JobAction::RetryFailedParts,
+        |service, job_id| async move { service.retry_failed_parts(&job_id, now()).await },
+    )
     .await
 }
 
@@ -49,17 +56,23 @@ pub(crate) async fn rerun_full_crawl(
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
     Json(input): Json<RerunFullCrawlRequest>,
 ) -> Response {
-    action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service
-            .rerun_full_crawl(
-                &job_id,
-                now(),
-                RerunFullCrawlInput {
-                    robots_override_reason: input.robots_override_reason,
-                },
-            )
-            .await
-    })
+    action_response(
+        state,
+        raw_job_id,
+        trace,
+        JobAction::RerunFullCrawl,
+        |service, job_id| async move {
+            service
+                .rerun_full_crawl(
+                    &job_id,
+                    now(),
+                    RerunFullCrawlInput {
+                        robots_override_reason: input.robots_override_reason,
+                    },
+                )
+                .await
+        },
+    )
     .await
 }
 
@@ -68,9 +81,13 @@ pub(crate) async fn resume(
     Path(raw_job_id): Path<String>,
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
 ) -> Response {
-    action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service.resume(&job_id, now()).await
-    })
+    action_response(
+        state,
+        raw_job_id,
+        trace,
+        JobAction::ResumeCheckpoint,
+        |service, job_id| async move { service.resume(&job_id, now()).await },
+    )
     .await
 }
 
@@ -79,9 +96,13 @@ pub(crate) async fn restart(
     Path(raw_job_id): Path<String>,
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
 ) -> Response {
-    action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service.restart_from_beginning(&job_id, now()).await
-    })
+    action_response(
+        state,
+        raw_job_id,
+        trace,
+        JobAction::RestartFromBeginning,
+        |service, job_id| async move { service.restart_from_beginning(&job_id, now()).await },
+    )
     .await
 }
 
@@ -90,9 +111,13 @@ pub(crate) async fn retry(
     Path(raw_job_id): Path<String>,
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
 ) -> Response {
-    action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service.retry(&job_id, now()).await
-    })
+    action_response(
+        state,
+        raw_job_id,
+        trace,
+        JobAction::Retry,
+        |service, job_id| async move { service.retry(&job_id, now()).await },
+    )
     .await
 }
 
@@ -101,9 +126,13 @@ pub(crate) async fn cancel(
     Path(raw_job_id): Path<String>,
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
 ) -> Response {
-    action_response(state, raw_job_id, trace, |service, job_id| async move {
-        service.cancel(&job_id, now()).await
-    })
+    action_response(
+        state,
+        raw_job_id,
+        trace,
+        JobAction::Cancel,
+        |service, job_id| async move { service.cancel(&job_id, now()).await },
+    )
     .await
 }
 
@@ -114,10 +143,10 @@ pub(crate) async fn reprioritize(
     Json(input): Json<QueueActionInput>,
 ) -> Response {
     let Some(runtime) = state.job_actions_runtime() else {
-        return unavailable(&trace);
+        return unavailable(JobAction::Reprioritize, &trace);
     };
     let Ok(job_id) = raw_job_id.parse::<JobId>() else {
-        return invalid_job_id(&trace);
+        return invalid_job_id(JobAction::Reprioritize, &trace);
     };
     match runtime
         .service()
@@ -125,7 +154,7 @@ pub(crate) async fn reprioritize(
         .await
     {
         Ok(result) => success(result),
-        Err(error) => action_error(&error, &trace),
+        Err(error) => action_error(JobAction::Reprioritize, &error, &trace),
     }
 }
 
@@ -135,14 +164,14 @@ pub(crate) async fn remove(
     axum::extract::Extension(trace): axum::extract::Extension<TraceId>,
 ) -> Response {
     let Some(runtime) = state.job_actions_runtime() else {
-        return unavailable(&trace);
+        return unavailable(JobAction::Remove, &trace);
     };
     let Ok(job_id) = raw_job_id.parse::<JobId>() else {
-        return invalid_job_id(&trace);
+        return invalid_job_id(JobAction::Remove, &trace);
     };
     match runtime.service().remove(&job_id).await {
         Ok(result) => success(result),
-        Err(error) => action_error(&error, &trace),
+        Err(error) => action_error(JobAction::Remove, &error, &trace),
     }
 }
 
@@ -150,25 +179,52 @@ async fn action_response<F, Fut>(
     state: AppState,
     raw_job_id: String,
     trace: TraceId,
-    action: F,
+    requested_action: JobAction,
+    callback: F,
 ) -> Response
 where
     F: FnOnce(erabi_jobs::JobActionService, JobId) -> Fut,
     Fut: Future<Output = Result<JobActionResult, JobActionError>>,
 {
     let Some(runtime) = state.job_actions_runtime() else {
-        return unavailable(&trace);
+        return unavailable(requested_action, &trace);
     };
     let Ok(job_id) = raw_job_id.parse::<JobId>() else {
-        return invalid_job_id(&trace);
+        return invalid_job_id(requested_action, &trace);
     };
-    match action(runtime.service().clone(), job_id).await {
+    match callback(runtime.service().clone(), job_id).await {
         Ok(result) => success(result),
-        Err(error) => action_error(&error, &trace),
+        Err(error) => action_error(requested_action, &error, &trace),
     }
 }
 
 fn success(result: JobActionResult) -> Response {
+    let mut context = CorrelationContext::new();
+    if let Some(value) = result
+        .parent_job_id
+        .as_ref()
+        .and_then(|value| TelemetryId::parse(value.as_str()).ok())
+    {
+        context = context.with_source_job_id(value);
+    }
+    if let Some(value) = result
+        .parent_job_id
+        .as_ref()
+        .and_then(|_| TelemetryId::parse(result.job_id.as_str()).ok())
+    {
+        context = context.with_action_job_id(value);
+    }
+    if let Some(value) = result
+        .crawl_run_id
+        .as_deref()
+        .and_then(|value| TelemetryId::parse(value).ok())
+    {
+        context = context.with_crawl_run_id(value);
+    }
+    emit(SemanticEvent::JobActionAccepted {
+        context,
+        action: telemetry_action(result.action),
+    });
     Json(JobActionResponse {
         action: action_name(result.action),
         job_id: result.job_id.to_string(),
@@ -185,7 +241,7 @@ fn success(result: JobActionResult) -> Response {
     .into_response()
 }
 
-fn action_error(error: &JobActionError, trace: &TraceId) -> Response {
+fn action_error(action: JobAction, error: &JobActionError, trace: &TraceId) -> Response {
     let (status, code, message) = match error {
         JobActionError::NotFound => (
             StatusCode::NOT_FOUND,
@@ -258,10 +314,25 @@ fn action_error(error: &JobActionError, trace: &TraceId) -> Response {
             "The job action could not be completed safely.",
         ),
     };
+    emit(SemanticEvent::JobActionRejected {
+        context: CorrelationContext::new(),
+        action: telemetry_action(action),
+        code: TelemetryCode::from_static(code),
+        operational: matches!(
+            error,
+            JobActionError::Repository(_) | JobActionError::Cancellation(_)
+        ),
+    });
     error_response(status, ApiErrorEnvelope::new(code, message, trace.as_str()))
 }
 
-fn unavailable(trace: &TraceId) -> Response {
+fn unavailable(action: JobAction, trace: &TraceId) -> Response {
+    emit(SemanticEvent::JobActionRejected {
+        context: CorrelationContext::new(),
+        action: telemetry_action(action),
+        code: TelemetryCode::from_static("JOB_ACTIONS_UNAVAILABLE"),
+        operational: true,
+    });
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         ApiErrorEnvelope::new(
@@ -272,7 +343,13 @@ fn unavailable(trace: &TraceId) -> Response {
     )
 }
 
-fn invalid_job_id(trace: &TraceId) -> Response {
+fn invalid_job_id(action: JobAction, trace: &TraceId) -> Response {
+    emit(SemanticEvent::JobActionRejected {
+        context: CorrelationContext::new(),
+        action: telemetry_action(action),
+        code: TelemetryCode::from_static("INVALID_JOB_ID"),
+        operational: false,
+    });
     error_response(
         StatusCode::BAD_REQUEST,
         ApiErrorEnvelope::new(
@@ -281,6 +358,19 @@ fn invalid_job_id(trace: &TraceId) -> Response {
             trace.as_str(),
         ),
     )
+}
+
+const fn telemetry_action(action: JobAction) -> JobActionToken {
+    match action {
+        JobAction::RetryFailedParts => JobActionToken::RetryFailedParts,
+        JobAction::RerunFullCrawl => JobActionToken::RerunFullCrawl,
+        JobAction::ResumeCheckpoint => JobActionToken::ResumeCheckpoint,
+        JobAction::RestartFromBeginning => JobActionToken::RestartFromBeginning,
+        JobAction::Retry => JobActionToken::Retry,
+        JobAction::Cancel => JobActionToken::Cancel,
+        JobAction::Reprioritize => JobActionToken::Reprioritize,
+        JobAction::Remove => JobActionToken::Remove,
+    }
 }
 
 fn now() -> i64 {

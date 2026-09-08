@@ -16,6 +16,7 @@ use erabi_crawler::{
 };
 use erabi_db::repositories::SourceRepositoryError;
 use erabi_domain::{ResolvedValue, SettingSource, SnapshotOperationalSettings};
+use erabi_observability::{CorrelationContext, SemanticEvent, TelemetryCode, TelemetryId, emit};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -112,6 +113,7 @@ pub(crate) async fn start_quick_scrape(
     input: Result<Json<QuickScrapeRequest>, JsonRejection>,
 ) -> Response {
     let Ok(Json(input)) = input else {
+        emit_quick_rejected("INVALID_QUICK_SCRAPE_REQUEST", false);
         return api_error(
             StatusCode::BAD_REQUEST,
             "INVALID_QUICK_SCRAPE_REQUEST",
@@ -120,6 +122,7 @@ pub(crate) async fn start_quick_scrape(
         );
     };
     let Some(service) = state.quick_scrape_runtime() else {
+        emit_quick_rejected("QUICK_SCRAPE_UNAVAILABLE", true);
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "QUICK_SCRAPE_UNAVAILABLE",
@@ -133,11 +136,17 @@ pub(crate) async fn start_quick_scrape(
         Err(error) => return quick_scrape_request_error(error, &trace),
     };
     match service.submit(request, epoch_seconds()).await {
-        Ok(accepted) => (
-            StatusCode::ACCEPTED,
-            Json(QuickScrapeAcceptedResponse::from(accepted)),
-        )
-            .into_response(),
+        Ok(accepted) => {
+            emit(SemanticEvent::QuickScrapeAccepted {
+                context: quick_context(Some(&accepted.run_id.to_string()), Some(&accepted.job_id)),
+                item_count: 1,
+            });
+            (
+                StatusCode::ACCEPTED,
+                Json(QuickScrapeAcceptedResponse::from(accepted)),
+            )
+                .into_response()
+        }
         Err(error) => quick_scrape_error(&error, &trace),
     }
 }
@@ -145,6 +154,7 @@ pub(crate) async fn start_quick_scrape(
 /// Accepts a bounded pasted-URL convenience envelope. Every accepted item
 /// delegates to the Task 6 primitive; this route owns neither a batch run nor
 /// a batch transaction.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn start_quick_scrape_batch(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -153,6 +163,7 @@ pub(crate) async fn start_quick_scrape_batch(
     let input = match input {
         Ok(Json(input)) => input,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            emit_batch_rejected(0, 0, 0, 1, 0, true, "BODY_TOO_LARGE");
             return api_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "BODY_TOO_LARGE",
@@ -161,6 +172,7 @@ pub(crate) async fn start_quick_scrape_batch(
             );
         }
         Err(_) => {
+            emit_batch_rejected(0, 0, 0, 0, 0, false, "INVALID_QUICK_SCRAPE_BATCH_REQUEST");
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "INVALID_QUICK_SCRAPE_BATCH_REQUEST",
@@ -170,6 +182,7 @@ pub(crate) async fn start_quick_scrape_batch(
         }
     };
     if input.items.is_empty() {
+        emit_batch_rejected(0, 0, 0, 0, 0, false, "EMPTY_QUICK_SCRAPE_BATCH");
         return api_error(
             StatusCode::BAD_REQUEST,
             "EMPTY_QUICK_SCRAPE_BATCH",
@@ -178,6 +191,15 @@ pub(crate) async fn start_quick_scrape_batch(
         );
     }
     if input.items.len() > QUICK_SCRAPE_BATCH_MAX_ITEMS {
+        emit_batch_rejected(
+            u64::try_from(input.items.len()).unwrap_or(u64::MAX),
+            0,
+            0,
+            0,
+            0,
+            false,
+            "TOO_MANY_QUICK_SCRAPE_ITEMS",
+        );
         return api_error(
             StatusCode::BAD_REQUEST,
             "TOO_MANY_QUICK_SCRAPE_ITEMS",
@@ -186,6 +208,15 @@ pub(crate) async fn start_quick_scrape_batch(
         );
     }
     let Some(service) = state.quick_scrape_runtime() else {
+        emit_batch_rejected(
+            u64::try_from(input.items.len()).unwrap_or(u64::MAX),
+            0,
+            0,
+            1,
+            0,
+            true,
+            "QUICK_SCRAPE_UNAVAILABLE",
+        );
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "QUICK_SCRAPE_UNAVAILABLE",
@@ -239,6 +270,62 @@ pub(crate) async fn start_quick_scrape_batch(
                 }
             },
         }
+    }
+
+    let item_count = u64::try_from(outcomes.len()).unwrap_or(u64::MAX);
+    let accepted_count = u64::try_from(
+        outcomes
+            .iter()
+            .filter(|item| matches!(item, QuickScrapeBatchOutcome::Accepted { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let validation_rejected_count = u64::try_from(
+        outcomes
+            .iter()
+            .filter(|item| matches!(item, QuickScrapeBatchOutcome::ValidationError { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let system_error_count = u64::try_from(
+        outcomes
+            .iter()
+            .filter(|item| matches!(item, QuickScrapeBatchOutcome::SystemError { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let not_processed_count = u64::try_from(
+        outcomes
+            .iter()
+            .filter(|item| matches!(item, QuickScrapeBatchOutcome::NotProcessed { .. }))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    if system_error_count > 0 || accepted_count == 0 {
+        emit(SemanticEvent::QuickScrapeBatchRejected {
+            context: CorrelationContext::new(),
+            item_count,
+            accepted_count,
+            validation_rejected_count,
+            system_error_count,
+            not_processed_count,
+            halted,
+            code: TelemetryCode::from_static(if system_error_count > 0 {
+                "QUICK_SCRAPE_SUBMISSION_FAILED"
+            } else {
+                "BATCH_VALIDATION_REJECTED"
+            }),
+        });
+    } else {
+        emit(SemanticEvent::QuickScrapeBatchAccepted {
+            context: CorrelationContext::new(),
+            item_count,
+            accepted_count,
+            validation_rejected_count,
+            system_error_count,
+            not_processed_count,
+            halted,
+        });
     }
 
     (
@@ -345,6 +432,7 @@ fn quick_scrape_error(error: &QuickScrapeSubmissionError, trace: &TraceId) -> Re
             "Quick Scrape could not be durably accepted.",
         ),
     };
+    emit_quick_rejected(code, matches!(error, QuickScrapeSubmissionError::Job(_)));
     api_error(status, code, message, trace)
 }
 
@@ -382,7 +470,53 @@ fn quick_scrape_request_error(error: QuickScrapeRequestError, trace: &TraceId) -
             "A Quick Scrape robots override requires a non-empty bounded reason.",
         ),
     };
+    emit_quick_rejected(code, false);
     api_error(StatusCode::BAD_REQUEST, code, message, trace)
+}
+
+fn quick_context(run_id: Option<&str>, job_id: Option<&str>) -> CorrelationContext {
+    let mut context = CorrelationContext::new();
+    if let Some(value) = job_id.and_then(|value| TelemetryId::parse(value).ok()) {
+        context = context.with_job_id(value);
+    }
+    if let Some(value) = run_id.and_then(|value| TelemetryId::parse(value).ok()) {
+        context = context.with_crawl_run_id(value);
+    }
+    context
+}
+
+fn emit_quick_rejected(code: &'static str, operational: bool) {
+    emit(SemanticEvent::QuickScrapeRejected {
+        context: CorrelationContext::new(),
+        code: TelemetryCode::from_static(code),
+        item_count: 1,
+        validation_rejected_count: u64::from(!operational),
+        system_error_count: u64::from(operational),
+        not_processed_count: 0,
+        halted: false,
+        operational,
+    });
+}
+
+fn emit_batch_rejected(
+    item_count: u64,
+    accepted_count: u64,
+    validation_rejected_count: u64,
+    system_error_count: u64,
+    not_processed_count: u64,
+    halted: bool,
+    code: &'static str,
+) {
+    emit(SemanticEvent::QuickScrapeBatchRejected {
+        context: CorrelationContext::new(),
+        item_count,
+        accepted_count,
+        validation_rejected_count,
+        system_error_count,
+        not_processed_count,
+        halted,
+        code: TelemetryCode::from_static(code),
+    });
 }
 
 const fn quick_scrape_request_error_code(error: QuickScrapeRequestError) -> &'static str {
