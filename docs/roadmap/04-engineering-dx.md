@@ -27,7 +27,7 @@ The DX track is subordinate to the canonical product specifications. A DX packag
 | DX-D01 | MERGED | Harden execution failure, secondary-error, terminal-progress, and worker-disposition semantics. |
 | DX-08-04 | MERGED | Stabilize migration checksums across Windows line-ending behavior. |
 | DX-D02a | MERGED | Safe structured tracing foundation, bounded telemetry APIs, exact target filtering, and sanitized HTTP request tracing. |
-| DX-D02b | CURRENT | Add semantic runtime observability across jobs, crawler, API, CLI, provider execution, diagnostics, and terminal repair without changing business truth. |
+| DX-D02b | MERGED | Semantic runtime observability across jobs, crawler, API, CLI, provider execution, diagnostics, and terminal repair without changing business truth. Merged via PR #12 (`2681c8880f7f23ad72b80418e36532983d517bbe`). |
 | **DX-S06** | **NEXT** | **Generated OpenAPI contract and Scalar API reference for the backend.** |
 | DX-D03 | OPEN | Decide checkpoint compatibility/version naming without breaking live compatibility. |
 | DX-D04 | OPEN | Reconcile migration-number allocation drift before the next persistence-owning MVP plan. |
