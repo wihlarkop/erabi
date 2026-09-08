@@ -3,7 +3,7 @@
 use std::{
     future::Future,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use erabi_crawler::{
@@ -27,6 +27,10 @@ use erabi_db::{
 use erabi_domain::{
     CrawlExecutionErrorCode, CrawlExecutionId, CrawlExecutionOutcome, CrawlRunId, CrawlRunStatus,
     SourceId, SourceTargetType,
+};
+use erabi_observability::{
+    ArtifactKind, CrawlExecutionSpan, EventOutcome, ProviderToken, SemanticEvent, TelemetryCode,
+    emit,
 };
 use uuid::Uuid;
 
@@ -689,7 +693,11 @@ impl QuickScrapeJobHandler {
             ))
         })?;
         let provider = tokio::select! {
-            value = self.adapter.execute(request) => value,
+            value = async {
+                let started = Instant::now();
+                let result = self.adapter.execute(request).await;
+                (started.elapsed(), result)
+            } => value,
             () = context.storage_pressure().signalled() => {
                 pacing_cancellation.cancel();
                 return Ok(());
@@ -706,6 +714,24 @@ impl QuickScrapeJobHandler {
                     .await;
             }
         };
+        let (provider_duration, provider) = provider;
+        emit(SemanticEvent::ProviderExecuteCompleted {
+            context: crate::telemetry_crawl_context(
+                &context,
+                Some(&run_id.to_string()),
+                Some(&execution_id.to_string()),
+            ),
+            provider: ProviderToken::Crawl4Ai,
+            outcome: if provider.is_ok() {
+                EventOutcome::Success
+            } else {
+                EventOutcome::Failure
+            },
+            duration_ms: u64::try_from(provider_duration.as_millis()).unwrap_or(u64::MAX),
+            code: provider.as_ref().err().map(|error| {
+                TelemetryCode::from_static(crawl_execution_code_name(adapter_error_code(error)))
+            }),
+        });
         let result = match provider {
             Ok(result) => {
                 if permit.record_outcome(PacingOutcome::Success).is_err() {
@@ -822,6 +848,7 @@ impl QuickScrapeJobHandler {
         };
         let artifacts = self
             .persist_artifacts(
+                &context,
                 run_id,
                 source_id,
                 snapshot.created_at(),
@@ -912,6 +939,27 @@ impl QuickScrapeJobHandler {
                     "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
                 )
             })?;
+        if let Some(record) = checkpoint.as_ref() {
+            emit(SemanticEvent::CheckpointRecovered {
+                context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+                version: 2,
+                phase: erabi_observability::CheckpointPhase::Recovery,
+                bytes: record
+                    .checkpoint
+                    .payload
+                    .as_ref()
+                    .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                work_generation: 0,
+                outcome: EventOutcome::Reconstructed,
+            });
+        }
+        emit(SemanticEvent::RecoveryReconstructed {
+            context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+            action: erabi_observability::RecoveryAction::Reconstructed,
+            generation: 0,
+            recovered_count: u64::try_from(durable.work.len()).unwrap_or(u64::MAX),
+            outcome: EventOutcome::Reconstructed,
+        });
         let authoritative_status = durable
             .work
             .iter()
@@ -1037,20 +1085,29 @@ impl QuickScrapeJobHandler {
                 "CHECKPOINT_BUILD_FAILED",
             )
         })?;
-        context
-            .checkpoint(&checkpoint.to_envelope().map_err(|_| {
-                QuickScrapeError::checkpoint(
-                    ExecutionOperation::Serialization,
-                    "CHECKPOINT_ENVELOPE_FAILED",
-                )
-            })?)
-            .await
-            .map_err(|_| {
-                QuickScrapeError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_PERSIST_FAILED",
-                )
-            })?;
+        let envelope = checkpoint.to_envelope().map_err(|_| {
+            QuickScrapeError::checkpoint(
+                ExecutionOperation::Serialization,
+                "CHECKPOINT_ENVELOPE_FAILED",
+            )
+        })?;
+        context.checkpoint(&envelope).await.map_err(|_| {
+            QuickScrapeError::checkpoint(
+                ExecutionOperation::LoadCheckpoint,
+                "CHECKPOINT_PERSIST_FAILED",
+            )
+        })?;
+        emit(SemanticEvent::CheckpointPersisted {
+            context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+            version: checkpoint.payload_version,
+            phase: crate::telemetry_checkpoint_phase(phase),
+            bytes: envelope
+                .payload
+                .as_ref()
+                .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
+            work_generation: 0,
+            outcome: EventOutcome::Durable,
+        });
         self.progress(context, "CHECKPOINT_SAVED", None).await
     }
 
@@ -1354,6 +1411,7 @@ impl QuickScrapeJobHandler {
 
     async fn persist_artifacts(
         &self,
+        context: &JobExecutionContext,
         run_id: CrawlRunId,
         source_id: SourceId,
         created_at: &str,
@@ -1391,6 +1449,13 @@ impl QuickScrapeJobHandler {
                         "ARTIFACT_RECORD_FAILED",
                     )
                 })?;
+            emit(SemanticEvent::ArtifactPersisted {
+                context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+                kind: telemetry_artifact_kind(kind),
+                count: 1,
+                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                outcome: EventOutcome::Success,
+            });
             persisted.push(CrawlExecutionArtifact {
                 artifact_id: stored.id,
                 kind: execution_artifact_kind(kind),
@@ -1449,12 +1514,24 @@ impl QuickScrapeJobHandler {
                 Ok(ProgressPublication::Published(_)) => {
                     if terminal_event {
                         context.mark_terminal_progress_durable();
+                        if let Some(terminal) = terminal {
+                            emit(SemanticEvent::ProgressTerminalPublished {
+                                context: crate::telemetry_job_context(context),
+                                status: crate::telemetry_progress_status(terminal),
+                            });
+                        }
                     }
                     Ok(())
                 }
                 Ok(ProgressPublication::DurableOnly { .. }) => {
                     if terminal_event {
                         context.mark_terminal_progress_durable();
+                        if let Some(terminal) = terminal {
+                            emit(SemanticEvent::ProgressTerminalDurableOnly {
+                                context: crate::telemetry_job_context(context),
+                                status: crate::telemetry_progress_status(terminal),
+                            });
+                        }
                     }
                     context.record_secondary_diagnostic(ExecutionDiagnostic::new(
                         OrchestrationErrorCategory::ProgressPublication,
@@ -1484,6 +1561,16 @@ impl QuickScrapeJobHandler {
                     )
                 }),
         }
+    }
+}
+
+fn telemetry_artifact_kind(kind: CrawlerArtifactKind) -> ArtifactKind {
+    match kind {
+        CrawlerArtifactKind::RawHtml
+        | CrawlerArtifactKind::CleanedHtml
+        | CrawlerArtifactKind::RenderedHtml => ArtifactKind::Html,
+        CrawlerArtifactKind::Screenshot => ArtifactKind::Screenshot,
+        CrawlerArtifactKind::Markdown => ArtifactKind::Other,
     }
 }
 
@@ -1518,7 +1605,12 @@ impl JobHandler for QuickScrapeJobHandler {
         // default worker stack; this is an execution-boundary allocation, not
         // a change to retry or recovery semantics.
         Box::pin(async move {
-            match handler.execute_inner(context.clone()).await {
+            let telemetry_context = crate::telemetry_job_context(&context);
+            let span = CrawlExecutionSpan::new(&telemetry_context);
+            match span
+                .run(Box::pin(handler.execute_inner(context.clone())))
+                .await
+            {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     context.record_diagnostics(error.diagnostics);

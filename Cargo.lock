@@ -681,6 +681,7 @@ version = "0.1.0"
 dependencies = [
  "erabi-db",
  "erabi-domain",
+ "erabi-observability",
  "httpdate",
  "reqwest",
  "serde",
@@ -735,6 +736,7 @@ dependencies = [
  "erabi-crawler",
  "erabi-db",
  "erabi-domain",
+ "erabi-observability",
  "fs4",
  "futures-util",
  "serde",

@@ -15,6 +15,9 @@ use std::{
 };
 
 use erabi_domain::{CrawlRunSnapshot, RobotsDecision};
+use erabi_observability::{
+    CorrelationContext, RobotsDecisionToken, RobotsEvidence, SemanticEvent, TelemetryCode, emit,
+};
 use reqwest::header;
 use tokio::{sync::watch, time::Instant};
 use url::Url;
@@ -675,6 +678,39 @@ impl RobotsPolicyService {
         snapshot: &CrawlRunSnapshot,
         cancellation: &PacingCancellation,
     ) -> Result<RobotsAdmission, RobotsPolicyError> {
+        let result = Box::pin(self.evaluate_inner(target, snapshot, cancellation)).await;
+        match &result {
+            Ok(admission) => emit(SemanticEvent::RobotsEvaluated {
+                context: CorrelationContext::new(),
+                decision: match admission.decision() {
+                    RobotsAdmissionDecision::Allowed => RobotsDecisionToken::Allowed,
+                    RobotsAdmissionDecision::Disallowed => RobotsDecisionToken::Disallowed,
+                    RobotsAdmissionDecision::Overridden => RobotsDecisionToken::Overridden,
+                },
+                evidence: match admission.evidence() {
+                    RobotsPolicyEvidence::NetworkPolicy => RobotsEvidence::NetworkPolicy,
+                    RobotsPolicyEvidence::Cache => RobotsEvidence::Cache,
+                    RobotsPolicyEvidence::NotFound => RobotsEvidence::NotFound,
+                    RobotsPolicyEvidence::AccessDenied => RobotsEvidence::AccessDenied,
+                },
+                code: None,
+            }),
+            Err(error) => emit(SemanticEvent::RobotsEvaluated {
+                context: CorrelationContext::new(),
+                decision: RobotsDecisionToken::Failed,
+                evidence: RobotsEvidence::Evaluated,
+                code: Some(robots_error_code(error)),
+            }),
+        }
+        result
+    }
+
+    async fn evaluate_inner(
+        &self,
+        target: &Url,
+        snapshot: &CrawlRunSnapshot,
+        cancellation: &PacingCancellation,
+    ) -> Result<RobotsAdmission, RobotsPolicyError> {
         self.network_policy
             .validate_url(target)
             .map_err(RobotsPolicyError::NetworkTarget)?;
@@ -865,6 +901,17 @@ impl RobotsPolicyService {
         );
         Ok((document, evidence))
     }
+}
+
+fn robots_error_code(error: &RobotsPolicyError) -> TelemetryCode {
+    TelemetryCode::from_static(match error {
+        RobotsPolicyError::Origin(_) => "ORIGIN_INVALID",
+        RobotsPolicyError::NetworkTarget(_) => "NETWORK_TARGET_REJECTED",
+        RobotsPolicyError::Admission(_) => "ADMISSION_FAILED",
+        RobotsPolicyError::Unavailable(_) => "ROBOTS_UNAVAILABLE",
+        RobotsPolicyError::UnavailableWithPacing { .. } => "ROBOTS_PACING_FAILED",
+        RobotsPolicyError::Invalid(_) => "ROBOTS_INVALID",
+    })
 }
 
 fn robots_url(target: &Url) -> Url {

@@ -14,6 +14,7 @@ use erabi_domain::{
     CrawlerId, CrawlerVersionId, LayerValue, ResolvedValue, SeedId, SettingLayers,
     SnapshotOperationalSettings,
 };
+use erabi_observability::{CorrelationContext, SemanticEvent, TelemetryCode, TelemetryId, emit};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -57,6 +58,7 @@ pub(crate) async fn start_production_run(
     input: Result<Json<ProductionRunRequest>, JsonRejection>,
 ) -> Response {
     let Ok(Json(input)) = input else {
+        emit_production_rejected("INVALID_PRODUCTION_RUN_REQUEST", false);
         return api_error(
             StatusCode::BAD_REQUEST,
             "INVALID_PRODUCTION_RUN_REQUEST",
@@ -73,6 +75,7 @@ pub(crate) async fn start_production_run(
     let (Some(crawler_id), Some(version_id)) =
         (parse_crawler_id(&crawler_id), parse_version_id(&version_id))
     else {
+        emit_production_rejected("INVALID_PRODUCTION_RUN_REQUEST", false);
         return api_error(
             StatusCode::BAD_REQUEST,
             "INVALID_PRODUCTION_RUN_REQUEST",
@@ -81,6 +84,7 @@ pub(crate) async fn start_production_run(
         );
     };
     let Ok(selected_seed_ids) = parse_seed_ids(input.selected_seed_ids.as_deref()) else {
+        emit_production_rejected("INVALID_PRODUCTION_RUN_REQUEST", false);
         return api_error(
             StatusCode::BAD_REQUEST,
             "INVALID_PRODUCTION_RUN_REQUEST",
@@ -98,6 +102,7 @@ pub(crate) async fn start_production_run(
         Err(error) => return crawler_error(&error, &trace),
     };
     if version.state() != erabi_domain::CrawlerVersionState::Published {
+        emit_production_rejected("CRAWLER_VERSION_NOT_PUBLISHED", false);
         return api_error(
             StatusCode::CONFLICT,
             "CRAWLER_VERSION_NOT_PUBLISHED",
@@ -124,6 +129,7 @@ pub(crate) async fn start_production_run(
             crawler_version_id: Some(version_id),
         },
     ) else {
+        emit_production_rejected("INVALID_ROBOTS_OVERRIDE", false);
         return api_error(
             StatusCode::BAD_REQUEST,
             "INVALID_ROBOTS_OVERRIDE",
@@ -142,14 +148,24 @@ pub(crate) async fn start_production_run(
         priority: 0,
     };
     match service.submit(request, epoch_seconds()).await {
-        Ok(accepted) => (
-            StatusCode::ACCEPTED,
-            Json(ProductionRunAcceptedResponse {
-                run_id: accepted.run_id.to_string(),
-                job_id: accepted.job_id,
-            }),
-        )
-            .into_response(),
+        Ok(accepted) => {
+            emit(SemanticEvent::ProductionAccepted {
+                context: production_context(
+                    Some(&crawler_id.to_string()),
+                    Some(&version_id.to_string()),
+                    Some(&accepted.run_id.to_string()),
+                    Some(&accepted.job_id),
+                ),
+            });
+            (
+                StatusCode::ACCEPTED,
+                Json(ProductionRunAcceptedResponse {
+                    run_id: accepted.run_id.to_string(),
+                    job_id: accepted.job_id,
+                }),
+            )
+                .into_response()
+        }
         Err(error) => production_error(&error, &trace),
     }
 }
@@ -250,44 +266,94 @@ fn crawler_error(error: &CrawlerRepositoryError, trace: &TraceId) -> Response {
             "Production Run submission could not be completed.",
         ),
     };
+    emit_production_rejected(
+        code,
+        !matches!(
+            error,
+            CrawlerRepositoryError::CrawlerNotFound
+                | CrawlerRepositoryError::CrawlerVersionNotFound
+                | CrawlerRepositoryError::VersionNotOwnedByCrawler
+                | CrawlerRepositoryError::VersionNotPublished
+        ),
+    );
     api_error(status, code, message, trace)
 }
 
 fn production_error(error: &ProductionRunSubmissionError, trace: &TraceId) -> Response {
     match error {
         ProductionRunSubmissionError::Crawler(error) => crawler_error(error, trace),
-        ProductionRunSubmissionError::NoEnabledSeeds => api_error(
-            StatusCode::BAD_REQUEST,
-            "NO_ENABLED_SEEDS",
-            "Production Run requires at least one enabled selected Seed.",
-            trace,
-        ),
+        ProductionRunSubmissionError::NoEnabledSeeds => {
+            emit_production_rejected("NO_ENABLED_SEEDS", false);
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "NO_ENABLED_SEEDS",
+                "Production Run requires at least one enabled selected Seed.",
+                trace,
+            )
+        }
         ProductionRunSubmissionError::DuplicateSeedSelection
         | ProductionRunSubmissionError::SeedNotOwnedByVersion
         | ProductionRunSubmissionError::SeedDisabled
         | ProductionRunSubmissionError::Guardrails
-        | ProductionRunSubmissionError::Snapshot(_) => api_error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_PRODUCTION_RUN_REQUEST",
-            "The Production Run request is invalid for this immutable CrawlerVersion.",
-            trace,
-        ),
-        ProductionRunSubmissionError::Job(_) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PRODUCTION_RUN_SUBMISSION_FAILED",
-            "Production Run submission could not be durably accepted.",
-            trace,
-        ),
+        | ProductionRunSubmissionError::Snapshot(_) => {
+            emit_production_rejected("INVALID_PRODUCTION_RUN_REQUEST", false);
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PRODUCTION_RUN_REQUEST",
+                "The Production Run request is invalid for this immutable CrawlerVersion.",
+                trace,
+            )
+        }
+        ProductionRunSubmissionError::Job(_) => {
+            emit_production_rejected("PRODUCTION_RUN_SUBMISSION_FAILED", true);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "PRODUCTION_RUN_SUBMISSION_FAILED",
+                "Production Run submission could not be durably accepted.",
+                trace,
+            )
+        }
     }
 }
 
 fn unavailable(trace: &TraceId) -> Response {
+    emit_production_rejected("PRODUCTION_RUN_UNAVAILABLE", true);
     api_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "PRODUCTION_RUN_UNAVAILABLE",
         "Production Run submission is not configured in this runtime.",
         trace,
     )
+}
+
+fn production_context(
+    crawler_id: Option<&str>,
+    version_id: Option<&str>,
+    run_id: Option<&str>,
+    job_id: Option<&str>,
+) -> CorrelationContext {
+    let mut context = CorrelationContext::new();
+    if let Some(value) = crawler_id.and_then(|value| TelemetryId::parse(value).ok()) {
+        context = context.with_crawler_id(value);
+    }
+    if let Some(value) = version_id.and_then(|value| TelemetryId::parse(value).ok()) {
+        context = context.with_crawler_version_id(value);
+    }
+    if let Some(value) = run_id.and_then(|value| TelemetryId::parse(value).ok()) {
+        context = context.with_crawl_run_id(value);
+    }
+    if let Some(value) = job_id.and_then(|value| TelemetryId::parse(value).ok()) {
+        context = context.with_job_id(value);
+    }
+    context
+}
+
+fn emit_production_rejected(code: &'static str, operational: bool) {
+    emit(SemanticEvent::ProductionRejected {
+        context: CorrelationContext::new(),
+        code: TelemetryCode::from_static(code),
+        operational,
+    });
 }
 
 fn api_error(

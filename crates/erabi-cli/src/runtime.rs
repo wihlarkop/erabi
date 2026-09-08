@@ -24,6 +24,7 @@ use erabi_jobs::{
     ProgressLiveHub, QuickScrapeJobHandler, StoragePressureMonitor, StoragePressurePolicy,
     StoragePressureState, WorkerPolicy, WorkerRuntimeDisposition, recover_and_rebuild_at,
 };
+use erabi_observability::{EventOutcome, SemanticEvent, TelemetryCode, WorkerLifecycleSpan, emit};
 use secrecy::ExposeSecret;
 use std::sync::Arc;
 use tokio::{
@@ -265,7 +266,7 @@ impl RunningRuntime {
         };
         let server_task = spawn_server(listener, router, stop_receiver);
 
-        Ok(Self {
+        let runtime = Self {
             local_address,
             app_state,
             startup_outcome,
@@ -279,7 +280,11 @@ impl RunningRuntime {
             storage_pressure_task,
             quick_scrape_worker_task,
             cancellation,
-        })
+        };
+        emit(SemanticEvent::RuntimeStarted {
+            mode: erabi_observability::RuntimeMode::Server,
+        });
+        Ok(runtime)
     }
 
     /// Returns the address selected by the bound TCP listener.
@@ -366,15 +371,31 @@ impl RunningRuntime {
                 self.shutdown().await
             }
             ServeEvent::Worker(result) => {
-                let code = match result {
-                    Ok(Ok(())) => "WORKER_EXITED",
-                    Ok(Err(error)) => error.code,
-                    Err(_) => "WORKER_TASK_JOIN_FAILED",
+                let (code, fatal) = match result {
+                    Ok(Ok(())) => ("WORKER_EXITED", false),
+                    Ok(Err(error)) => {
+                        emit(SemanticEvent::WorkerFatal {
+                            code: TelemetryCode::from_static(error.code),
+                        });
+                        (error.code, true)
+                    }
+                    Err(_) => {
+                        emit(SemanticEvent::WorkerFatal {
+                            code: TelemetryCode::from_static("WORKER_TASK_JOIN_FAILED"),
+                        });
+                        ("WORKER_TASK_JOIN_FAILED", true)
+                    }
                 };
+                emit(SemanticEvent::RuntimeWorkerTerminated {
+                    code: TelemetryCode::from_static(code),
+                    fatal,
+                });
                 // The worker has already completed, so shutdown() cannot
                 // wait on it again. It still runs the process-wide admission,
                 // cancellation, server, and resource-release sequence.
-                let _ = self.shutdown().await;
+                let _ = self
+                    .shutdown_with_completion(ShutdownCompletion::TerminalFailure)
+                    .await;
                 Err(RuntimeError::WorkerFatal { code })
             }
         }
@@ -384,7 +405,16 @@ impl RunningRuntime {
     ///
     /// # Errors
     /// Returns a sanitized worker or unexpected-server failure.
-    pub async fn shutdown(mut self) -> Result<ShutdownReport, RuntimeError> {
+    pub async fn shutdown(self) -> Result<ShutdownReport, RuntimeError> {
+        self.shutdown_with_completion(ShutdownCompletion::DeriveFromResult)
+            .await
+    }
+
+    async fn shutdown_with_completion(
+        mut self,
+        completion: ShutdownCompletion,
+    ) -> Result<ShutdownReport, RuntimeError> {
+        emit(SemanticEvent::RuntimeShutdownStarted);
         let deadline = self.shutdown.begin_shutdown();
         self.app_state.stop_accepting_mutations();
         let _ = self.stop_server.send(true);
@@ -403,24 +433,50 @@ impl RunningRuntime {
         if let Some(worker_task) = &mut self.quick_scrape_worker_task {
             match timeout_at(deadline, &mut *worker_task).await {
                 Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => return Err(RuntimeError::WorkerFatal { code: error.code }),
+                Ok(Ok(Err(error))) => {
+                    return complete_shutdown(
+                        Err(RuntimeError::WorkerFatal { code: error.code }),
+                        completion,
+                    );
+                }
                 Ok(Err(_)) => {
-                    return Err(RuntimeError::WorkerFatal {
-                        code: "WORKER_TASK_JOIN_FAILED",
-                    });
+                    return complete_shutdown(
+                        Err(RuntimeError::WorkerFatal {
+                            code: "WORKER_TASK_JOIN_FAILED",
+                        }),
+                        completion,
+                    );
                 }
                 Err(_) => worker_task.abort(),
             }
         }
         match timeout_at(deadline, &mut self.server_task).await {
-            Ok(Ok(Ok(()))) => Ok(report),
-            Ok(Ok(Err(_)) | Err(_)) => Err(RuntimeError::Server),
+            Ok(Ok(Ok(()))) => complete_shutdown(Ok(report), completion),
+            Ok(Ok(Err(_)) | Err(_)) => complete_shutdown(Err(RuntimeError::Server), completion),
             Err(_) => {
                 self.server_task.abort();
-                Ok(report)
+                complete_shutdown(Ok(report), completion)
             }
         }
     }
+}
+
+fn complete_shutdown(
+    result: Result<ShutdownReport, RuntimeError>,
+    completion: ShutdownCompletion,
+) -> Result<ShutdownReport, RuntimeError> {
+    let outcome = match completion {
+        ShutdownCompletion::DeriveFromResult => {
+            if result.is_ok() {
+                EventOutcome::Success
+            } else {
+                EventOutcome::Failure
+            }
+        }
+        ShutdownCompletion::TerminalFailure => EventOutcome::Failure,
+    };
+    emit(SemanticEvent::RuntimeShutdownCompleted { outcome });
+    result
 }
 
 async fn wait_for_os_shutdown_signal() -> Result<(), RuntimeError> {
@@ -479,6 +535,8 @@ fn spawn_crawl_root_worker(
     mut stop_receiver: watch::Receiver<bool>,
 ) -> JoinHandle<Result<(), WorkerRuntimeFailure>> {
     tokio::spawn(async move {
+        WorkerLifecycleSpan::new()
+            .run(Box::pin(async move {
         let CrawlRootWorkerDependencies {
             database,
             adapter,
@@ -490,16 +548,24 @@ fn spawn_crawl_root_worker(
             cancellation,
             storage_pressure,
         } = dependencies;
-        let runtime = JobRuntime::with_storage_pressure_monitor(
+        let runtime = match JobRuntime::with_storage_pressure_monitor(
             &database,
             "crawl-root-worker",
             WorkerPolicy::conservative(),
             cancellation,
             storage_pressure,
         )
-        .map_err(|error| WorkerRuntimeFailure {
-            code: error.safe_code(),
-        })?;
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                emit(SemanticEvent::WorkerFatal {
+                    code: TelemetryCode::from_static(error.safe_code()),
+                });
+                return Err(WorkerRuntimeFailure {
+                    code: error.safe_code(),
+                });
+            }
+        };
         let quick_scrape = QuickScrapeJobHandler::new(
             database.clone(),
             Arc::clone(&adapter),
@@ -527,9 +593,21 @@ fn spawn_crawl_root_worker(
                     match Box::pin(runtime.execute_next_at(&handler, startup_epoch_seconds())).await {
                         Ok(_) => {}
                         Err(error) => match error.disposition() {
-                            WorkerRuntimeDisposition::Continue
-                            | WorkerRuntimeDisposition::LeaseLost => {}
+                            WorkerRuntimeDisposition::Continue => {
+                                emit(SemanticEvent::WorkerTurnRuntimeFailure {
+                                    code: TelemetryCode::from_static(error.safe_code()),
+                                    disposition: error.telemetry_disposition(),
+                                });
+                            }
+                            WorkerRuntimeDisposition::LeaseLost => {
+                                emit(SemanticEvent::JobLeaseLost {
+                                    context: erabi_observability::CorrelationContext::new(),
+                                });
+                            }
                             WorkerRuntimeDisposition::Fatal => {
+                                emit(SemanticEvent::WorkerFatal {
+                                    code: TelemetryCode::from_static(error.safe_code()),
+                                });
                                 return Err(WorkerRuntimeFailure {
                                     code: error.safe_code(),
                                 });
@@ -545,6 +623,8 @@ fn spawn_crawl_root_worker(
             }
         }
         Ok(())
+            }))
+            .await
     })
 }
 
@@ -767,6 +847,12 @@ enum ServeEvent {
     Worker(Result<Result<(), WorkerRuntimeFailure>, tokio::task::JoinError>),
 }
 
+#[derive(Clone, Copy)]
+enum ShutdownCompletion {
+    DeriveFromResult,
+    TerminalFailure,
+}
+
 async fn wait_for_worker_or_signal<F>(
     worker_task: &mut JoinHandle<Result<(), WorkerRuntimeFailure>>,
     signal: F,
@@ -818,8 +904,140 @@ mod tests {
 
     use erabi_db::repositories::JobId;
     use erabi_jobs::{CancellationToken, StoragePressureLevel, StorageProbe, StorageProbeError};
+    use erabi_observability::test_support::{Capture, CapturedEvent, CapturedRecord};
 
     use super::*;
+
+    fn events_named(capture: &Capture, name: &str) -> Vec<CapturedEvent> {
+        capture
+            .records()
+            .into_iter()
+            .filter_map(|record| match record {
+                CapturedRecord::Event(event)
+                    if event
+                        .fields
+                        .iter()
+                        .any(|field| field.name == "event_name" && field.value == name) =>
+                {
+                    Some(event)
+                }
+                CapturedRecord::Event(_) | CapturedRecord::Span(_) => None,
+            })
+            .collect()
+    }
+
+    fn shutdown_completion_events(capture: &Capture) -> Vec<CapturedEvent> {
+        events_named(capture, "runtime.shutdown.completed")
+    }
+
+    fn assert_worker_terminated(capture: &Capture, code: &str) {
+        let events = events_named(capture, "runtime.worker.terminated");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, erabi_observability::TelemetryLevel::Error);
+        assert!(
+            events[0]
+                .fields
+                .iter()
+                .any(|field| field.name == "code" && field.value == code)
+        );
+    }
+
+    fn assert_shutdown_completion(capture: &Capture, outcome: &str) {
+        let events = shutdown_completion_events(capture);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .fields
+                .iter()
+                .any(|field| field.name == "outcome" && field.value == outcome),
+            "captured shutdown completion: {:?}",
+            events[0]
+        );
+        for record in capture.records() {
+            let fields = match record {
+                CapturedRecord::Event(event) => event.fields,
+                CapturedRecord::Span(span) => span.fields,
+            };
+            assert!(
+                fields
+                    .iter()
+                    .all(|field| !field.value.contains("DO_NOT_LOG_PANIC_PAYLOAD_42021"))
+            );
+            assert!(
+                fields
+                    .iter()
+                    .all(|field| !field.value.contains("DO_NOT_LOG_SERVER_ERROR_42022"))
+            );
+        }
+    }
+
+    async fn telemetry_runtime(
+        label: &str,
+    ) -> Result<(RunningRuntime, std::path::PathBuf), RuntimeError> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let data_dir = std::env::temp_dir().join(format!("erabi-runtime-{label}-{nonce}"));
+        let config = BootstrapConfig::from_values(&BTreeMap::from([
+            ("ERABI_DATA_DIR".to_owned(), data_dir.display().to_string()),
+            ("ERABI_PORT".to_owned(), "0".to_owned()),
+        ]))
+        .map_err(|_| {
+            RuntimeError::Fatal(StartupFatalError::new(
+                "TEST_CONFIGURATION_INVALID",
+                "runtime test configuration was invalid",
+            ))
+        })?;
+        let runtime = RunningRuntime::start_with_options(
+            config,
+            RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
+                message: "shutdown telemetry test".to_owned(),
+            }),
+        )
+        .await?;
+        Ok((runtime, data_dir))
+    }
+
+    #[tokio::test]
+    async fn successful_shutdown_emits_one_completion_event() -> Result<(), RuntimeError> {
+        let (runtime, data_dir) = telemetry_runtime("shutdown-success").await?;
+        let capture = Capture::new();
+        let result = capture.run(runtime.shutdown()).await;
+        assert!(result.is_ok());
+        assert_shutdown_completion(&capture, "SUCCESS");
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_worker_failure_shutdown_emits_one_failure_completion_event()
+    -> Result<(), RuntimeError> {
+        let (mut runtime, data_dir) = telemetry_runtime("shutdown-worker-error").await?;
+        if let Some(worker_task) = runtime.quick_scrape_worker_task.take() {
+            worker_task.abort();
+            let _ = worker_task.await;
+        }
+        runtime.quick_scrape_worker_task = Some(tokio::spawn(async {
+            Err(WorkerRuntimeFailure {
+                code: "TEST_WORKER_FATAL_DIRECT",
+            })
+        }));
+        runtime.server_task.abort();
+        let _ = runtime.server_task.await;
+        runtime.server_task = tokio::spawn(async { Ok(()) });
+
+        let capture = Capture::new();
+        let result = capture.run(runtime.shutdown()).await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::WorkerFatal {
+                code: "TEST_WORKER_FATAL_DIRECT"
+            })
+        ));
+        assert_shutdown_completion(&capture, "FAILURE");
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn runtime_shutdown_signals_workers_without_extending_fixed_deadline() {
@@ -872,8 +1090,9 @@ mod tests {
             })
         }));
 
-        let result = runtime
-            .serve_until_shutdown_signal(std::future::pending())
+        let capture = Capture::new();
+        let result = capture
+            .run(runtime.serve_until_shutdown_signal(std::future::pending()))
             .await;
         assert!(matches!(
             result,
@@ -881,6 +1100,8 @@ mod tests {
                 code: "TEST_WORKER_FATAL"
             })
         ));
+        assert_shutdown_completion(&capture, "FAILURE");
+        assert_worker_terminated(&capture, "TEST_WORKER_FATAL");
         let _ = std::fs::remove_dir_all(data_dir);
         Ok(())
     }
@@ -927,8 +1148,9 @@ mod tests {
         runtime.quick_scrape_worker_task =
             Some(tokio::spawn(async { panic!("test worker panic") }));
 
-        let result = runtime
-            .serve_until_shutdown_signal(std::future::pending())
+        let capture = Capture::new();
+        let result = capture
+            .run(runtime.serve_until_shutdown_signal(std::future::pending()))
             .await;
         assert!(matches!(
             result,
@@ -936,6 +1158,85 @@ mod tests {
                 code: "WORKER_TASK_JOIN_FAILED"
             })
         ));
+        assert_shutdown_completion(&capture, "FAILURE");
+        assert_worker_terminated(&capture, "WORKER_TASK_JOIN_FAILED");
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_error_shutdown_emits_one_failure_completion_event() -> Result<(), RuntimeError>
+    {
+        let (mut runtime, data_dir) = telemetry_runtime("shutdown-server-error").await?;
+        if let Some(worker_task) = runtime.quick_scrape_worker_task.take() {
+            worker_task.abort();
+            let _ = worker_task.await;
+        }
+        runtime.quick_scrape_worker_task = Some(tokio::spawn(async { Ok(()) }));
+        runtime.server_task.abort();
+        let _ = runtime.server_task.await;
+        runtime.server_task =
+            tokio::spawn(async { Err(io::Error::other("DO_NOT_LOG_SERVER_ERROR_42022")) });
+
+        let capture = Capture::new();
+        let result = capture.run(runtime.shutdown()).await;
+        assert!(matches!(result, Err(RuntimeError::Server)));
+        assert_shutdown_completion(&capture, "FAILURE");
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_join_failure_shutdown_emits_one_failure_completion_event()
+    -> Result<(), RuntimeError> {
+        let (mut runtime, data_dir) = telemetry_runtime("shutdown-server-join").await?;
+        if let Some(worker_task) = runtime.quick_scrape_worker_task.take() {
+            worker_task.abort();
+            let _ = worker_task.await;
+        }
+        runtime.quick_scrape_worker_task = Some(tokio::spawn(async { Ok(()) }));
+        runtime.server_task.abort();
+        let _ = runtime.server_task.await;
+        runtime.server_task = tokio::spawn(async {
+            panic!("DO_NOT_LOG_PANIC_PAYLOAD_42021");
+            #[allow(unreachable_code)]
+            Ok::<(), io::Error>(())
+        });
+
+        let capture = Capture::new();
+        let result = capture.run(runtime.shutdown()).await;
+        assert!(matches!(result, Err(RuntimeError::Server)));
+        assert_shutdown_completion(&capture, "FAILURE");
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_timeout_emits_one_success_completion_event() -> Result<(), RuntimeError> {
+        let (mut runtime, data_dir) = telemetry_runtime("shutdown-timeout").await?;
+        if let Some(worker_task) = runtime.quick_scrape_worker_task.take() {
+            worker_task.abort();
+            let _ = worker_task.await;
+        }
+        runtime.quick_scrape_worker_task = Some(tokio::spawn(async {
+            std::future::pending::<Result<(), WorkerRuntimeFailure>>().await
+        }));
+        runtime.server_task.abort();
+        let _ = runtime.server_task.await;
+        runtime.server_task =
+            tokio::spawn(async { std::future::pending::<io::Result<()>>().await });
+
+        let capture = Capture::new();
+        let (result, ()) = capture
+            .run(async {
+                tokio::join!(
+                    runtime.shutdown(),
+                    tokio::time::advance(crate::GRACEFUL_SHUTDOWN_DEADLINE),
+                )
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_shutdown_completion(&capture, "SUCCESS");
         let _ = std::fs::remove_dir_all(data_dir);
         Ok(())
     }
