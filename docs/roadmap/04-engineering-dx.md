@@ -31,7 +31,7 @@ The DX track is subordinate to the canonical product specifications. A DX packag
 | **DX-S06** | **MERGED** | **Generated OpenAPI contract and Scalar API reference for the backend.** |
 | DX-D03 | OPEN | Decide checkpoint compatibility/version naming without breaking live compatibility. |
 | **DX-D04** | **MERGED** | **Reconcile migration-number allocation drift before the next persistence-owning MVP plan.** |
-| DX-D05 | OPEN | Clarify Production orchestration ownership/extraction boundaries. |
+| DX-D05 | CURRENT | Clarify Production orchestration ownership/extraction boundaries. |
 | DX-D06 | OPEN | Separate semantic traversal responsibilities from service orchestration where warranted. |
 | DX-D07 | OPEN | Improve crawler repository private module ownership without changing persistence semantics. |
 | DX-S01 | OPEN | Replace crawl-root string routing/classification with private typed routing. |
@@ -158,6 +158,23 @@ state.
 DX-D04 exits with unchanged SQL and runtime migration code, no `0007`/`0008`
 placeholder migrations, consistent active planning references, a clean
 documentation diff, and an uncommitted candidate ready for independent review.
+
+## DX-D05 - Production Orchestration Ownership
+
+Approved design: [DX-D05 - Production Orchestration Ownership and Extraction Boundary](../superpowers/specs/2026-09-09-dx-d05-production-orchestration-design.md).
+
+DX-D05 is the current architecture package. It establishes the ownership seam
+before Plan 07 adds extraction, separating Production workflow, crawl-stage
+orchestration, bounded page execution, and finalization composition while
+keeping canonical crawl facts in `erabi-crawler`.
+
+The scope is behavior-preserving: provider, durable evidence, checkpoint,
+recovery, progress, cancellation, storage-pressure, retry, and final-status
+semantics remain unchanged. Non-goals are extraction implementation,
+selector/normalization/validation work, database or API changes, and DX-D06 or
+DX-D07 cleanup. Exit evidence is focused and full verification plus
+independent review; the package remains `CURRENT` until that review is
+accepted.
 
 ---
 

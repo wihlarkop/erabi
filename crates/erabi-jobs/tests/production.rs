@@ -21,7 +21,7 @@ use erabi_db::{
         ActionRunAssociation, CrawlAdmissionState, CrawlExecutionRepository,
         CrawlPageTypeMatchState, CrawlRunRepository, CrawlTraversalControl,
         CrawlTraversalRepository, CrawlUrlStateRecord, CrawlWorkState, CrawlerRepository,
-        DiscoveredUrlRecord, JobKind, JobRepository,
+        DiscoveredUrlRecord, JobKind, JobRepository, NewJob,
     },
 };
 use erabi_domain::{
@@ -35,6 +35,7 @@ use erabi_jobs::{
     ProgressRepository, StoragePressureMonitor, StoragePressurePolicy, StorageProbe,
     StorageProbeError, WorkerPolicy, WorkerTurn,
 };
+use tokio::sync::{Barrier, Notify};
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
     let database = ErabiDatabase::in_memory().await?;
@@ -199,6 +200,29 @@ impl CrawlerAdapter for FixtureAdapter {
                 ],
                 page.provider_reported_partial,
             )
+        })
+    }
+}
+
+struct BlockingFixtureAdapter {
+    inner: FixtureAdapter,
+    started: Arc<Barrier>,
+    release: Arc<Notify>,
+}
+
+impl CrawlerAdapter for BlockingFixtureAdapter {
+    fn health(&self) -> CrawlerFuture<'_, CrawlerHealth> {
+        self.inner.health()
+    }
+
+    fn execute(&self, request: CrawlerExecuteRequest) -> CrawlerFuture<'_, CrawlerExecuteResult> {
+        let execution = self.inner.execute(request);
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            started.wait().await;
+            release.notified().await;
+            execution.await
         })
     }
 }
@@ -578,6 +602,94 @@ async fn submit_and_execute(
     let turn = runtime(database)?.execute_next_at(&root, 100).await?;
     assert!(matches!(turn, WorkerTurn::Succeeded { .. }), "{turn:?}");
     Ok(accepted)
+}
+
+#[tokio::test]
+async fn storage_pressure_defers_incomplete_production_without_finalization()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version_id, _) = published_graph(
+        &database,
+        vec![seed("https://example.test/listing/a")?],
+        GraphOptions::default(),
+    )
+    .await?;
+    let accepted = ProductionRunSubmissionService::new(database.clone())
+        .submit(request(&crawler, version_id, 10, 60, 30_000), 100)
+        .await?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot(accepted.run_id)
+        .await?;
+    let root_job = NewJob::new(JobKind::new("PRODUCTION_CRAWL")?, 1, 100, 2)?;
+    let production = JobRepository::new(&database)
+        .create_production_run_with_root_job(&snapshot, &root_job, 100)
+        .await?;
+    let started = Arc::new(Barrier::new(2));
+    let release = Arc::new(Notify::new());
+    let adapter = BlockingFixtureAdapter {
+        inner: FixtureAdapter {
+            pages: BTreeMap::from([(
+                "https://example.test/listing/a".to_owned(),
+                FixturePage::html(Vec::new()),
+            )]),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            clock: None,
+        },
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    };
+    let temporary = tempfile::tempdir()?;
+    let root = handler(
+        database.clone(),
+        Arc::new(adapter),
+        ArtifactStore::new(temporary.path())?,
+        None,
+    );
+    let pressure_policy = StoragePressurePolicy::new(100, 50)?;
+    let monitor = StoragePressureMonitor::new(
+        HealthyStorageProbe,
+        "production-storage-pressure-test-data",
+        pressure_policy,
+    );
+    let pressure = monitor.controller().clone();
+    let runtime = JobRuntime::with_storage_pressure_monitor(
+        &database,
+        "production-storage-pressure-test",
+        WorkerPolicy::conservative(),
+        CancellationController::default(),
+        monitor,
+    )?;
+    let execution = runtime.execute_next_at(&root, 100);
+    let signal = async {
+        started.wait().await;
+        pressure.update(pressure_policy.classify(50));
+        release.notify_one();
+    };
+    let (turn, ()) = tokio::join!(execution, signal);
+    assert!(matches!(
+        turn?,
+        WorkerTurn::StoragePressure {
+            checkpoint_persisted: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        CrawlRunRepository::new(&database)
+            .status(production.crawl_run_id)
+            .await?,
+        CrawlRunStatus::Running
+    );
+    let job_id = production.job_id;
+    let progress = ProgressRepository::new(&database)
+        .replay(&job_id, ProgressReplayRequest::new(None, 32)?)
+        .await?;
+    assert!(progress.events.iter().all(|event| {
+        !matches!(
+            event.key.as_str(),
+            "FINALIZATION_COMPLETED" | "PRODUCTION_PARTIAL_RESULT" | "PRODUCTION_BOUNDED_COMPLETE"
+        )
+    }));
+    Ok(())
 }
 
 #[tokio::test]

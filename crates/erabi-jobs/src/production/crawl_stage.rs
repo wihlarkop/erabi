@@ -1,131 +1,23 @@
-//! Bounded execution for one frozen Production Crawl Run.
+//! Production crawl-stage orchestration.
 //!
-//! It delegates discovery semantics to `erabi_crawler::SemanticTraversal` and
-//! owns provider execution, durable evidence, progress, checkpoint-backed
-//! recovery, and final status.
+//! This module owns frozen-run loading/recovery, `SemanticTraversal` driving,
+//! durable crawl evidence/checkpoint progression, and safe worker boundaries.
 
+#[allow(clippy::wildcard_imports)]
+use super::*;
 use serde::de::DeserializeOwned;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use erabi_crawler::{
-    CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
-    CrawlerArtifactEvidence, CrawlerArtifactKind, CrawlerEvidencePolicy, CrawlerExecuteRequest,
-    CrawlerResultCompleteness, DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider,
-    DiscoveryPreviewProviderError, DiscoveryPreviewProviderOutcome, NetworkTargetPolicy, OriginKey,
-    PacingCancellation, PacingOutcome, PacingService, PreviewClock, RenderingRequirement,
-    RobotsAdmissionDecision, RobotsPolicyService, ScreenshotPolicy, SemanticTraversal,
-    SemanticTraversalCheckpoint, SemanticTraversalQueueEntry, SemanticTraversalStep,
-    SemanticTraversalTransitionState, load_frozen_production_semantics,
-};
-use erabi_db::{
-    ArtifactStore, ErabiDatabase,
-    repositories::{
-        ArtifactRepository, CrawlAdmissionState, CrawlExecutionArtifact,
-        CrawlExecutionArtifactKind, CrawlExecutionRecord, CrawlExecutionRepository,
-        CrawlExecutionRepositoryError, CrawlExecutionSummary, CrawlInFlightWork,
-        CrawlPageTypeMatchState, CrawlRedirectReconciliation, CrawlRunRepository,
-        CrawlTransitionSourceCount, CrawlTraversalControl, CrawlTraversalPageTypeCounts,
-        CrawlTraversalRepository, CrawlTraversalSemanticProjection, CrawlTraversalUrlSemanticState,
-        CrawlUrlStateRecord, CrawlWorkState, DiscoveredUrlRecord, JobRepository,
-    },
-};
-use erabi_domain::{
-    CrawlExecutionErrorCode, CrawlExecutionId, CrawlExecutionOutcome, CrawlRunId, CrawlRunSnapshot,
-    CrawlRunStatus, DiscoveryPath, DiscoveryPreviewPage, DiscoveryPreviewResult,
-    DiscoveryPreviewSeed, DiscoveryTransitionId, EffectiveDiscoveryPreviewLimits,
-    EffectiveTransitionPreviewTotalLimit, PageTypeId, PreviewBudgetKind, PreviewUrlState,
-    TestDiagnostic,
-};
-use erabi_observability::{
-    ArtifactKind, CrawlExecutionSpan, EventOutcome, ProviderToken, SemanticEvent, TelemetryCode,
-    emit,
-};
-use tokio::sync::Mutex;
-use uuid::Uuid;
-
-use crate::{
-    ExecutionAction, ExecutionDiagnostic, ExecutionDiagnostics, ExecutionOperation,
-    JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent,
-    OrchestrationErrorCategory, ProgressAttemptId, ProgressKey, ProgressLiveHub, ProgressMetadata,
-    ProgressPublication, ProgressService, ProgressTerminalState,
-};
-
-const PRODUCTION_CRAWL_JOB_KIND: &str = "PRODUCTION_CRAWL";
-
-#[derive(Clone, Debug)]
-struct ProductionError {
-    diagnostics: ExecutionDiagnostics,
+#[allow(clippy::large_enum_variant)]
+pub(super) enum CrawlStageOutcome {
+    ReadyForPostCrawl(ReadyForPostCrawl),
+    DeferredNoPostCrawl,
 }
 
-type ProductionResult<T> = Result<T, ProductionError>;
-
-impl ProductionError {
-    fn new(diagnostic: ExecutionDiagnostic) -> Self {
-        let mut diagnostics = ExecutionDiagnostics::new();
-        diagnostics.add_primary(diagnostic);
-        Self { diagnostics }
-    }
-
-    fn progress(operation: ExecutionOperation, code: &'static str) -> Self {
-        Self::new(ExecutionDiagnostic::new(
-            OrchestrationErrorCategory::ProgressPublication,
-            operation,
-            ExecutionAction::Reconcile,
-            code,
-        ))
-    }
-
-    fn repository(operation: ExecutionOperation, code: &'static str) -> Self {
-        Self::new(ExecutionDiagnostic::new(
-            OrchestrationErrorCategory::Repository,
-            operation,
-            ExecutionAction::Retry,
-            code,
-        ))
-    }
-
-    fn checkpoint(operation: ExecutionOperation, code: &'static str) -> Self {
-        Self::new(ExecutionDiagnostic::new(
-            OrchestrationErrorCategory::CheckpointRecovery,
-            operation,
-            ExecutionAction::Retry,
-            code,
-        ))
-    }
-
-    fn artifact(operation: ExecutionOperation, code: &'static str) -> Self {
-        Self::new(ExecutionDiagnostic::new(
-            OrchestrationErrorCategory::Artifact,
-            operation,
-            ExecutionAction::Retry,
-            code,
-        ))
-    }
-
-    fn projection(operation: ExecutionOperation, code: &'static str) -> Self {
-        Self::new(ExecutionDiagnostic::new(
-            OrchestrationErrorCategory::SerializationProjection,
-            operation,
-            ExecutionAction::Fail,
-            code,
-        ))
-    }
-}
-
-fn is_production_job_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        PRODUCTION_CRAWL_JOB_KIND
-            | "RETRY"
-            | "RETRY_FAILED_PARTS"
-            | "RESUME_CHECKPOINT"
-            | "RERUN_FULL_CRAWL"
-    )
+pub(super) struct ReadyForPostCrawl {
+    pub(super) run_id: CrawlRunId,
+    pub(super) snapshot: CrawlRunSnapshot,
+    pub(super) current_status: CrawlRunStatus,
 }
 
 type ExecutionProvenanceKey = (String, String);
@@ -212,60 +104,13 @@ fn semantic_projection(state: &SemanticTraversalCheckpoint) -> CrawlTraversalSem
     }
 }
 
-/// Runtime dependencies are injected by the process composition root. In
-/// particular, `pacing` is the one process-wide Task 5 service also used by
-/// robots and Quick Scrape; this handler never constructs a limiter.
-#[derive(Clone)]
-pub struct ProductionCrawlJobHandler {
-    database: ErabiDatabase,
-    adapter: Arc<dyn CrawlerAdapter>,
-    robots: RobotsPolicyService,
-    pacing: PacingService,
-    network_policy: NetworkTargetPolicy,
-    artifact_store: ArtifactStore,
-    progress_live_hub: Option<ProgressLiveHub>,
-    clock: Arc<dyn PreviewClock>,
-}
-
 #[allow(clippy::result_large_err)]
 impl ProductionCrawlJobHandler {
-    #[must_use]
-    pub fn new(
-        database: ErabiDatabase,
-        adapter: Arc<dyn CrawlerAdapter>,
-        robots: RobotsPolicyService,
-        pacing: PacingService,
-        network_policy: NetworkTargetPolicy,
-        artifact_store: ArtifactStore,
-    ) -> Self {
-        Self {
-            database,
-            adapter,
-            robots,
-            pacing,
-            network_policy,
-            artifact_store,
-            progress_live_hub: None,
-            clock: Arc::new(SystemProductionClock),
-        }
-    }
-
-    #[must_use]
-    pub fn with_progress_live_hub(mut self, hub: ProgressLiveHub) -> Self {
-        self.progress_live_hub = Some(hub);
-        self
-    }
-
-    /// Shares Preview's existing deterministic clock seam with production
-    /// duration enforcement and observation timestamps.
-    #[must_use]
-    pub fn with_clock(mut self, clock: Arc<dyn PreviewClock>) -> Self {
-        self.clock = clock;
-        self
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn execute_inner(&self, context: JobExecutionContext) -> ProductionResult<()> {
+    pub(super) async fn run_crawl_stage(
+        &self,
+        context: JobExecutionContext,
+    ) -> ProductionResult<CrawlStageOutcome> {
         if !is_production_job_kind(context.kind().as_str()) {
             return Err(ProductionError::new(ExecutionDiagnostic::new(
                 OrchestrationErrorCategory::Invariant,
@@ -373,30 +218,11 @@ impl ProductionCrawlJobHandler {
                         "RUN_STATUS_LOAD_FAILED",
                     )
                 })?;
-            let final_status = self
-                .finalize_durable_run(&context, &snapshot, run_id, current_status)
-                .await?;
-            if let Err(error) = self
-                .progress(&context, "FINALIZATION_COMPLETED", None)
-                .await
-            {
-                context.record_secondary_diagnostics(error.diagnostics);
-            }
-            if let Err(error) = self
-                .progress(
-                    &context,
-                    if final_status == CrawlRunStatus::PartialResult {
-                        "PRODUCTION_PARTIAL_RESULT"
-                    } else {
-                        "PRODUCTION_BOUNDED_COMPLETE"
-                    },
-                    Some(ProgressTerminalState::Succeeded),
-                )
-                .await
-            {
-                context.record_secondary_diagnostics(error.diagnostics);
-            }
-            return Ok(());
+            return Ok(CrawlStageOutcome::ReadyForPostCrawl(ReadyForPostCrawl {
+                run_id,
+                snapshot,
+                current_status,
+            }));
         }
 
         let run_repository = CrawlRunRepository::new(&self.database);
@@ -666,10 +492,11 @@ impl ProductionCrawlJobHandler {
                     if context.cancellation().is_cancelled() {
                         return self
                             .cancellation_boundary(&context, &snapshot, run_id)
-                            .await;
+                            .await
+                            .map(|()| CrawlStageOutcome::DeferredNoPostCrawl);
                     }
                     if context.storage_pressure().is_signalled() {
-                        return Ok(());
+                        return Ok(CrawlStageOutcome::DeferredNoPostCrawl);
                     }
                 }
                 SemanticTraversalStep::Interrupted(reason) => {
@@ -711,10 +538,11 @@ impl ProductionCrawlJobHandler {
                         erabi_crawler::DiscoveryPreviewInterruption::Cancelled => {
                             return self
                                 .cancellation_boundary(&context, &snapshot, run_id)
-                                .await;
+                                .await
+                                .map(|()| CrawlStageOutcome::DeferredNoPostCrawl);
                         }
                         erabi_crawler::DiscoveryPreviewInterruption::StoragePressure => {
-                            return Ok(());
+                            return Ok(CrawlStageOutcome::DeferredNoPostCrawl);
                         }
                     }
                 }
@@ -766,40 +594,23 @@ impl ProductionCrawlJobHandler {
                     "RUN_STATUS_LOAD_FAILED",
                 )
             })?;
-        let final_status = self
-            .finalize_durable_run(&context, &snapshot, run_id, current_status)
-            .await?;
-        if let Err(error) = self
-            .progress(&context, "FINALIZATION_COMPLETED", None)
-            .await
-        {
-            context.record_secondary_diagnostics(error.diagnostics);
-        }
-        if let Err(error) = self
-            .progress(
-                &context,
-                if final_status == CrawlRunStatus::PartialResult {
-                    "PRODUCTION_PARTIAL_RESULT"
-                } else {
-                    "PRODUCTION_BOUNDED_COMPLETE"
-                },
-                Some(ProgressTerminalState::Succeeded),
-            )
-            .await
-        {
-            context.record_secondary_diagnostics(error.diagnostics);
-        }
-        Ok(())
+        Ok(CrawlStageOutcome::ReadyForPostCrawl(ReadyForPostCrawl {
+            run_id,
+            snapshot,
+            current_status,
+        }))
     }
+}
 
+#[allow(clippy::result_large_err)]
+impl ProductionCrawlJobHandler {
     async fn cancellation_boundary(
         &self,
         context: &JobExecutionContext,
         snapshot: &CrawlRunSnapshot,
         run_id: CrawlRunId,
     ) -> ProductionResult<()> {
-        self.finalize_durable_run(context, snapshot, run_id, CrawlRunStatus::Cancelled)
-            .await?;
+        self.finalize_cancelled(context, snapshot, run_id).await?;
         if let Err(error) = self
             .progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
             .await
@@ -822,107 +633,6 @@ impl ProductionCrawlJobHandler {
             ExecutionAction::Fail,
             "CRAWL_RUN_CANCELLED",
         )))
-    }
-
-    async fn finalize_durable_run(
-        &self,
-        context: &JobExecutionContext,
-        snapshot: &CrawlRunSnapshot,
-        run_id: CrawlRunId,
-        current_status: CrawlRunStatus,
-    ) -> ProductionResult<CrawlRunStatus> {
-        let executions = CrawlExecutionRepository::new(&self.database)
-            .list_for_run(run_id)
-            .await
-            .map_err(|_| {
-                ProductionError::repository(
-                    ExecutionOperation::PersistExecution,
-                    "EXECUTIONS_LOAD_FAILED",
-                )
-            })?;
-        let discovered = CrawlRunRepository::new(&self.database)
-            .discovered_urls(run_id)
-            .await
-            .map_err(|_| {
-                ProductionError::repository(
-                    ExecutionOperation::LoadRunSnapshot,
-                    "DISCOVERY_LOAD_FAILED",
-                )
-            })?;
-        let latest = JobRepository::new(&self.database)
-            .latest_checkpoint_for_lineage(context.job_id())
-            .await
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_LOAD_FAILED",
-                )
-            })?;
-        let _checkpoint = latest
-            .as_ref()
-            .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, snapshot, run_id))
-            .transpose()
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_INVALID",
-                )
-            })?;
-        let durable = CrawlTraversalRepository::new(&self.database)
-            .reconstruct_recovery_state(run_id)
-            .await
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
-                )
-            })?;
-        let finalization = erabi_crawler::finalize_durable_state_with_traversal(
-            snapshot,
-            current_status,
-            &executions,
-            &discovered,
-            None,
-            Some(&durable.control),
-            Some(&durable.work),
-        )
-        .map_err(|_| {
-            ProductionError::new(
-                ExecutionDiagnostic::new(
-                    OrchestrationErrorCategory::Finalization,
-                    ExecutionOperation::FinalizeRun,
-                    ExecutionAction::Retry,
-                    "CRAWL_RUN_FINALIZATION_FAILED",
-                )
-                .with_run(run_id),
-            )
-        })?;
-        let summary = CrawlExecutionSummary {
-            crawl_run_id: run_id,
-            in_scope_pages_planned: finalization.structural_input.in_scope_pages_planned,
-            in_scope_pages_completed: finalization.structural_input.in_scope_pages_completed,
-            pagination_truncation_count: finalization.structural_input.pagination_truncation_count,
-            unresolved_partial_work_count: finalization
-                .structural_input
-                .unresolved_partial_work_count,
-            page_type_ambiguity_count: finalization.structural_input.page_type_ambiguity_count,
-        };
-        CrawlExecutionRepository::new(&self.database)
-            .finalize(&summary, finalization.status)
-            .await
-            .map_err(|_| {
-                ProductionError::new(
-                    ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::Finalization,
-                        ExecutionOperation::FinalizeRun,
-                        ExecutionAction::Retry,
-                        "CRAWL_RUN_FINALIZATION_FAILED",
-                    )
-                    .with_run(run_id),
-                )
-            })?;
-        context.mark_terminal_crawl_run(run_id, finalization.status);
-        Ok(finalization.status)
     }
 
     async fn load_provenance_ids(
@@ -2398,699 +2108,6 @@ impl ProductionCrawlJobHandler {
         }
         Ok(())
     }
-
-    #[allow(clippy::too_many_lines)]
-    async fn execute_page(
-        &self,
-        context: &JobExecutionContext,
-        snapshot: &CrawlRunSnapshot,
-        requested_url: &str,
-        deadline: &ProductionDeadline,
-    ) -> Result<PageResult, PageFailure> {
-        let target = requested_url
-            .parse::<url::Url>()
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
-        self.network_policy
-            .validate_and_resolve(&target)
-            .await
-            .map_err(|_| {
-                context.record_primary_diagnostic(ExecutionDiagnostic::new(
-                    OrchestrationErrorCategory::NetworkAdmission,
-                    ExecutionOperation::AcquireAdmission,
-                    ExecutionAction::Fail,
-                    "NETWORK_TARGET_REJECTED",
-                ));
-                PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse)
-            })?;
-        let origin = OriginKey::from_url(&target).map_err(|_| {
-            context.record_primary_diagnostic(ExecutionDiagnostic::new(
-                OrchestrationErrorCategory::NetworkAdmission,
-                ExecutionOperation::AcquireAdmission,
-                ExecutionAction::Fail,
-                "ORIGIN_INVALID",
-            ));
-            PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse)
-        })?;
-        let registration = self.pacing.register(origin, snapshot).map_err(|_| {
-            context.record_primary_diagnostic(ExecutionDiagnostic::new(
-                OrchestrationErrorCategory::Pacing,
-                ExecutionOperation::AcquireAdmission,
-                ExecutionAction::Retry,
-                "PACING_REGISTRATION_FAILED",
-            ));
-            PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure)
-        })?;
-        let pacing_cancel = PacingCancellation::new();
-        let admission = tokio::select! {
-            value = self.robots.evaluate(&target, snapshot, &pacing_cancel) => value.map_err(|error| {
-                context.record_primary_diagnostic(ExecutionDiagnostic::new(
-                    OrchestrationErrorCategory::NetworkAdmission,
-                    ExecutionOperation::AcquireAdmission,
-                    ExecutionAction::Retry,
-                    "ROBOTS_POLICY_FAILED",
-                ));
-                if matches!(error, erabi_crawler::RobotsPolicyError::UnavailableWithPacing { .. }) {
-                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::Pacing,
-                        ExecutionOperation::RecordOutcome,
-                        ExecutionAction::Continue,
-                        "ROBOTS_PACING_OUTCOME_RECORD_FAILED",
-                    ));
-                }
-                PageFailure::normal(CrawlExecutionErrorCode::RobotsExcluded)
-            }),
-            () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
-            () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
-        }?;
-        if admission.decision() == RobotsAdmissionDecision::Disallowed {
-            context.record_primary_diagnostic(ExecutionDiagnostic::new(
-                OrchestrationErrorCategory::NetworkAdmission,
-                ExecutionOperation::AcquireAdmission,
-                ExecutionAction::Fail,
-                "ROBOTS_EXCLUDED",
-            ));
-            return Err(PageFailure::normal(CrawlExecutionErrorCode::RobotsExcluded));
-        }
-        let permit = tokio::select! {
-            value = registration.acquire(&admission, &pacing_cancel) => value.map_err(|_| {
-                context.record_primary_diagnostic(ExecutionDiagnostic::new(
-                    OrchestrationErrorCategory::Pacing,
-                    ExecutionOperation::AcquireAdmission,
-                    ExecutionAction::Retry,
-                    "PACING_PERMIT_ACQUISITION_FAILED",
-                ));
-                PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure)
-            }),
-            () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
-            () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
-        }?;
-        // Recompute immediately before the provider call so pacing/robots
-        // work cannot let an in-flight request exceed the frozen run cap.
-        let timeout = deadline
-            .remaining_timeout(snapshot.settings().timeout_ms.value)
-            .ok_or_else(PageFailure::duration_exhausted)?;
-        self.progress(context, "PAGE_LOADING", None)
-            .await
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::RemoteFailure))?;
-        let request = CrawlerExecuteRequest::try_new(
-            target,
-            timeout,
-            snapshot.settings().user_agent.value.clone(),
-            RenderingRequirement::RenderedHtml,
-            None,
-            None,
-            CrawlerEvidencePolicy {
-                cleaned_html: true,
-                rendered_html: true,
-                markdown: true,
-                discovered_links: true,
-                selector_observations: true,
-                pagination_observations: true,
-                screenshot: if snapshot.settings().screenshot.value {
-                    ScreenshotPolicy::Viewport
-                } else {
-                    ScreenshotPolicy::None
-                },
-                ..CrawlerEvidencePolicy::default()
-            },
-        )
-        .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
-        let result = tokio::select! {
-            value = async {
-                let started = Instant::now();
-                let result = self.adapter.execute(request).await;
-                (started.elapsed(), result)
-            } => value,
-            () = context.storage_pressure().signalled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::StoragePressure)); }
-            () = context.cancellation().cancelled() => { pacing_cancel.cancel(); return Err(PageFailure::normal(CrawlExecutionErrorCode::Cancelled)); }
-        };
-        let (provider_duration, result) = result;
-        emit(SemanticEvent::ProviderExecuteCompleted {
-            context: crate::telemetry_job_context(context),
-            provider: ProviderToken::Crawl4Ai,
-            outcome: if result.is_ok() {
-                EventOutcome::Success
-            } else {
-                EventOutcome::Failure
-            },
-            duration_ms: u64::try_from(provider_duration.as_millis()).unwrap_or(u64::MAX),
-            code: result.as_ref().err().map(|error| {
-                TelemetryCode::from_static(crawl_execution_code_name(adapter_error_code(error)))
-            }),
-        });
-        let result = match result {
-            Ok(result) => {
-                if permit.record_outcome(PacingOutcome::Success).is_err() {
-                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::Pacing,
-                        ExecutionOperation::RecordOutcome,
-                        ExecutionAction::Continue,
-                        "PACING_OUTCOME_RECORD_FAILED",
-                    ));
-                }
-                result
-            }
-            Err(error) => {
-                context.record_primary_diagnostic(
-                    ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::Provider,
-                        ExecutionOperation::ProviderExecution,
-                        ExecutionAction::Retry,
-                        crawl_execution_code_name(adapter_error_code(&error)),
-                    )
-                    .with_provider("crawler-adapter"),
-                );
-                if permit
-                    .record_outcome(PacingOutcome::from_adapter_error(&error))
-                    .is_err()
-                {
-                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::Pacing,
-                        ExecutionOperation::RecordOutcome,
-                        ExecutionAction::Continue,
-                        "PACING_OUTCOME_RECORD_FAILED",
-                    ));
-                }
-                return Err(PageFailure {
-                    code: adapter_error_code(&error),
-                    status: adapter_error_status(&error),
-                    duration_exhausted: false,
-                });
-            }
-        };
-        let (observation, response, artifacts, completeness) = result.into_parts();
-        if observation.requested_url != requested_url {
-            return Err(PageFailure::normal(
-                CrawlExecutionErrorCode::InvalidResponse,
-            ));
-        }
-        let final_url = observation
-            .final_url
-            .as_deref()
-            .unwrap_or(&observation.requested_url);
-        let final_target = final_url
-            .parse::<url::Url>()
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
-        self.network_policy
-            .validate_and_resolve(&final_target)
-            .await
-            .map_err(|_| PageFailure::normal(CrawlExecutionErrorCode::InvalidResponse))?;
-        Ok(PageResult {
-            observation,
-            status: response.status_code(),
-            media_type: response.media_type().map(|value| value.as_str().to_owned()),
-            content_length: response.content_length_bytes(),
-            elapsed_ms: response.provider_elapsed_ms(),
-            artifacts,
-            completeness,
-        })
-    }
-
-    async fn persist_execution(
-        &self,
-        record: CrawlExecutionRecord,
-        context: &JobExecutionContext,
-        expected_work_generation: Option<u64>,
-        historical_alias_if_current: bool,
-    ) -> ProductionResult<()> {
-        let work_state = match record.outcome {
-            CrawlExecutionOutcome::Completed => CrawlWorkState::Completed,
-            CrawlExecutionOutcome::Partial => CrawlWorkState::Partial,
-            CrawlExecutionOutcome::Failed => CrawlWorkState::Failed,
-            CrawlExecutionOutcome::Cancelled => CrawlWorkState::Cancelled,
-        };
-        let executions = CrawlExecutionRepository::new(&self.database);
-        let expected_work_generation = match expected_work_generation {
-            Some(generation) => generation,
-            None => CrawlTraversalRepository::new(&self.database)
-                .read_work_generation(
-                    record.crawl_run_id,
-                    &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
-                )
-                .await
-                .map_err(|_| {
-                    ProductionError::repository(
-                        ExecutionOperation::PersistExecution,
-                        "WORK_GENERATION_LOAD_FAILED",
-                    )
-                })?,
-        };
-        let result = executions
-            .persist_current_work(
-                &record,
-                &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
-                context.job_id(),
-                context.attempt_id(),
-                work_state,
-                expected_work_generation,
-                context.ownership_now(),
-            )
-            .await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(CrawlExecutionRepositoryError::InvalidReference) if historical_alias_if_current => {
-                executions
-                    .persist_historical_work(
-                        &record,
-                        &crawl_url_state_id(record.crawl_run_id, &record.canonical_url),
-                        context.job_id(),
-                        context.attempt_id(),
-                        expected_work_generation,
-                        context.ownership_now(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        ProductionError::repository(
-                            ExecutionOperation::PersistExecution,
-                            "HISTORICAL_EXECUTION_PERSIST_FAILED",
-                        )
-                    })
-            }
-            Err(_) => Err(ProductionError::repository(
-                ExecutionOperation::PersistExecution,
-                "EXECUTION_PERSIST_FAILED",
-            )),
-        }
-    }
-
-    async fn persist_artifacts(
-        &self,
-        context: &JobExecutionContext,
-        run_id: CrawlRunId,
-        created_at: &str,
-        artifacts: Vec<CrawlerArtifactEvidence>,
-        retain: bool,
-    ) -> ProductionResult<Vec<CrawlExecutionArtifact>> {
-        if !retain {
-            return Ok(Vec::new());
-        }
-        let mut saved = Vec::new();
-        for artifact in artifacts {
-            let (kind, name, media_type, bytes) = artifact_bytes(&artifact);
-            let stored = self
-                .artifact_store
-                .write_bytes(format!("production/{run_id}"), name, bytes)
-                .map_err(|_| {
-                    ProductionError::artifact(
-                        ExecutionOperation::PersistArtifact,
-                        "ARTIFACT_WRITE_FAILED",
-                    )
-                })?;
-            ArtifactRepository::new(&self.database)
-                .record(
-                    &stored,
-                    Some(run_id),
-                    None,
-                    media_type,
-                    created_at,
-                    &serde_json::json!({"kind":artifact_kind_name(kind)}),
-                )
-                .await
-                .map_err(|_| {
-                    ProductionError::artifact(
-                        ExecutionOperation::PersistArtifact,
-                        "ARTIFACT_RECORD_FAILED",
-                    )
-                })?;
-            emit(SemanticEvent::ArtifactPersisted {
-                context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
-                kind: telemetry_artifact_kind(kind),
-                count: 1,
-                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                outcome: EventOutcome::Success,
-            });
-            saved.push(CrawlExecutionArtifact {
-                artifact_id: stored.id,
-                kind: execution_artifact_kind(kind),
-            });
-        }
-        Ok(saved)
-    }
-
-    async fn progress(
-        &self,
-        context: &JobExecutionContext,
-        key: &str,
-        terminal: Option<ProgressTerminalState>,
-    ) -> ProductionResult<()> {
-        let attempt = ProgressAttemptId::new(context.attempt_id().to_owned()).map_err(|_| {
-            ProductionError::progress(
-                ExecutionOperation::Serialization,
-                "PROGRESS_ATTEMPT_INVALID",
-            )
-        })?;
-        let terminal_event = terminal.is_some();
-        let event = match terminal {
-            Some(state) => NewProgressEvent::terminal(
-                context.job_id().clone(),
-                state,
-                ProgressMetadata::default(),
-            )
-            .map_err(|_| {
-                ProductionError::progress(
-                    ExecutionOperation::Serialization,
-                    "PROGRESS_EVENT_INVALID",
-                )
-            })?,
-            None => NewProgressEvent::new(
-                context.job_id().clone(),
-                ProgressKey::new(key).map_err(|_| {
-                    ProductionError::progress(
-                        ExecutionOperation::Serialization,
-                        "PROGRESS_KEY_INVALID",
-                    )
-                })?,
-                ProgressMetadata::default(),
-            ),
-        }
-        .with_attempt(attempt);
-        let service = ProgressService::new(&self.database);
-        match &self.progress_live_hub {
-            Some(hub) => match service
-                .append_and_publish_at(hub, &event, epoch_seconds())
-                .await
-            {
-                Ok(ProgressPublication::Published(_)) => {
-                    if terminal_event {
-                        context.mark_terminal_progress_durable();
-                        if let Some(terminal) = terminal {
-                            emit(SemanticEvent::ProgressTerminalPublished {
-                                context: crate::telemetry_job_context(context),
-                                status: crate::telemetry_progress_status(terminal),
-                            });
-                        }
-                    }
-                    Ok(())
-                }
-                Ok(ProgressPublication::DurableOnly { .. }) => {
-                    if terminal_event {
-                        context.mark_terminal_progress_durable();
-                        if let Some(terminal) = terminal {
-                            emit(SemanticEvent::ProgressTerminalDurableOnly {
-                                context: crate::telemetry_job_context(context),
-                                status: crate::telemetry_progress_status(terminal),
-                            });
-                        }
-                    }
-                    context.record_secondary_diagnostic(ExecutionDiagnostic::new(
-                        OrchestrationErrorCategory::ProgressPublication,
-                        ExecutionOperation::PublishProgress,
-                        ExecutionAction::Publish,
-                        "PROGRESS_LIVE_PUBLICATION_FAILED",
-                    ));
-                    Ok(())
-                }
-                Err(_) => Err(ProductionError::progress(
-                    ExecutionOperation::AppendProgress,
-                    "PROGRESS_DURABLE_APPEND_FAILED",
-                )),
-            },
-            None => service
-                .append_at(&event, epoch_seconds())
-                .await
-                .map(|_| {
-                    if terminal_event {
-                        context.mark_terminal_progress_durable();
-                    }
-                })
-                .map_err(|_| {
-                    ProductionError::progress(
-                        ExecutionOperation::AppendProgress,
-                        "PROGRESS_DURABLE_APPEND_FAILED",
-                    )
-                }),
-        }
-    }
-}
-
-fn telemetry_artifact_kind(kind: CrawlerArtifactKind) -> ArtifactKind {
-    match kind {
-        CrawlerArtifactKind::RawHtml
-        | CrawlerArtifactKind::CleanedHtml
-        | CrawlerArtifactKind::RenderedHtml => ArtifactKind::Html,
-        CrawlerArtifactKind::Screenshot => ArtifactKind::Screenshot,
-        CrawlerArtifactKind::Markdown => ArtifactKind::Other,
-    }
-}
-
-impl JobHandler for ProductionCrawlJobHandler {
-    fn execute(
-        &self,
-        context: JobExecutionContext,
-    ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
-        let handler = self.clone();
-        async move {
-            let telemetry_context = crate::telemetry_job_context(&context);
-            let span = CrawlExecutionSpan::new(&telemetry_context);
-            match span
-                .run(Box::pin(handler.execute_inner(context.clone())))
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    context.record_diagnostics(error.diagnostics);
-                    Err(JobExecutionError)
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ProductionTraversalProvider {
-    handler: ProductionCrawlJobHandler,
-    context: JobExecutionContext,
-    snapshot: CrawlRunSnapshot,
-    deadline: ProductionDeadline,
-    attempts: Arc<Mutex<BTreeMap<String, ProductionPageAttempt>>>,
-}
-
-impl ProductionTraversalProvider {
-    fn new(
-        handler: ProductionCrawlJobHandler,
-        context: JobExecutionContext,
-        snapshot: CrawlRunSnapshot,
-        deadline: ProductionDeadline,
-    ) -> Self {
-        Self {
-            handler,
-            context,
-            snapshot,
-            deadline,
-            attempts: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    async fn take_attempts(&self) -> BTreeMap<String, ProductionPageAttempt> {
-        std::mem::take(&mut *self.attempts.lock().await)
-    }
-}
-
-impl DiscoveryPreviewProvider for ProductionTraversalProvider {
-    fn observe(
-        &self,
-        request: DiscoveryPreviewObservationRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<DiscoveryPreviewProviderOutcome, DiscoveryPreviewProviderError>,
-                > + Send
-                + '_,
-        >,
-    > {
-        let provider = self.clone();
-        Box::pin(async move {
-            let requested_url = request.requested_url;
-            if provider.context.cancellation().is_cancelled() {
-                return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
-                    reason: erabi_crawler::DiscoveryPreviewInterruption::Cancelled,
-                });
-            }
-            if provider.context.storage_pressure().is_signalled() {
-                return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
-                    reason: erabi_crawler::DiscoveryPreviewInterruption::StoragePressure,
-                });
-            }
-            let outcome = match provider
-                .handler
-                .execute_page(
-                    &provider.context,
-                    &provider.snapshot,
-                    &requested_url,
-                    &provider.deadline,
-                )
-                .await
-            {
-                Ok(page) => {
-                    let downloaded_bytes = page.content_length.unwrap_or(0);
-                    let observation = page.semantic_observation();
-                    provider.attempts.lock().await.insert(
-                        requested_url,
-                        ProductionPageAttempt::Observed {
-                            page: Box::new(page),
-                            observed_at_millis: provider.handler.clock.now_millis(),
-                        },
-                    );
-                    DiscoveryPreviewProviderOutcome::Observed {
-                        observation,
-                        downloaded_bytes,
-                    }
-                }
-                Err(failure) => {
-                    if failure.code == CrawlExecutionErrorCode::Cancelled
-                        && provider.context.cancellation().is_cancelled()
-                    {
-                        return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
-                            reason: erabi_crawler::DiscoveryPreviewInterruption::Cancelled,
-                        });
-                    }
-                    if failure.code == CrawlExecutionErrorCode::StoragePressure
-                        && provider.context.storage_pressure().is_signalled()
-                    {
-                        return Ok(DiscoveryPreviewProviderOutcome::Interrupted {
-                            reason: erabi_crawler::DiscoveryPreviewInterruption::StoragePressure,
-                        });
-                    }
-                    provider.attempts.lock().await.insert(
-                        requested_url,
-                        ProductionPageAttempt::Failed {
-                            failure: failure.clone(),
-                            observed_at_millis: provider.handler.clock.now_millis(),
-                        },
-                    );
-                    if failure.code == CrawlExecutionErrorCode::RobotsExcluded {
-                        DiscoveryPreviewProviderOutcome::RobotsExcluded {
-                            reason: "ROBOTS_EXCLUDED".to_owned(),
-                        }
-                    } else {
-                        DiscoveryPreviewProviderOutcome::PageFailed {
-                            diagnostic: TestDiagnostic {
-                                code: if failure.duration_exhausted {
-                                    "PRODUCTION_DURATION_EXHAUSTED".to_owned()
-                                } else {
-                                    "PRODUCTION_PAGE_FAILED".to_owned()
-                                },
-                                message: "The bounded Production page operation did not complete."
-                                    .to_owned(),
-                            },
-                        }
-                    }
-                }
-            };
-            Ok(outcome)
-        })
-    }
-}
-
-#[derive(Clone)]
-struct ProductionDeadline {
-    clock: Arc<dyn PreviewClock>,
-    started_at_millis: u64,
-    max_duration_millis: u64,
-}
-
-impl ProductionDeadline {
-    fn new(clock: Arc<dyn PreviewClock>, started_at_millis: u64, max_duration_millis: u64) -> Self {
-        Self {
-            clock,
-            started_at_millis,
-            max_duration_millis,
-        }
-    }
-
-    fn remaining_timeout(&self, per_page_timeout_millis: u64) -> Option<Duration> {
-        let elapsed = self
-            .clock
-            .now_millis()
-            .saturating_sub(self.started_at_millis);
-        let remaining = self.max_duration_millis.checked_sub(elapsed)?;
-        (remaining > 0).then(|| Duration::from_millis(remaining.min(per_page_timeout_millis)))
-    }
-}
-
-struct SystemProductionClock;
-
-impl PreviewClock for SystemProductionClock {
-    fn now_millis(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-            })
-    }
-}
-
-#[derive(Clone)]
-enum ProductionPageAttempt {
-    Observed {
-        page: Box<PageResult>,
-        observed_at_millis: u64,
-    },
-    Failed {
-        failure: PageFailure,
-        observed_at_millis: u64,
-    },
-}
-
-#[derive(Clone)]
-struct PageResult {
-    observation: erabi_crawler::PageObservation,
-    status: Option<u16>,
-    media_type: Option<String>,
-    content_length: Option<u64>,
-    elapsed_ms: Option<u64>,
-    artifacts: Vec<CrawlerArtifactEvidence>,
-    completeness: CrawlerResultCompleteness,
-}
-
-/// One physical provider invocation contributes exactly one attempt. An
-/// observed provider-partial page is completed in the sense used by the
-/// Task 3 summary contract, while its partial evidence contributes one
-/// unresolved-work unit; it is never counted as a second attempt.
-#[derive(Clone, Copy, Debug, Default)]
-#[allow(dead_code)]
-struct PageAttemptCounts {
-    attempted: u64,
-    completed: u64,
-    unresolved_partial_work: u64,
-}
-
-impl PageResult {
-    fn semantic_observation(&self) -> erabi_crawler::PageObservation {
-        let mut observation = self.observation.clone();
-        // Direct non-HTML responses are evidence only; they never enter HTML
-        // discovery/extraction semantics in this task.
-        if !self.media_type.as_deref().is_some_and(is_html) {
-            observation.discovered_links.clear();
-            observation.pagination_observations.clear();
-        }
-        observation
-    }
-}
-
-#[derive(Clone)]
-struct PageFailure {
-    code: CrawlExecutionErrorCode,
-    status: Option<u16>,
-    duration_exhausted: bool,
-}
-
-impl PageFailure {
-    const fn normal(code: CrawlExecutionErrorCode) -> Self {
-        Self {
-            code,
-            status: None,
-            duration_exhausted: false,
-        }
-    }
-
-    const fn duration_exhausted() -> Self {
-        Self {
-            code: CrawlExecutionErrorCode::Timeout,
-            status: None,
-            duration_exhausted: true,
-        }
-    }
 }
 
 fn production_limits(
@@ -3126,24 +2143,6 @@ fn production_limits(
         max_downloaded_bytes: version.guardrails().max_downloaded_bytes,
         transition_total_limits,
     })
-}
-
-fn crawl_execution_code_name(code: CrawlExecutionErrorCode) -> &'static str {
-    match code {
-        CrawlExecutionErrorCode::AccessDenied => "ACCESS_DENIED",
-        CrawlExecutionErrorCode::NotFound => "NOT_FOUND",
-        CrawlExecutionErrorCode::Timeout => "TIMEOUT",
-        CrawlExecutionErrorCode::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
-        CrawlExecutionErrorCode::InvalidResponse => "INVALID_RESPONSE",
-        CrawlExecutionErrorCode::RateLimited => "RATE_LIMITED",
-        CrawlExecutionErrorCode::RemoteFailure => "REMOTE_FAILURE",
-        CrawlExecutionErrorCode::UnsupportedCapability => "UNSUPPORTED_CAPABILITY",
-        CrawlExecutionErrorCode::PartialResult => "PARTIAL_RESULT",
-        CrawlExecutionErrorCode::Cancelled => "CANCELLED",
-        CrawlExecutionErrorCode::RobotsExcluded => "ROBOTS_EXCLUDED",
-        CrawlExecutionErrorCode::PageTypeAmbiguous => "PAGE_TYPE_AMBIGUOUS",
-        CrawlExecutionErrorCode::StoragePressure => "STORAGE_PRESSURE",
-    }
 }
 
 /// A checkpoint is required to recover interrupted frontier state, not to
@@ -3242,12 +2241,6 @@ fn fragment_free_fetch_url(value: &str) -> Result<String, ()> {
     Ok(parsed.to_string())
 }
 
-fn crawl_url_state_id(run_id: CrawlRunId, canonical_url: &str) -> String {
-    let identity = format!("{run_id}:{canonical_url}");
-    let digest = erabi_domain::canonical_sha256(&identity).unwrap_or_else(|_| "invalid".to_owned());
-    format!("crawl:{digest}")
-}
-
 fn decode_id<T: DeserializeOwned>(value: &str) -> Result<T, ()> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| ())
 }
@@ -3270,19 +2263,6 @@ fn discovered_at(
         .get(source_requested_url)
         .map_or(fallback_millis, ProductionPageAttempt::observed_at_millis);
     format!("unix-ms:{millis}")
-}
-
-impl ProductionPageAttempt {
-    const fn observed_at_millis(&self) -> u64 {
-        match self {
-            Self::Observed {
-                observed_at_millis, ..
-            }
-            | Self::Failed {
-                observed_at_millis, ..
-            } => *observed_at_millis,
-        }
-    }
 }
 
 fn discovery_seed_status(state: PreviewUrlState) -> &'static str {
@@ -3343,18 +2323,11 @@ fn preserve_reason_for_discovery_status(status: &str) -> Option<&'static str> {
     }
 }
 
-fn is_html(media_type: &str) -> bool {
-    media_type
-        .split(';')
-        .next()
-        .is_some_and(|value| value.eq_ignore_ascii_case("text/html"))
-}
-
 fn parse_run_id(value: &str) -> Option<CrawlRunId> {
     Uuid::parse_str(value).ok().and_then(CrawlRunId::from_uuid)
 }
 
-fn discovered_id() -> String {
+pub(super) fn discovered_id() -> String {
     Uuid::now_v7().to_string()
 }
 
@@ -3378,140 +2351,4 @@ fn semantic_discovered_id<T: serde::Serialize>(
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(Uuid::from_bytes(bytes).to_string())
-}
-
-fn adapter_error_code(error: &CrawlerAdapterError) -> CrawlExecutionErrorCode {
-    match error {
-        CrawlerAdapterError::Unavailable => CrawlExecutionErrorCode::ProviderUnavailable,
-        CrawlerAdapterError::Timeout => CrawlExecutionErrorCode::Timeout,
-        CrawlerAdapterError::AccessDenied => CrawlExecutionErrorCode::AccessDenied,
-        CrawlerAdapterError::NotFound => CrawlExecutionErrorCode::NotFound,
-        CrawlerAdapterError::RateLimited { .. } => CrawlExecutionErrorCode::RateLimited,
-        CrawlerAdapterError::RemoteFailure { .. } => CrawlExecutionErrorCode::RemoteFailure,
-        CrawlerAdapterError::UnsupportedCapability => {
-            CrawlExecutionErrorCode::UnsupportedCapability
-        }
-        CrawlerAdapterError::InvalidProviderResponse => CrawlExecutionErrorCode::InvalidResponse,
-        CrawlerAdapterError::Cancelled => CrawlExecutionErrorCode::Cancelled,
-    }
-}
-
-fn adapter_error_status(error: &CrawlerAdapterError) -> Option<u16> {
-    if let CrawlerAdapterError::RemoteFailure { status_code } = error {
-        *status_code
-    } else {
-        None
-    }
-}
-
-fn artifact_bytes(
-    artifact: &CrawlerArtifactEvidence,
-) -> (CrawlerArtifactKind, &'static str, Option<&str>, &[u8]) {
-    match artifact {
-        CrawlerArtifactEvidence::RawHtml(value) => (
-            CrawlerArtifactKind::RawHtml,
-            "raw.html",
-            Some("text/html"),
-            value.as_bytes(),
-        ),
-        CrawlerArtifactEvidence::CleanedHtml(value) => (
-            CrawlerArtifactKind::CleanedHtml,
-            "cleaned.html",
-            Some("text/html"),
-            value.as_bytes(),
-        ),
-        CrawlerArtifactEvidence::RenderedHtml(value) => (
-            CrawlerArtifactKind::RenderedHtml,
-            "rendered.html",
-            Some("text/html"),
-            value.as_bytes(),
-        ),
-        CrawlerArtifactEvidence::Markdown(value) => (
-            CrawlerArtifactKind::Markdown,
-            "page.md",
-            Some("text/markdown"),
-            value.as_bytes(),
-        ),
-        CrawlerArtifactEvidence::Screenshot { media_type, bytes } => (
-            CrawlerArtifactKind::Screenshot,
-            "screenshot.bin",
-            Some(media_type.as_str()),
-            bytes,
-        ),
-    }
-}
-
-fn execution_artifact_kind(kind: CrawlerArtifactKind) -> CrawlExecutionArtifactKind {
-    match kind {
-        CrawlerArtifactKind::RawHtml => CrawlExecutionArtifactKind::RawHtml,
-        CrawlerArtifactKind::CleanedHtml => CrawlExecutionArtifactKind::CleanedHtml,
-        CrawlerArtifactKind::RenderedHtml => CrawlExecutionArtifactKind::RenderedHtml,
-        CrawlerArtifactKind::Markdown => CrawlExecutionArtifactKind::Markdown,
-        CrawlerArtifactKind::Screenshot => CrawlExecutionArtifactKind::Screenshot,
-    }
-}
-
-fn artifact_kind_name(kind: CrawlerArtifactKind) -> &'static str {
-    match kind {
-        CrawlerArtifactKind::RawHtml => "RAW_HTML",
-        CrawlerArtifactKind::CleanedHtml => "CLEANED_HTML",
-        CrawlerArtifactKind::RenderedHtml => "RENDERED_HTML",
-        CrawlerArtifactKind::Markdown => "MARKDOWN",
-        CrawlerArtifactKind::Screenshot => "SCREENSHOT",
-    }
-}
-
-fn epoch_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |value| {
-            i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
-        })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ProductionDeadline, discovered_id, is_production_job_kind};
-    use erabi_crawler::{ManualPreviewClock, PreviewClock};
-    use std::{sync::Arc, time::Duration};
-    use uuid::Uuid;
-
-    #[test]
-    fn discovered_url_identity_is_a_bare_uuid_v7() {
-        let id = discovered_id();
-        assert_eq!(
-            Uuid::parse_str(&id)
-                .ok()
-                .map(|parsed| parsed.get_version_num()),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn duration_timeout_is_capped_and_expires_without_sleeping() {
-        let clock = Arc::new(ManualPreviewClock::new());
-        let deadline = ProductionDeadline::new(clock.clone(), 0, 500);
-        assert_eq!(
-            deadline.remaining_timeout(2_000),
-            Some(Duration::from_millis(500))
-        );
-        clock.advance_millis(500);
-        assert_eq!(deadline.remaining_timeout(2_000), None);
-        assert_eq!(clock.now_millis(), 500);
-    }
-
-    #[test]
-    fn production_recovery_kinds_are_explicitly_routed() {
-        for kind in [
-            "PRODUCTION_CRAWL",
-            "RETRY",
-            "RETRY_FAILED_PARTS",
-            "RESUME_CHECKPOINT",
-            "RERUN_FULL_CRAWL",
-        ] {
-            assert!(is_production_job_kind(kind), "{kind} must use production");
-        }
-        assert!(!is_production_job_kind("QUICK_SCRAPE"));
-        assert!(!is_production_job_kind("RESTART_FROM_BEGINNING"));
-    }
 }
