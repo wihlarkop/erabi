@@ -11,7 +11,9 @@
 **Spec:** `docs/specs/04-extraction-curation-and-provenance.md`, `docs/specs/03-discovery-graph-and-runs.md`, `docs/specs/08-ux-accessibility-and-verification.md`  
 **Spec revision:** `679b499e617fcef14e4e40b9a7fc826b379b8a30`
 
-**Migration ownership:** `migrations/0006_curated_data.sql` for Datasets, record versions/candidates, validation, reviews, provenance, and relationships.
+**Migration ownership:** `migrations/0007_curated_data.sql` is reserved by the
+canonical migration allocation ledger for Datasets, record
+versions/candidates, validation, reviews, provenance, and relationships.
 
 ---
 
@@ -74,7 +76,7 @@
 
 ### Task 4: Dataset/review persistence and immutable approved Record versions
 
-**Files:** `migrations/0006_curated_data.sql`, Dataset/review/provenance domain types, repositories/routes/tests.
+**Files:** `migrations/0007_curated_data.sql`, Dataset/review/provenance domain types, repositories/routes/tests.
 
 **Persist:** datasets, identity/record versions, candidate values, validation issues, reviews/items, provenance rows, relationships/references as defined by MVP.
 
