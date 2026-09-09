@@ -255,9 +255,9 @@ Existing non-Production compatibility paths may continue to use `ExtractionHealt
 
 ## 9. Compatibility wrappers in `erabi-crawler`
 
-DX-D05 should avoid a big-bang API break.
+DX-D05 must avoid a breaking cleanup of the existing crawler finalization surface.
 
-Existing finalization APIs such as:
+The currently exported finalization APIs, including:
 
 ```text
 finalize_durable_state
@@ -265,9 +265,9 @@ finalize_durable_state_with_control
 finalize_durable_state_with_traversal
 ```
 
-may remain as compatibility wrappers if current callers/tests need them.
+must remain available during DX-D05 as behavior-preserving compatibility wrappers. The existing public `CrawlFinalization` result surface must likewise remain usable by current callers. Removing or renaming that public compatibility surface is outside DX-D05 unless a new design review explicitly approves the break.
 
-A new canonical crawl-only core should reconstruct structural facts. Legacy wrappers may adapt those facts into the existing `CrawlFinalization`/complete-snapshot result by attaching the historical extraction-health default.
+A new canonical crawl-only core should reconstruct structural facts. Legacy wrappers adapt those facts into the existing `CrawlFinalization`/complete-snapshot result by attaching the historical extraction-health default.
 
 Production jobs should use the crawl-only structural facts explicitly, so Plan 07 does not need to reopen the crawler ownership boundary.
 
