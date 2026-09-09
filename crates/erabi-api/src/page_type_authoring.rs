@@ -15,6 +15,8 @@ use erabi_domain::{
     UrlMatcherDefinition, UrlMatcherKind, resolve_page_type,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::{
@@ -199,15 +201,16 @@ enum MatchServiceError {
     Repository(CrawlerRepositoryError),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PageTypeRequest {
     name: String,
     priority: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[schema(as = UrlMatcherRequest)]
 pub(crate) enum MatcherDefinitionRequest {
     ExactUrl {
         url: String,
@@ -255,7 +258,7 @@ impl MatcherDefinitionRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 enum MatcherResponse {
     ExactUrl {
@@ -329,7 +332,7 @@ impl MatcherResponse {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 struct PageTypeResponse {
     id: String,
     crawler_version_id: String,
@@ -338,7 +341,7 @@ struct PageTypeResponse {
     matchers: Vec<MatcherResponse>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum MatchDecisionKind {
     Matched,
@@ -346,7 +349,7 @@ enum MatchDecisionKind {
     Unmatched,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 struct CandidateResponse {
     page_type_id: String,
     page_type_name: String,
@@ -360,13 +363,24 @@ struct CandidateResponse {
     wildcard_capture_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(as = MatchDecision)]
 struct MatchDecisionResponse {
     decision: MatchDecisionKind,
     candidate: Option<CandidateResponse>,
     candidates: Vec<CandidateResponse>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types",
+    responses(
+        (status = 200, description = "PageTypes", body = [PageTypeResponse]),
+        (status = 400, description = "Invalid PageType context", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "PageType authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn list_page_types(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -398,6 +412,16 @@ pub(crate) async fn list_page_types(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}",
+    responses(
+        (status = 200, description = "PageType", body = PageTypeResponse),
+        (status = 400, description = "Invalid PageType identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "PageType not found", body = ApiErrorEnvelope),
+        (status = 503, description = "PageType authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_page_type(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -431,6 +455,18 @@ pub(crate) async fn read_page_type(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types",
+    request_body = PageTypeRequest,
+    responses(
+        (status = 201, description = "PageType created", body = PageTypeResponse),
+        (status = 400, description = "Invalid PageType request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "PageType conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "PageType authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn create_page_type(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -475,6 +511,18 @@ pub(crate) async fn create_page_type(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}",
+    request_body = PageTypeRequest,
+    responses(
+        (status = 200, description = "PageType updated", body = PageTypeResponse),
+        (status = 400, description = "Invalid PageType request", body = ApiErrorEnvelope),
+        (status = 404, description = "PageType not found", body = ApiErrorEnvelope),
+        (status = 409, description = "PageType conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "PageType authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn update_page_type(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -531,6 +579,17 @@ pub(crate) async fn update_page_type(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}",
+    responses(
+        (status = 204, description = "PageType deleted"),
+        (status = 400, description = "Invalid PageType identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "PageType not found", body = ApiErrorEnvelope),
+        (status = 409, description = "PageType conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "PageType authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn delete_page_type(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -564,6 +623,16 @@ pub(crate) async fn delete_page_type(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers",
+    responses(
+        (status = 200, description = "URL matchers", body = [MatcherResponse]),
+        (status = 400, description = "Invalid matcher context", body = ApiErrorEnvelope),
+        (status = 404, description = "PageType not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Matcher authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn list_matchers(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -603,6 +672,16 @@ pub(crate) async fn list_matchers(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers/{matcher_id}",
+    responses(
+        (status = 200, description = "URL matcher", body = MatcherResponse),
+        (status = 400, description = "Invalid matcher identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "URL matcher not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Matcher authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_matcher(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -649,6 +728,18 @@ pub(crate) async fn read_matcher(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers",
+    request_body = MatcherDefinitionRequest,
+    responses(
+        (status = 201, description = "URL matcher created", body = MatcherResponse),
+        (status = 400, description = "Invalid matcher request", body = ApiErrorEnvelope),
+        (status = 404, description = "PageType not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Matcher conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Matcher authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn create_matcher(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -700,6 +791,18 @@ pub(crate) async fn create_matcher(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers/{matcher_id}",
+    request_body = MatcherDefinitionRequest,
+    responses(
+        (status = 200, description = "URL matcher updated", body = MatcherResponse),
+        (status = 400, description = "Invalid matcher request", body = ApiErrorEnvelope),
+        (status = 404, description = "URL matcher not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Matcher conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Matcher authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn update_matcher(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -766,6 +869,17 @@ pub(crate) async fn update_matcher(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/page-types/{page_type_id}/matchers/{matcher_id}",
+    responses(
+        (status = 204, description = "URL matcher deleted"),
+        (status = 400, description = "Invalid matcher identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "URL matcher not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Matcher conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Matcher authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn delete_matcher(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -806,6 +920,17 @@ pub(crate) async fn delete_matcher(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/match-page-type",
+    request_body = MatchRequest,
+    responses(
+        (status = 200, description = "Deterministic PageType match decision", body = MatchDecisionResponse),
+        (status = 400, description = "Invalid match request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "PageType matching unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn match_page_type(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -849,10 +974,19 @@ pub(crate) async fn match_page_type(
     Json(match_decision_response(decision)).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MatchRequest {
     url: String,
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new()
+        .routes(routes!(list_page_types, create_page_type))
+        .routes(routes!(read_page_type, update_page_type, delete_page_type))
+        .routes(routes!(list_matchers, create_matcher))
+        .routes(routes!(read_matcher, update_matcher, delete_matcher))
+        .routes(routes!(match_page_type))
 }
 
 fn page_type_response(page_type: &PageTypeRecord) -> PageTypeResponse {

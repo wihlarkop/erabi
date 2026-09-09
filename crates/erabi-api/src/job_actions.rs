@@ -17,6 +17,8 @@ use erabi_observability::{
     CorrelationContext, JobActionToken, SemanticEvent, TelemetryCode, TelemetryId, emit,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     AppState,
@@ -24,17 +26,29 @@ use crate::{
     error::{ApiErrorEnvelope, error_response},
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct QueueActionInput {
     pub priority: i32,
     pub scheduled_at: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct RerunFullCrawlRequest {
     pub robots_override_reason: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/retry-failed-parts",
+    summary = "Retry failed parts",
+    responses(
+        (status = 200, description = "Job action accepted", body = JobActionResponse),
+        (status = 400, description = "Invalid job identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "Job not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Job action conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Job actions unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn retry_failed_parts(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -50,6 +64,13 @@ pub(crate) async fn retry_failed_parts(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/rerun-full-crawl",
+    summary = "Rerun full crawl",
+    request_body = RerunFullCrawlRequest,
+    responses((status = 200, description = "Job action accepted", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn rerun_full_crawl(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -76,6 +97,12 @@ pub(crate) async fn rerun_full_crawl(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/resume",
+    summary = "Resume compatible checkpoint",
+    responses((status = 200, description = "Job action accepted", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn resume(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -91,6 +118,12 @@ pub(crate) async fn resume(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/restart",
+    summary = "Restart from beginning",
+    responses((status = 200, description = "Job action accepted", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn restart(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -106,6 +139,12 @@ pub(crate) async fn restart(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/retry",
+    summary = "Retry bounded job attempt",
+    responses((status = 200, description = "Job action accepted", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn retry(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -121,6 +160,12 @@ pub(crate) async fn retry(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/cancel",
+    summary = "Cancel job cooperatively",
+    responses((status = 200, description = "Job action accepted", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn cancel(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -136,6 +181,13 @@ pub(crate) async fn cancel(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/jobs/{job_id}/priority",
+    summary = "Move queued job",
+    request_body = QueueActionInput,
+    responses((status = 200, description = "Job action accepted", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn reprioritize(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -158,6 +210,12 @@ pub(crate) async fn reprioritize(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/jobs/{job_id}",
+    summary = "Remove safe never-started job",
+    responses((status = 200, description = "Job removed", body = JobActionResponse), (status = 400, body = ApiErrorEnvelope), (status = 404, body = ApiErrorEnvelope), (status = 409, body = ApiErrorEnvelope), (status = 503, body = ApiErrorEnvelope))
+)]
 pub(crate) async fn remove(
     State(state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -404,7 +462,7 @@ fn state_name(state: erabi_db::repositories::JobState) -> &'static str {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct JobActionResponse {
     action: &'static str,
     job_id: String,
@@ -414,4 +472,16 @@ struct JobActionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     failed_part_count: Option<usize>,
     removed: bool,
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new()
+        .routes(routes!(retry_failed_parts))
+        .routes(routes!(rerun_full_crawl))
+        .routes(routes!(resume))
+        .routes(routes!(restart))
+        .routes(routes!(retry))
+        .routes(routes!(cancel))
+        .routes(routes!(reprioritize))
+        .routes(routes!(remove))
 }

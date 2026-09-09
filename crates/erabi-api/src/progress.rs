@@ -22,6 +22,7 @@ use erabi_jobs::{ProgressService, ProgressServiceError};
 use futures_util::{Stream, stream};
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     AppState,
@@ -33,6 +34,18 @@ use crate::{
 const REPLAY_PAGE_SIZE: usize = 256;
 const KEEP_ALIVE_SECONDS: u64 = 15;
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/events/jobs/{job_id}/progress",
+    params(("Last-Event-ID" = Option<String>, Header, description = "Optional durable replay cursor")),
+    responses(
+        (status = 200, description = "Replayable job progress stream", content_type = "text/event-stream"),
+        (status = 400, description = "Invalid replay cursor", body = crate::error::ApiErrorEnvelope),
+        (status = 404, description = "Job not found", body = crate::error::ApiErrorEnvelope),
+        (status = 501, description = "Progress stream unavailable", body = crate::error::ApiErrorEnvelope),
+        (status = 503, description = "Progress stream unavailable", body = crate::error::ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn job_progress_sse(
     State(app_state): State<AppState>,
     Path(raw_job_id): Path<String>,
@@ -110,6 +123,10 @@ pub(crate) async fn job_progress_sse(
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new().routes(routes!(job_progress_sse))
 }
 
 struct ProgressStreamState {

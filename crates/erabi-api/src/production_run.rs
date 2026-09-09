@@ -16,6 +16,8 @@ use erabi_domain::{
 };
 use erabi_observability::{CorrelationContext, SemanticEvent, TelemetryCode, TelemetryId, emit};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::{
@@ -29,7 +31,7 @@ const API_ACTOR: &str = "api";
 
 /// Production accepts only an optional explicit Seed set and a fresh robots
 /// override. Provider controls are never HTTP DTO fields.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProductionRunRequest {
     #[serde(default)]
@@ -38,19 +40,31 @@ pub(crate) struct ProductionRunRequest {
     robots_override: Option<RobotsOverrideRequest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct RobotsOverrideRequest {
     reason: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 pub(crate) struct ProductionRunAcceptedResponse {
     run_id: String,
     job_id: String,
 }
 
 #[allow(clippy::too_many_lines)]
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/production-runs",
+    request_body = ProductionRunRequest,
+    responses(
+        (status = 202, description = "Production Run accepted", body = ProductionRunAcceptedResponse),
+        (status = 400, description = "Invalid Production Run request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Production Run conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Production Run unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn start_production_run(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -168,6 +182,10 @@ pub(crate) async fn start_production_run(
         }
         Err(error) => production_error(&error, &trace),
     }
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new().routes(routes!(start_production_run))
 }
 
 fn production_settings(

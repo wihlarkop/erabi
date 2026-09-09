@@ -15,6 +15,7 @@ erabi-domain = { version = "0.1.0", path = "../erabi-domain" }
 erabi-jobs = { version = "0.1.0", path = "../erabi-jobs" }
 erabi-observability = { version = "0.1.0", path = "../erabi-observability" }
 futures-util = "0.3.34"
+scalar_api_reference = "0.2"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -22,6 +23,8 @@ subtle = "2.6.1"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["sync"] }
 tower = { version = "0.5.3", features = ["util"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.2"
 url = "2.5.8"
 uuid = { version = "1.26.0", features = ["v7"] }
 

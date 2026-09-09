@@ -1,7 +1,5 @@
 //! HTTP boundary for the ephemeral Discovery Preview service.
 
-use std::collections::BTreeMap;
-
 use axum::{
     Json,
     extract::{Extension, Path, State, rejection::JsonRejection},
@@ -14,23 +12,31 @@ use erabi_domain::{
     TransitionPreviewTotalLimit,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use std::collections::BTreeMap;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::{
     AppState,
     app::TraceId,
     error::{ApiErrorEnvelope, error_response},
+    openapi::wire::{
+        CanonicalizationEvidenceSchema, DomainScopeEvidenceSchema, PageTypeMatchEvidenceSchema,
+        TestDiagnosticSchema,
+    },
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = DiscoveryPreviewRequest)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveryPreviewRequestDto {
     pub seed_ids: Vec<String>,
     pub limits: PreviewLimitsDto,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = PreviewLimits)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreviewLimitsDto {
     pub max_pages: u64,
@@ -41,11 +47,308 @@ pub(crate) struct PreviewLimitsDto {
     pub transition_total_limits: Vec<TransitionPreviewTotalLimitDto>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = TransitionPreviewTotalLimit)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TransitionPreviewTotalLimitDto {
     pub transition_id: String,
     pub max_total_links: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = DiscoveryPreviewResult)]
+struct DiscoveryPreviewResultSchema {
+    result_semantics: DiscoveryPreviewResultSemanticsSchema,
+    crawler_version_id: String,
+    config_hash: String,
+    selected_seed_ids: Vec<String>,
+    effective_limits: EffectiveDiscoveryPreviewLimitsSchema,
+    seeds: Vec<DiscoveryPreviewSeedSchema>,
+    pages: Vec<DiscoveryPreviewPageSchema>,
+    discovery_paths: Vec<DiscoveryPathSchema>,
+    summary: DiscoveryPreviewSummarySchema,
+    growth_indicators: PreviewGrowthIndicatorsSchema,
+    growth_warnings: Vec<PreviewGrowthWarningSchema>,
+    warnings: Vec<PreviewDiagnosticSchema>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = DiscoveryPreviewResultSemantics)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum DiscoveryPreviewResultSemanticsSchema {
+    PreviewOnly,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = EffectiveDiscoveryPreviewLimits)]
+struct EffectiveDiscoveryPreviewLimitsSchema {
+    max_pages: u64,
+    max_depth: u32,
+    max_duration_ms: u64,
+    max_downloaded_bytes: u64,
+    transition_total_limits: Vec<EffectiveTransitionPreviewTotalLimitSchema>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = EffectiveTransitionPreviewTotalLimit)]
+struct EffectiveTransitionPreviewTotalLimitSchema {
+    transition_id: String,
+    effective_total_limit: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = DiscoveryPreviewSeed)]
+struct DiscoveryPreviewSeedSchema {
+    seed_id: String,
+    requested_url: String,
+    canonical_url: String,
+    #[schema(required = true)]
+    entry_page_type_hint: Option<String>,
+    state: PreviewUrlStateSchema,
+    #[schema(required = true)]
+    duplicate_of_canonical_url: Option<String>,
+    #[schema(required = true)]
+    scope: Option<DomainScopeEvidenceSchema>,
+    #[schema(required = true)]
+    page_type_match: Option<PageTypeMatchEvidenceSchema>,
+    budget_hits: Vec<PreviewBudgetHitSchema>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = DiscoveryPreviewPage)]
+struct DiscoveryPreviewPageSchema {
+    requested_url: String,
+    requested_canonical_url: String,
+    #[schema(required = true)]
+    final_url: Option<String>,
+    #[schema(required = true)]
+    canonical_url: Option<String>,
+    depth: u32,
+    state: PreviewUrlStateSchema,
+    seed_ids: Vec<String>,
+    #[schema(required = true)]
+    scope: Option<DomainScopeEvidenceSchema>,
+    #[schema(required = true)]
+    page_type_match: Option<PageTypeMatchEvidenceSchema>,
+    #[schema(required = true)]
+    downloaded_bytes: Option<u64>,
+    #[schema(required = true)]
+    robots_reason: Option<String>,
+    #[schema(required = true)]
+    diagnostic: Option<TestDiagnosticSchema>,
+    budget_hits: Vec<PreviewBudgetHitSchema>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = DiscoveryPath)]
+struct DiscoveryPathSchema {
+    seed_id: String,
+    seed_ids: Vec<String>,
+    source_requested_url: String,
+    #[schema(required = true)]
+    source_final_url: Option<String>,
+    source_canonical_url: String,
+    source_page_type_match: PageTypeMatchEvidenceSchema,
+    #[schema(required = true)]
+    selector: Option<String>,
+    raw_href: String,
+    #[schema(required = true)]
+    resolved_original_url: Option<String>,
+    #[schema(required = true)]
+    canonical_url: Option<String>,
+    #[schema(required = true)]
+    canonicalization: Option<CanonicalizationEvidenceSchema>,
+    #[schema(required = true)]
+    scope: Option<DomainScopeEvidenceSchema>,
+    state: PreviewUrlStateSchema,
+    #[schema(required = true)]
+    duplicate_of_canonical_url: Option<String>,
+    #[schema(required = true)]
+    target_page_type_match: Option<PageTypeMatchEvidenceSchema>,
+    source_depth: u32,
+    #[schema(required = true)]
+    prospective_depth: Option<u32>,
+    transition_evaluations: Vec<PreviewTransitionEvaluationSchema>,
+    budget_hits: Vec<PreviewBudgetHitSchema>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewUrlState)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PreviewUrlStateSchema {
+    Sampled,
+    InScopeMatched,
+    AmbiguousPageType,
+    Unmatched,
+    External,
+    Blocked,
+    CanonicalDuplicate,
+    RobotsExcluded,
+    BudgetExcluded,
+    ProviderError,
+    InvalidUrl,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewBudgetKind)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PreviewBudgetKindSchema {
+    MaxPages,
+    MaxDepth,
+    MaxDuration,
+    MaxDownloadedBytes,
+    PageTypePageBudget,
+    TransitionPerSourcePage,
+    TransitionTotal,
+    ProvenanceRetention,
+    DiagnosticRetention,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewBudgetHit)]
+struct PreviewBudgetHitSchema {
+    kind: PreviewBudgetKindSchema,
+    #[schema(required = true)]
+    transition_id: Option<String>,
+    #[schema(required = true)]
+    page_type_id: Option<String>,
+    observed: u64,
+    limit: u64,
+}
+
+#[allow(dead_code)]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(ToSchema)]
+#[schema(as = PreviewTransitionEvaluation)]
+struct PreviewTransitionEvaluationSchema {
+    transition_id: String,
+    transition_name: String,
+    source_page_type_id: String,
+    target_page_type_id: String,
+    priority: i32,
+    selector_eligible: bool,
+    target_page_type_eligible: bool,
+    constraints_eligible: bool,
+    eligible: bool,
+    budget_hits: Vec<PreviewBudgetHitSchema>,
+    #[schema(required = true)]
+    diagnostic: Option<PreviewDiagnosticSchema>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewDiagnostic)]
+struct PreviewDiagnosticSchema {
+    code: String,
+    message: String,
+    #[schema(required = true)]
+    observed: Option<u64>,
+    #[schema(required = true)]
+    threshold: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = DiscoveryPreviewSummary)]
+struct DiscoveryPreviewSummarySchema {
+    pages_sampled: u64,
+    urls_discovered: u64,
+    canonical_unique_urls: u64,
+    duplicates_prevented: u64,
+    page_type_distribution: Vec<PreviewPageTypeDistributionSchema>,
+    ambiguous_urls: u64,
+    unmatched_urls: u64,
+    external_urls: u64,
+    blocked_urls: u64,
+    robots_excluded: u64,
+    provider_errors: u64,
+    transition_counts: Vec<PreviewTransitionCountSchema>,
+    budget_hit_counts: BTreeMap<String, u64>,
+    frontier_remaining: u64,
+    newly_enqueued_urls: u64,
+    pagination_truncation_count: u64,
+    duration_work_not_expanded: bool,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewPageTypeDistribution)]
+struct PreviewPageTypeDistributionSchema {
+    page_type_id: String,
+    page_type_name: String,
+    discovered_unique_urls: u64,
+    sampled_pages: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewTransitionCount)]
+struct PreviewTransitionCountSchema {
+    transition_id: String,
+    transition_name: String,
+    eligible_edges: u64,
+    source_pages_with_eligible_edges: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewGrowthIndicators)]
+struct PreviewGrowthIndicatorsSchema {
+    peak_new_canonical_urls_from_one_page: u64,
+    total_newly_enqueued_urls: u64,
+    frontier_remaining: u64,
+    #[schema(required = true)]
+    dominant_transition_id: Option<String>,
+    dominant_transition_eligible_edges: u64,
+    total_eligible_transition_edges: u64,
+    #[schema(required = true)]
+    dominant_transition_share_percent: Option<u64>,
+    query_variant_groups: Vec<PreviewQueryVariantGroupSchema>,
+    unmatched_denominator: u64,
+    ambiguity_denominator: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewQueryVariantGroup)]
+struct PreviewQueryVariantGroupSchema {
+    host: String,
+    path: String,
+    total_identities: u64,
+    query_bearing_identities: u64,
+    canonical_query_variants: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewGrowthWarning)]
+struct PreviewGrowthWarningSchema {
+    code: PreviewGrowthWarningCodeSchema,
+    message: String,
+    observed: u64,
+    threshold: u64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[schema(as = PreviewGrowthWarningCode)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PreviewGrowthWarningCodeSchema {
+    CyclicTransitionDominance,
+    QueryParameterExplosion,
+    HighUnmatchedRate,
+    WidespreadPageTypeAmbiguity,
+    BudgetPressure,
 }
 
 impl DiscoveryPreviewRequestDto {
@@ -79,6 +382,19 @@ impl DiscoveryPreviewRequestDto {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/discovery-preview",
+    request_body = DiscoveryPreviewRequestDto,
+    responses(
+        (status = 200, description = "Discovery Preview result", body = DiscoveryPreviewResultSchema),
+        (status = 400, description = "Invalid Discovery Preview request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Discovery Preview conflict", body = ApiErrorEnvelope),
+        (status = 502, description = "Discovery Preview provider error", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery Preview unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn run_discovery_preview(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -122,6 +438,10 @@ pub(crate) async fn run_discovery_preview(
         Ok(result) => Json(result).into_response(),
         Err(error) => map_preview_error(error, &trace),
     }
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new().routes(routes!(run_discovery_preview))
 }
 
 fn parse_id<T>(value: &str) -> Result<T, ()>
@@ -263,39 +583,10 @@ fn preview_error(
     error_response(status, ApiErrorEnvelope::new(code, message, trace.as_str()))
 }
 
-pub(crate) fn discovery_preview_openapi_schemas() -> BTreeMap<&'static str, Value> {
-    let mut schemas = BTreeMap::new();
-    schemas.insert("DiscoveryPreviewRequest", serde_json::json!({"type":"object","required":["seed_ids","limits"],"properties":{"seed_ids":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string","format":"uuid"}},"limits":{"$ref":"#/components/schemas/PreviewLimits"}}}));
-    schemas.insert("PreviewLimits", serde_json::json!({"type":"object","required":["max_pages","max_depth","max_duration_ms","default_transition_total_limit","transition_total_limits"],"properties":{"max_pages":{"type":"integer","minimum":1},"max_depth":{"type":"integer","minimum":0},"max_duration_ms":{"type":"integer","minimum":1},"default_transition_total_limit":{"type":"integer","minimum":1},"transition_total_limits":{"type":"array","maxItems":128,"items":{"$ref":"#/components/schemas/TransitionPreviewTotalLimit"}}}}));
-    schemas.insert("TransitionPreviewTotalLimit", serde_json::json!({"type":"object","required":["transition_id","max_total_links"],"properties":{"transition_id":{"type":"string","format":"uuid"},"max_total_links":{"type":"integer","minimum":1}}}));
-    schemas.insert("EffectiveTransitionPreviewTotalLimit", serde_json::json!({"type":"object","required":["transition_id","effective_total_limit"],"properties":{"transition_id":{"type":"string","format":"uuid"},"effective_total_limit":{"type":"integer","minimum":1}}}));
-    schemas.insert("EffectiveDiscoveryPreviewLimits", serde_json::json!({"type":"object","required":["max_pages","max_depth","max_duration_ms","max_downloaded_bytes","transition_total_limits"],"properties":{"max_pages":{"type":"integer","minimum":1},"max_depth":{"type":"integer","minimum":0},"max_duration_ms":{"type":"integer","minimum":1},"max_downloaded_bytes":{"type":"integer","minimum":1},"transition_total_limits":{"type":"array","items":{"$ref":"#/components/schemas/EffectiveTransitionPreviewTotalLimit"}}}}));
-    schemas.insert("DiscoveryPreviewResult", serde_json::json!({"type":"object","required":["result_semantics","crawler_version_id","config_hash","selected_seed_ids","effective_limits","seeds","pages","discovery_paths","summary","growth_indicators","growth_warnings","warnings"],"properties":{"result_semantics":{"$ref":"#/components/schemas/DiscoveryPreviewResultSemantics"},"crawler_version_id":{"type":"string","format":"uuid"},"config_hash":{"type":"string"},"selected_seed_ids":{"type":"array","items":{"type":"string","format":"uuid"}},"effective_limits":{"$ref":"#/components/schemas/EffectiveDiscoveryPreviewLimits"},"seeds":{"type":"array","items":{"$ref":"#/components/schemas/DiscoveryPreviewSeed"}},"pages":{"type":"array","items":{"$ref":"#/components/schemas/DiscoveryPreviewPage"}},"discovery_paths":{"type":"array","items":{"$ref":"#/components/schemas/DiscoveryPath"}},"summary":{"$ref":"#/components/schemas/DiscoveryPreviewSummary"},"growth_indicators":{"$ref":"#/components/schemas/PreviewGrowthIndicators"},"growth_warnings":{"type":"array","items":{"$ref":"#/components/schemas/PreviewGrowthWarning"}},"warnings":{"type":"array","items":{"$ref":"#/components/schemas/PreviewDiagnostic"}}}}));
-    schemas.insert("DiscoveryPreviewSeed", serde_json::json!({"type":"object","required":["seed_id","requested_url","canonical_url","entry_page_type_hint","state","duplicate_of_canonical_url","scope","page_type_match","budget_hits"],"properties":{"seed_id":{"type":"string","format":"uuid"},"requested_url":{"type":"string","format":"uri"},"canonical_url":{"type":"string","format":"uri"},"entry_page_type_hint":{"anyOf":[{"type":"string","format":"uuid"},{"type":"null"}]},"state":{"$ref":"#/components/schemas/PreviewUrlState"},"duplicate_of_canonical_url":{"type":["string","null"],"format":"uri"},"scope":{"anyOf":[{"$ref":"#/components/schemas/DomainScopeEvidence"},{"type":"null"}]},"page_type_match":{"anyOf":[{"$ref":"#/components/schemas/PageTypeMatchEvidence"},{"type":"null"}]},"budget_hits":{"type":"array","items":{"$ref":"#/components/schemas/PreviewBudgetHit"}}}}));
-    schemas.insert("DiscoveryPreviewPage", serde_json::json!({"type":"object","required":["requested_url","final_url","canonical_url","depth","state","seed_ids","scope","page_type_match","downloaded_bytes","robots_reason","diagnostic","budget_hits"],"properties":{"requested_url":{"type":"string","format":"uri"},"final_url":{"type":["string","null"],"format":"uri"},"canonical_url":{"type":["string","null"],"format":"uri"},"depth":{"type":"integer","minimum":0},"state":{"$ref":"#/components/schemas/PreviewUrlState"},"seed_ids":{"type":"array","items":{"type":"string","format":"uuid"}},"scope":{"anyOf":[{"$ref":"#/components/schemas/DomainScopeEvidence"},{"type":"null"}]},"page_type_match":{"anyOf":[{"$ref":"#/components/schemas/PageTypeMatchEvidence"},{"type":"null"}]},"downloaded_bytes":{"type":["integer","null"],"minimum":0},"robots_reason":{"type":["string","null"]},"diagnostic":{"anyOf":[{"$ref":"#/components/schemas/TestDiagnostic"},{"type":"null"}]},"budget_hits":{"type":"array","items":{"$ref":"#/components/schemas/PreviewBudgetHit"}}}}));
-    schemas.insert("DiscoveryPath", serde_json::json!({"type":"object","description":"A retained raw-href discovery edge with observed-source, canonicalization, scope, PageType, transition, and budget provenance.","required":["seed_id","seed_ids","source_requested_url","source_final_url","source_canonical_url","source_page_type_match","selector","raw_href","resolved_original_url","canonical_url","canonicalization","scope","state","duplicate_of_canonical_url","target_page_type_match","source_depth","prospective_depth","transition_evaluations","budget_hits"],"properties":{"seed_id":{"type":"string","format":"uuid"},"seed_ids":{"type":"array","items":{"type":"string","format":"uuid"}},"source_requested_url":{"type":"string","format":"uri"},"source_final_url":{"type":["string","null"],"format":"uri"},"source_canonical_url":{"type":"string","format":"uri"},"source_page_type_match":{"$ref":"#/components/schemas/PageTypeMatchEvidence"},"selector":{"type":["string","null"]},"raw_href":{"type":"string"},"resolved_original_url":{"type":["string","null"],"format":"uri"},"canonical_url":{"type":["string","null"],"format":"uri"},"canonicalization":{"anyOf":[{"$ref":"#/components/schemas/CanonicalizationEvidence"},{"type":"null"}]},"scope":{"anyOf":[{"$ref":"#/components/schemas/DomainScopeEvidence"},{"type":"null"}]},"state":{"$ref":"#/components/schemas/PreviewUrlState"},"duplicate_of_canonical_url":{"type":["string","null"],"format":"uri"},"target_page_type_match":{"anyOf":[{"$ref":"#/components/schemas/PageTypeMatchEvidence"},{"type":"null"}]},"source_depth":{"type":"integer","minimum":0},"prospective_depth":{"type":["integer","null"],"minimum":0},"transition_evaluations":{"type":"array","items":{"$ref":"#/components/schemas/PreviewTransitionEvaluation"}},"budget_hits":{"type":"array","items":{"$ref":"#/components/schemas/PreviewBudgetHit"}}}}));
-    schemas.insert("DiscoveryPreviewSummary", serde_json::json!({"type":"object","description":"Bounded Preview counts; sampled pages are successful observations, discovered PageType URLs arise only from first-unique hrefs, and transition counts are first-unique eligible edges.","required":["pages_sampled","urls_discovered","canonical_unique_urls","duplicates_prevented","page_type_distribution","ambiguous_urls","unmatched_urls","external_urls","blocked_urls","robots_excluded","provider_errors","transition_counts","budget_hit_counts","frontier_remaining","newly_enqueued_urls"],"properties":{"pages_sampled":{"type":"integer","minimum":0},"urls_discovered":{"type":"integer","minimum":0},"canonical_unique_urls":{"type":"integer","minimum":0},"duplicates_prevented":{"type":"integer","minimum":0},"page_type_distribution":{"type":"array","items":{"$ref":"#/components/schemas/PreviewPageTypeDistribution"}},"ambiguous_urls":{"type":"integer","minimum":0},"unmatched_urls":{"type":"integer","minimum":0},"external_urls":{"type":"integer","minimum":0},"blocked_urls":{"type":"integer","minimum":0},"robots_excluded":{"type":"integer","minimum":0},"provider_errors":{"type":"integer","minimum":0},"transition_counts":{"type":"array","items":{"$ref":"#/components/schemas/PreviewTransitionCount"}},"budget_hit_counts":{"type":"object","additionalProperties":{"type":"integer","minimum":0}},"frontier_remaining":{"type":"integer","minimum":0},"newly_enqueued_urls":{"type":"integer","minimum":0}}}));
-    schemas.insert("PreviewGrowthIndicators", serde_json::json!({"type":"object","description":"Advisory measured growth evidence, never an exact site-size estimate.","required":["peak_new_canonical_urls_from_one_page","total_newly_enqueued_urls","frontier_remaining","dominant_transition_id","dominant_transition_eligible_edges","total_eligible_transition_edges","dominant_transition_share_percent","query_variant_groups","unmatched_denominator","ambiguity_denominator"],"properties":{"peak_new_canonical_urls_from_one_page":{"type":"integer","minimum":0},"total_newly_enqueued_urls":{"type":"integer","minimum":0},"frontier_remaining":{"type":"integer","minimum":0},"dominant_transition_id":{"type":["string","null"],"format":"uuid"},"dominant_transition_eligible_edges":{"type":"integer","minimum":0},"total_eligible_transition_edges":{"type":"integer","minimum":0},"dominant_transition_share_percent":{"type":["integer","null"],"minimum":0},"query_variant_groups":{"type":"array","items":{"$ref":"#/components/schemas/PreviewQueryVariantGroup"}},"unmatched_denominator":{"type":"integer","minimum":0},"ambiguity_denominator":{"type":"integer","minimum":0}}}));
-    schemas.insert("PreviewQueryVariantGroup", serde_json::json!({"type":"object","required":["host","path","total_identities","query_bearing_identities","canonical_query_variants"],"properties":{"host":{"type":"string"},"path":{"type":"string"},"total_identities":{"type":"integer","minimum":0},"query_bearing_identities":{"type":"integer","minimum":0},"canonical_query_variants":{"type":"integer","minimum":0}}}));
-    schemas.insert("PreviewGrowthWarningCode", serde_json::json!({"type":"string","enum":["CYCLIC_TRANSITION_DOMINANCE","QUERY_PARAMETER_EXPLOSION","HIGH_UNMATCHED_RATE","WIDESPREAD_PAGE_TYPE_AMBIGUITY","BUDGET_PRESSURE"]}));
-    schemas.insert("PreviewGrowthWarning", serde_json::json!({"type":"object","required":["code","message","observed","threshold"],"properties":{"code":{"$ref":"#/components/schemas/PreviewGrowthWarningCode"},"message":{"type":"string"},"observed":{"type":"integer","minimum":0},"threshold":{"type":"integer","minimum":0}}}));
-    schemas.insert("PreviewDiagnostic", serde_json::json!({"type":"object","required":["code","message","observed","threshold"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"observed":{"type":["integer","null"],"minimum":0},"threshold":{"type":["integer","null"],"minimum":0}}}));
-    schemas.insert(
-        "DiscoveryPreviewResultSemantics",
-        serde_json::json!({"type":"string","enum":["PREVIEW_ONLY"]}),
-    );
-    schemas.insert("PreviewUrlState", serde_json::json!({"type":"string","enum":["SAMPLED","IN_SCOPE_MATCHED","AMBIGUOUS_PAGE_TYPE","UNMATCHED","EXTERNAL","BLOCKED","CANONICAL_DUPLICATE","ROBOTS_EXCLUDED","BUDGET_EXCLUDED","PROVIDER_ERROR","INVALID_URL"]}));
-    schemas.insert("PreviewBudgetKind", serde_json::json!({"type":"string","enum":["MAX_PAGES","MAX_DEPTH","MAX_DURATION","MAX_DOWNLOADED_BYTES","PAGE_TYPE_PAGE_BUDGET","TRANSITION_PER_SOURCE_PAGE","TRANSITION_TOTAL","PROVENANCE_RETENTION","DIAGNOSTIC_RETENTION"]}));
-    schemas.insert("PreviewBudgetHit", serde_json::json!({"type":"object","required":["kind","transition_id","page_type_id","observed","limit"],"properties":{"kind":{"$ref":"#/components/schemas/PreviewBudgetKind"},"transition_id":{"type":["string","null"],"format":"uuid"},"page_type_id":{"type":["string","null"],"format":"uuid"},"observed":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":0}}}));
-    schemas.insert("PreviewTransitionEvaluation", serde_json::json!({"type":"object","required":["transition_id","transition_name","source_page_type_id","target_page_type_id","priority","selector_eligible","target_page_type_eligible","constraints_eligible","eligible","budget_hits","diagnostic"],"properties":{"transition_id":{"type":"string","format":"uuid"},"transition_name":{"type":"string"},"source_page_type_id":{"type":"string","format":"uuid"},"target_page_type_id":{"type":"string","format":"uuid"},"priority":{"type":"integer"},"selector_eligible":{"type":"boolean"},"target_page_type_eligible":{"type":"boolean"},"constraints_eligible":{"type":"boolean"},"eligible":{"type":"boolean"},"budget_hits":{"type":"array","items":{"$ref":"#/components/schemas/PreviewBudgetHit"}},"diagnostic":{"anyOf":[{"$ref":"#/components/schemas/PreviewDiagnostic"},{"type":"null"}]}}}));
-    schemas.insert("PreviewTransitionCount", serde_json::json!({"type":"object","required":["transition_id","transition_name","eligible_edges","source_pages_with_eligible_edges"],"properties":{"transition_id":{"type":"string","format":"uuid"},"transition_name":{"type":"string"},"eligible_edges":{"type":"integer","minimum":0},"source_pages_with_eligible_edges":{"type":"integer","minimum":0}}}));
-    schemas.insert("PreviewPageTypeDistribution", serde_json::json!({"type":"object","required":["page_type_id","page_type_name","discovered_unique_urls","sampled_pages"],"properties":{"page_type_id":{"type":"string","format":"uuid"},"page_type_name":{"type":"string"},"discovered_unique_urls":{"type":"integer","minimum":0},"sampled_pages":{"type":"integer","minimum":0}}}));
-    schemas
-}
-
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
+    use serde_json::Value;
 
     use super::*;
 

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use axum::{
     Json,
     extract::{Extension, Path, State, rejection::JsonRejection},
@@ -13,6 +15,8 @@ use erabi_domain::{
     DomainScopeClassification, DomainScopePolicy, PageTypeId, ProductError, TransitionBudget,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::{
@@ -21,19 +25,143 @@ use crate::{
     error::{ApiErrorEnvelope, error_response},
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CanonicalizeUrlRequest {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClassifyDomainScopeRequest {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(ToSchema)]
+#[allow(dead_code)]
+#[schema(as = CanonicalizationPolicy)]
+struct CanonicalizationPolicySchema {
+    version: u16,
+    explicit_keep_parameters: BTreeSet<String>,
+    explicit_drop_parameters: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(as = CanonicalizationDecision)]
+#[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
+enum CanonicalizationDecisionSchema {
+    SchemeNormalized,
+    HostNormalized,
+    DefaultPortRemoved,
+    FragmentRemoved,
+    PathNormalized,
+    QuerySorted,
+    TrackingParameterRemoved { parameter: String },
+    CustomParameterDropped { parameter: String },
+    ExplicitParameterKept { parameter: String },
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+#[schema(as = DomainScopeHostRule)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+enum DomainScopeHostRuleSchema {
+    Exact { host: String },
+    Subdomains { host: String },
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+#[schema(as = DomainScopeKind)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+enum DomainScopeKindSchema {
+    SeedDomainsOnly,
+    SameRegistrableDomain {
+        explicit_subdomains: BTreeSet<String>,
+    },
+    ExplicitAllowlist {
+        hosts: BTreeSet<String>,
+    },
+    Custom {
+        allow: BTreeSet<DomainScopeHostRuleSchema>,
+        block: BTreeSet<DomainScopeHostRuleSchema>,
+    },
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+#[schema(as = DomainScopePolicy)]
+struct DomainScopePolicySchema {
+    version: u16,
+    policy: DomainScopeKindSchema,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[allow(dead_code)]
+#[schema(as = DomainScopeRationale)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum DomainScopeRationaleSchema {
+    SeedHost,
+    RegistrableDomain,
+    ExplicitSubdomain,
+    UnselectedSubdomain,
+    ExplicitAllowlist,
+    OutsideSeedDomains,
+    OutsideAllowlist,
+    ExplicitBlock,
+    CustomAllow,
+    OutsideCustomAllow,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(as = DomainScopeClassification)]
+#[serde(tag = "classification", rename_all = "SCREAMING_SNAKE_CASE")]
+enum DomainScopeClassificationSchema {
+    InScope {
+        host: String,
+        rationale: DomainScopeRationaleSchema,
+    },
+    External {
+        host: String,
+        rationale: DomainScopeRationaleSchema,
+    },
+    Blocked {
+        host: String,
+        rationale: DomainScopeRationaleSchema,
+    },
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+#[schema(as = DeferredPageTypeHealth)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+enum DeferredPageTypeHealthSchema {
+    DeferredExtractionHealth { version: u16 },
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+#[schema(as = PageTypeDiscoveryGuardrails)]
+struct PageTypeDiscoveryGuardrailsSchema {
+    page_type_id: String,
+    page_budget: Option<u64>,
+    health_threshold: Option<DeferredPageTypeHealthSchema>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[schema(as = CrawlerVersionGuardrails)]
+struct CrawlerVersionGuardrailsSchema {
+    version: u16,
+    max_pages: u64,
+    max_depth: u32,
+    max_duration_seconds: u64,
+    max_downloaded_bytes: u64,
+    max_concurrent_requests_per_domain: u32,
+    min_request_delay_ms: u64,
+    page_types: Vec<PageTypeDiscoveryGuardrailsSchema>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveryTransitionRequest {
     source_page_type_id: String,
@@ -75,11 +203,11 @@ impl DiscoveryTransitionRequest {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub(crate) struct CanonicalizationExplanation {
     original_url: String,
     canonical_url: String,
-    decisions: Vec<CanonicalizationDecision>,
+    decisions: Vec<CanonicalizationDecisionSchema>,
 }
 
 impl From<CanonicalizationResult> for CanonicalizationExplanation {
@@ -87,18 +215,80 @@ impl From<CanonicalizationResult> for CanonicalizationExplanation {
         Self {
             original_url: result.original_url,
             canonical_url: result.canonical_url.to_string(),
-            decisions: result.decisions,
+            decisions: result
+                .decisions
+                .into_iter()
+                .map(CanonicalizationDecisionSchema::from)
+                .collect(),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct CanonicalizedDomainScopeResult {
-    canonicalization: CanonicalizationExplanation,
-    classification: DomainScopeClassification,
+impl From<CanonicalizationDecision> for CanonicalizationDecisionSchema {
+    fn from(value: CanonicalizationDecision) -> Self {
+        match value {
+            CanonicalizationDecision::SchemeNormalized => Self::SchemeNormalized,
+            CanonicalizationDecision::HostNormalized => Self::HostNormalized,
+            CanonicalizationDecision::DefaultPortRemoved => Self::DefaultPortRemoved,
+            CanonicalizationDecision::FragmentRemoved => Self::FragmentRemoved,
+            CanonicalizationDecision::PathNormalized => Self::PathNormalized,
+            CanonicalizationDecision::QuerySorted => Self::QuerySorted,
+            CanonicalizationDecision::TrackingParameterRemoved { parameter } => {
+                Self::TrackingParameterRemoved { parameter }
+            }
+            CanonicalizationDecision::CustomParameterDropped { parameter } => {
+                Self::CustomParameterDropped { parameter }
+            }
+            CanonicalizationDecision::ExplicitParameterKept { parameter } => {
+                Self::ExplicitParameterKept { parameter }
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub(crate) struct CanonicalizedDomainScopeResult {
+    canonicalization: CanonicalizationExplanation,
+    classification: DomainScopeClassificationSchema,
+}
+
+impl From<DomainScopeClassification> for DomainScopeClassificationSchema {
+    fn from(value: DomainScopeClassification) -> Self {
+        match value {
+            DomainScopeClassification::InScope { host, rationale } => Self::InScope {
+                host,
+                rationale: rationale.into(),
+            },
+            DomainScopeClassification::External { host, rationale } => Self::External {
+                host,
+                rationale: rationale.into(),
+            },
+            DomainScopeClassification::Blocked { host, rationale } => Self::Blocked {
+                host,
+                rationale: rationale.into(),
+            },
+        }
+    }
+}
+
+impl From<erabi_domain::DomainScopeRationale> for DomainScopeRationaleSchema {
+    fn from(value: erabi_domain::DomainScopeRationale) -> Self {
+        match value {
+            erabi_domain::DomainScopeRationale::SeedHost => Self::SeedHost,
+            erabi_domain::DomainScopeRationale::RegistrableDomain => Self::RegistrableDomain,
+            erabi_domain::DomainScopeRationale::ExplicitSubdomain => Self::ExplicitSubdomain,
+            erabi_domain::DomainScopeRationale::UnselectedSubdomain => Self::UnselectedSubdomain,
+            erabi_domain::DomainScopeRationale::ExplicitAllowlist => Self::ExplicitAllowlist,
+            erabi_domain::DomainScopeRationale::OutsideSeedDomains => Self::OutsideSeedDomains,
+            erabi_domain::DomainScopeRationale::OutsideAllowlist => Self::OutsideAllowlist,
+            erabi_domain::DomainScopeRationale::ExplicitBlock => Self::ExplicitBlock,
+            erabi_domain::DomainScopeRationale::CustomAllow => Self::CustomAllow,
+            erabi_domain::DomainScopeRationale::OutsideCustomAllow => Self::OutsideCustomAllow,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub(crate) struct DiscoveryTransitionDto {
     id: String,
     source_page_type_id: String,
@@ -136,6 +326,16 @@ impl From<&DiscoveryTransitionRecord> for DiscoveryTransitionDto {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalization",
+    responses(
+        (status = 200, description = "Canonicalization policy", body = CanonicalizationPolicySchema),
+        (status = 400, description = "Invalid CrawlerVersion identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_canonicalization(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -158,6 +358,18 @@ pub(crate) async fn read_canonicalization(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalization",
+    request_body = CanonicalizationPolicySchema,
+    responses(
+        (status = 200, description = "Canonicalization policy", content_type = "application/json"),
+        (status = 400, description = "Invalid canonicalization policy", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Canonicalization policy conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn update_canonicalization(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -190,6 +402,17 @@ pub(crate) async fn update_canonicalization(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/canonicalize-url",
+    request_body = CanonicalizeUrlRequest,
+    responses(
+        (status = 200, description = "Canonicalization explanation", body = CanonicalizationExplanation),
+        (status = 400, description = "Invalid canonicalization request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn canonicalize_url(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -221,6 +444,16 @@ pub(crate) async fn canonicalize_url(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/domain-scope",
+    responses(
+        (status = 200, description = "Domain Scope policy", body = DomainScopePolicySchema),
+        (status = 400, description = "Invalid CrawlerVersion identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_domain_scope(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -243,6 +476,18 @@ pub(crate) async fn read_domain_scope(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/domain-scope",
+    request_body = DomainScopePolicySchema,
+    responses(
+        (status = 200, description = "Domain Scope policy", content_type = "application/json"),
+        (status = 400, description = "Invalid Domain Scope policy", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Domain Scope policy conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn update_domain_scope(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -269,6 +514,17 @@ pub(crate) async fn update_domain_scope(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/classify-domain-scope",
+    request_body = ClassifyDomainScopeRequest,
+    responses(
+        (status = 200, description = "Domain Scope classification", body = CanonicalizedDomainScopeResult),
+        (status = 400, description = "Invalid classification request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn classify_domain_scope(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -304,11 +560,21 @@ pub(crate) async fn classify_domain_scope(
     };
     Json(CanonicalizedDomainScopeResult {
         canonicalization: result.into(),
-        classification,
+        classification: classification.into(),
     })
     .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/guardrails",
+    responses(
+        (status = 200, description = "CrawlerVersion guardrails", body = CrawlerVersionGuardrailsSchema),
+        (status = 400, description = "Invalid CrawlerVersion identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_crawler_version_guardrails(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -331,6 +597,18 @@ pub(crate) async fn read_crawler_version_guardrails(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/guardrails",
+    request_body = CrawlerVersionGuardrailsSchema,
+    responses(
+        (status = 200, description = "CrawlerVersion guardrails", content_type = "application/json"),
+        (status = 400, description = "Invalid guardrails", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Guardrails conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn update_crawler_version_guardrails(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -363,6 +641,16 @@ pub(crate) async fn update_crawler_version_guardrails(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions",
+    responses(
+        (status = 200, description = "Discovery transitions", body = [DiscoveryTransitionDto]),
+        (status = 400, description = "Invalid CrawlerVersion identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn list_discovery_transitions(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -391,6 +679,18 @@ pub(crate) async fn list_discovery_transitions(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions",
+    request_body = DiscoveryTransitionRequest,
+    responses(
+        (status = 201, description = "Discovery transition created", body = DiscoveryTransitionDto),
+        (status = 400, description = "Invalid DiscoveryTransition", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "DiscoveryTransition conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn create_discovery_transition(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -438,6 +738,16 @@ pub(crate) async fn create_discovery_transition(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions/{transition_id}",
+    responses(
+        (status = 200, description = "Discovery transition", body = DiscoveryTransitionDto),
+        (status = 400, description = "Invalid DiscoveryTransition identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "DiscoveryTransition not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_discovery_transition(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -468,6 +778,18 @@ pub(crate) async fn read_discovery_transition(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions/{transition_id}",
+    request_body = DiscoveryTransitionRequest,
+    responses(
+        (status = 200, description = "Discovery transition updated", body = DiscoveryTransitionDto),
+        (status = 400, description = "Invalid DiscoveryTransition", body = ApiErrorEnvelope),
+        (status = 404, description = "DiscoveryTransition not found", body = ApiErrorEnvelope),
+        (status = 409, description = "DiscoveryTransition conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn update_discovery_transition(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -520,6 +842,17 @@ pub(crate) async fn update_discovery_transition(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/transitions/{transition_id}",
+    responses(
+        (status = 204, description = "Discovery transition deleted"),
+        (status = 400, description = "Invalid DiscoveryTransition identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "DiscoveryTransition not found", body = ApiErrorEnvelope),
+        (status = 409, description = "DiscoveryTransition conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Discovery policy unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn delete_discovery_transition(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -554,6 +887,27 @@ pub(crate) async fn delete_discovery_transition(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => crawler_discovery_repository_error(error, &trace),
     }
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new()
+        .routes(routes!(read_canonicalization, update_canonicalization))
+        .routes(routes!(canonicalize_url))
+        .routes(routes!(read_domain_scope, update_domain_scope))
+        .routes(routes!(classify_domain_scope))
+        .routes(routes!(
+            read_crawler_version_guardrails,
+            update_crawler_version_guardrails
+        ))
+        .routes(routes!(
+            list_discovery_transitions,
+            create_discovery_transition
+        ))
+        .routes(routes!(
+            read_discovery_transition,
+            update_discovery_transition,
+            delete_discovery_transition
+        ))
 }
 
 #[allow(clippy::result_large_err)]

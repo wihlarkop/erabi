@@ -72,3 +72,36 @@ async fn request_trace_captures_only_the_matched_route_template()
     }));
     Ok(())
 }
+
+#[tokio::test]
+async fn request_trace_uses_the_closed_scalar_docs_template()
+-> Result<(), Box<dyn std::error::Error>> {
+    let capture = Capture::new();
+    let response = capture
+        .run(
+            loopback_router()?.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/docs")
+                    .body(Body::empty())?,
+            ),
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let records = capture.records();
+    let Some(request_span) = records.iter().find_map(|record| match record {
+        CapturedRecord::Span(span) if span.name == "http.request" => Some(span),
+        _ => None,
+    }) else {
+        return Err("http.request span was not captured".into());
+    };
+
+    let route_template = request_span
+        .fields
+        .iter()
+        .find(|field| field.name == "route_template")
+        .map(|field| field.value.as_str());
+    assert_eq!(route_template, Some("/api/docs"));
+    Ok(())
+}
