@@ -63,14 +63,16 @@ Runtime migration truth continues to be represented by the actual SQL files plus
 
 At the start of DX-D04 the supported runtime chain is:
 
-| Version | Name | File | State |
+| Version | Name | File | Repository state |
 |---|---|---|---|
-| `0001` | `system` | `migrations/0001_system.sql` | APPLIED / IMMUTABLE |
-| `0002` | `crawler_core` | `migrations/0002_crawler_core.sql` | APPLIED / IMMUTABLE |
-| `0003` | `runs` | `migrations/0003_runs.sql` | APPLIED / IMMUTABLE |
-| `0004` | `jobs` | `migrations/0004_jobs.sql` | APPLIED / IMMUTABLE |
-| `0005` | `crawl_execution` | `migrations/0005_crawl_execution.sql` | APPLIED / IMMUTABLE |
-| `0006` | `crawl_traversal_state` | `migrations/0006_crawl_traversal_state.sql` | APPLIED / IMMUTABLE |
+| `0001` | `system` | `migrations/0001_system.sql` | IMPLEMENTED / IMMUTABLE |
+| `0002` | `crawler_core` | `migrations/0002_crawler_core.sql` | IMPLEMENTED / IMMUTABLE |
+| `0003` | `runs` | `migrations/0003_runs.sql` | IMPLEMENTED / IMMUTABLE |
+| `0004` | `jobs` | `migrations/0004_jobs.sql` | IMPLEMENTED / IMMUTABLE |
+| `0005` | `crawl_execution` | `migrations/0005_crawl_execution.sql` | IMPLEMENTED / IMMUTABLE |
+| `0006` | `crawl_traversal_state` | `migrations/0006_crawl_traversal_state.sql` | IMPLEMENTED / IMMUTABLE |
+
+`IMPLEMENTED / IMMUTABLE` describes repository-supported migration history. It does not claim that every database instance has already applied every migration; a database may still have pending migrations and apply them through the normal runner.
 
 DX-D04 must not modify this chain.
 
@@ -110,7 +112,7 @@ This separation prevents reservation metadata from pretending to be an executabl
 
 ## 6. Migration allocation states
 
-A migration number has exactly one planning state:
+A migration number has exactly one repository/planning allocation state:
 
 ```text
 UNALLOCATED
@@ -121,8 +123,10 @@ RESERVED
     |
     | SQL implemented and merged into supported runtime chain
     v
-APPLIED / IMMUTABLE
+IMPLEMENTED / IMMUTABLE
 ```
+
+These allocation states are distinct from per-database execution status. A migration that is `IMPLEMENTED / IMMUTABLE` in the repository may still be pending on a particular database until `MigrationRunner` applies it.
 
 ### UNALLOCATED
 
@@ -136,18 +140,18 @@ A reserved version:
 
 - does not have a placeholder `.sql` file;
 - does not appear in the runtime bundled chain;
-- does not appear in `schema_migrations`;
+- does not appear in `schema_migrations` merely because it is reserved;
 - cannot be claimed by another package.
 
-### APPLIED / IMMUTABLE
+### IMPLEMENTED / IMMUTABLE
 
-The migration exists in the runtime chain. Its version is permanently consumed and is never reused, even if later product behavior stops using the tables it created.
+The migration exists in the supported runtime chain. Its version is permanently consumed and is never reused, even if later product behavior stops using the tables it created.
 
 ## 7. Approved allocation after DX-D04
 
 DX-D04 reconciles the active MVP chain to:
 
-### Applied / immutable
+### Implemented / immutable
 
 | Version | Logical name | Owner |
 |---|---|---|
@@ -169,11 +173,11 @@ The next unallocated migration version is therefore `0009`.
 
 ## 8. Allocation rules
 
-### Rule 1 — Applied history is append-only
+### Rule 1 — Implemented history is append-only
 
 Once a migration is part of the supported runtime chain, its version is permanently consumed.
 
-Do not reuse an applied version for another feature or plan.
+Do not reuse an implemented version for another feature or plan.
 
 ### Rule 2 — Reservations are unique
 
@@ -181,7 +185,7 @@ A reserved version has exactly one package owner and one planned logical name.
 
 No two active packages may reserve the same version.
 
-### Rule 3 — Allocate after the complete applied + reserved chain
+### Rule 3 — Allocate after the complete implemented + reserved chain
 
 A new reservation takes the next sequential unallocated version after both:
 
@@ -218,9 +222,9 @@ First reconcile:
 
 Only then may implementation proceed.
 
-### Rule 8 — Applied gaps are not collapsed
+### Rule 8 — Implemented gaps are not collapsed
 
-If an applied feature becomes obsolete, the historical number remains consumed. Later migrations remain additive.
+If an implemented feature becomes obsolete, the historical number remains consumed. Later migrations remain additive.
 
 ## 9. Conflict behavior
 
@@ -337,7 +341,7 @@ Required verification:
 2. No existing SQL migration content or filename changed.
 3. `crates/erabi-db/src/migrate.rs` is unchanged.
 4. The canonical allocation ledger records:
-   - `0001`–`0006` as applied/immutable;
+   - `0001`–`0006` as implemented/immutable;
    - `0007_curated_data` reserved for Plan 07;
    - `0008_assets_exports_backups` reserved for Plan 08.
 5. Active MVP plan index matches the ledger.
@@ -346,7 +350,7 @@ Required verification:
 8. Active planning contains no stale conflicting references to:
    - `0006_curated_data.sql`;
    - `0007_assets_exports_backups.sql`.
-9. Applied and reserved versions are unique and strictly sequential through `0008`.
+9. Implemented and reserved versions are unique and strictly sequential through `0008`.
 10. No placeholder `0007` or `0008` SQL file exists.
 11. `git diff --check` passes.
 
