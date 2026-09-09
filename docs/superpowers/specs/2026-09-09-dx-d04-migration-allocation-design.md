@@ -1,6 +1,6 @@
 # DX-D04 — Migration Allocation and Reservation Design
 
-**Status:** APPROVED DESIGN — awaiting written-spec review  
+**Status:** APPROVED SPEC  
 **Date:** 2026-09-09  
 **Package:** DX-D04  
 **Baseline:** `244ad0f2b4f0180b999a80b19ad9e3b25501945f`
