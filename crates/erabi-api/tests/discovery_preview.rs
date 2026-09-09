@@ -9,6 +9,7 @@ use erabi_api::{AppState, SecurityConfig, build_router};
 use erabi_crawler::{FixtureDiscoveryPreviewProvider, ObservedLink, PageObservation};
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
 use erabi_domain::{Crawler, Seed, UrlMatcher};
+use serde_json::Value;
 use tower::ServiceExt;
 
 async fn database() -> Result<ErabiDatabase, Box<dyn std::error::Error>> {
@@ -145,29 +146,45 @@ fn assert_typed_preview_openapi(openapi: &serde_json::Value) {
             .as_array()
             .is_some_and(|required| required.contains(&serde_json::json!("total_identities")))
     );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPath"]["properties"]["canonicalization"]["anyOf"]
-            [0]["$ref"],
-        "#/components/schemas/CanonicalizationEvidence"
+    for (property, expected_ref) in [
+        (
+            "canonicalization",
+            "#/components/schemas/CanonicalizationEvidence",
+        ),
+        ("scope", "#/components/schemas/DomainScopeEvidence"),
+        (
+            "target_page_type_match",
+            "#/components/schemas/PageTypeMatchEvidence",
+        ),
+    ] {
+        assert!(
+            openapi["components"]["schemas"]["DiscoveryPath"]["properties"][property]
+                .get("oneOf")
+                .and_then(Value::as_array)
+                .is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .any(|variant| variant["$ref"] == expected_ref)
+                }),
+            "missing {expected_ref} in DiscoveryPath.{property}"
+        );
+    }
+    let Some(diagnostic_variants) = openapi["components"]["schemas"]["DiscoveryPreviewPage"][
+        "properties"
+    ]["diagnostic"]["oneOf"]
+        .as_array()
+    else {
+        panic!("diagnostic variants are missing");
+    };
+    assert!(
+        diagnostic_variants
+            .iter()
+            .any(|variant| variant["$ref"] == "#/components/schemas/TestDiagnostic")
     );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPath"]["properties"]["scope"]["anyOf"][0]["$ref"],
-        "#/components/schemas/DomainScopeEvidence"
-    );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPath"]["properties"]["target_page_type_match"]["anyOf"]
-            [0]["$ref"],
-        "#/components/schemas/PageTypeMatchEvidence"
-    );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPreviewPage"]["properties"]["diagnostic"]["anyOf"]
-            [0]["$ref"],
-        "#/components/schemas/TestDiagnostic"
-    );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPreviewPage"]["properties"]["diagnostic"]["anyOf"]
-            [1]["type"],
-        "null"
+    assert!(
+        diagnostic_variants
+            .iter()
+            .any(|variant| variant["type"] == "null")
     );
     assert_eq!(
         openapi["components"]["schemas"]["DiscoveryPreviewSummary"]["properties"]["page_type_distribution"]
@@ -179,16 +196,18 @@ fn assert_typed_preview_openapi(openapi: &serde_json::Value) {
             ["items"]["$ref"],
         "#/components/schemas/PreviewTransitionCount"
     );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPreviewSeed"]["properties"]["scope"]["anyOf"][1]
-            ["type"],
-        "null"
-    );
-    assert_eq!(
-        openapi["components"]["schemas"]["DiscoveryPreviewPage"]["properties"]["page_type_match"]["anyOf"]
-            [1]["type"],
-        "null"
-    );
+    for (schema, property) in [
+        ("DiscoveryPreviewSeed", "scope"),
+        ("DiscoveryPreviewPage", "page_type_match"),
+    ] {
+        assert!(
+            openapi["components"]["schemas"][schema]["properties"][property]
+                .get("oneOf")
+                .and_then(Value::as_array)
+                .is_some_and(|variants| variants.iter().any(|variant| variant["type"] == "null")),
+            "missing nullable variant for {schema}.{property}"
+        );
+    }
 }
 
 #[tokio::test]

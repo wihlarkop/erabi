@@ -122,6 +122,58 @@ async fn remote_browser_shell_and_compiled_asset_boundary_bootstrap_without_a_be
 }
 
 #[tokio::test]
+async fn loopback_scalar_docs_are_self_hosted_nonce_scoped_and_secret_free()
+-> Result<(), Box<dyn std::error::Error>> {
+    let docs = loopback_router()?
+        .oneshot(request("GET", "/api/docs").body(Body::empty())?)
+        .await?;
+    assert_eq!(docs.status(), StatusCode::OK);
+    assert_eq!(
+        docs.headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .count(),
+        1
+    );
+    let policy = docs
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(policy.contains("script-src 'self' 'nonce-"));
+    assert!(!policy.contains("script-src 'unsafe-inline'"));
+    assert!(policy.contains("style-src 'self' 'unsafe-inline'"));
+
+    let body = to_bytes(docs.into_body(), usize::MAX).await?;
+    let html = std::str::from_utf8(&body)?;
+    assert!(html.contains("/assets/scalar.js"));
+    assert!(html.contains("\"disabled\":true"));
+    assert!(!html.contains("http://"));
+    assert!(!html.contains("https://"));
+    assert!(!html.contains("cdn.jsdelivr.net"));
+    assert!(!html.contains("proxyUrl"));
+    assert!(!html.contains("registry"));
+    assert!(!html.contains(TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scalar_asset_is_local_javascript() -> Result<(), Box<dyn std::error::Error>> {
+    let asset = loopback_router()?
+        .oneshot(request("GET", "/assets/scalar.js").body(Body::empty())?)
+        .await?;
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset.headers().get(header::CONTENT_TYPE),
+        Some(&axum::http::HeaderValue::from_static(
+            "application/javascript"
+        ))
+    );
+    assert!(!to_bytes(asset.into_body(), usize::MAX).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_bearer_success_and_failures_are_stable() -> Result<(), Box<dyn std::error::Error>> {
     let success = remote_router()?
         .oneshot(
@@ -336,6 +388,15 @@ async fn cors_is_closed_by_default_and_security_headers_are_present()
             .contains_key(header::CONTENT_SECURITY_POLICY)
     );
     assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok()),
+        Some(
+            "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'"
+        )
+    );
+    assert_eq!(
         response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
         Some(&axum::http::HeaderValue::from_static("nosniff"))
     );
@@ -523,6 +584,21 @@ async fn remote_openapi_is_disabled_without_explicit_opt_in()
         .await?;
     assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
     assert_eq!(error_code(disabled).await?, "OPENAPI_DISABLED");
+
+    let unauthenticated_docs = remote_router()?
+        .oneshot(request("GET", "/api/docs").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauthenticated_docs.status(), StatusCode::UNAUTHORIZED);
+
+    let disabled_docs = remote_router()?
+        .oneshot(
+            request("GET", "/api/docs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(disabled_docs.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(disabled_docs).await?, "OPENAPI_DISABLED");
     Ok(())
 }
 
@@ -546,5 +622,19 @@ async fn explicitly_enabled_remote_openapi_remains_bearer_protected()
         )
         .await?;
     assert_eq!(authenticated.status(), StatusCode::OK);
+
+    let unauthenticated_docs = remote_router_with_openapi(true)?
+        .oneshot(request("GET", "/api/docs").body(Body::empty())?)
+        .await?;
+    assert_eq!(unauthenticated_docs.status(), StatusCode::UNAUTHORIZED);
+
+    let authenticated_docs = remote_router_with_openapi(true)?
+        .oneshot(
+            request("GET", "/api/docs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(authenticated_docs.status(), StatusCode::OK);
     Ok(())
 }

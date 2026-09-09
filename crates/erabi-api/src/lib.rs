@@ -10,6 +10,7 @@ mod discovery_policy;
 mod discovery_preview;
 mod error;
 mod job_actions;
+mod openapi;
 mod page_type_authoring;
 mod production_run;
 mod progress;

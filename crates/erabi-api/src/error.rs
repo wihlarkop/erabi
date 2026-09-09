@@ -2,9 +2,10 @@
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// An optional recovery hint for an expected failure.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 pub struct Recoverability {
     /// Whether retrying can be meaningful after the listed action.
     pub recoverable: bool,
@@ -13,7 +14,7 @@ pub struct Recoverability {
 }
 
 /// Version-stable JSON envelope for every API error emitted by this crate.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
 pub struct ApiErrorEnvelope {
     /// Stable machine-readable code for client logic.
     pub code: String,

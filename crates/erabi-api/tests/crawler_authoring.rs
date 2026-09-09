@@ -238,7 +238,8 @@ async fn crawler_authoring_routes_return_typed_lifecycle_dtos_and_errors()
             .get("/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation")
             .is_some()
     );
-    assert!(openapi["components"]["schemas"]["VersionValidationReport"].is_object());
+    assert!(openapi["components"]["schemas"]["PublicationValidationResponse"].is_object());
+    assert!(openapi["components"]["schemas"]["PublicationValidationIssue"].is_object());
     Ok(())
 }
 

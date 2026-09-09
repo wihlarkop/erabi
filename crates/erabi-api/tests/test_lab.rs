@@ -9,6 +9,7 @@ use erabi_api::{AppState, SecurityConfig, build_router};
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
 use erabi_domain::{Crawler, Seed};
 use secrecy::SecretString;
+use serde_json::Value;
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-lab-token";
@@ -154,13 +155,21 @@ async fn test_lab_executes_persists_and_reads_server_owned_evidence()
         ),
     ] {
         let property = &openapi["components"]["schemas"][schema]["properties"][field];
-        assert_eq!(
-            property["anyOf"][0]["$ref"],
-            format!("#/components/schemas/{reference}"),
+        let Some(variants) = property
+            .get("anyOf")
+            .or_else(|| property.get("oneOf"))
+            .and_then(Value::as_array)
+        else {
+            return Err(format!("{schema}.{field} is missing nullable variants").into());
+        };
+        assert!(
+            variants
+                .iter()
+                .any(|variant| { variant["$ref"] == format!("#/components/schemas/{reference}") }),
             "{schema}.{field} must retain its typed reference"
         );
-        assert_eq!(
-            property["anyOf"][1]["type"], "null",
+        assert!(
+            variants.iter().any(|variant| variant["type"] == "null"),
             "{schema}.{field} must accept serde null"
         );
     }

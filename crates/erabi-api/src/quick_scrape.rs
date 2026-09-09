@@ -18,6 +18,8 @@ use erabi_db::repositories::SourceRepositoryError;
 use erabi_domain::{ResolvedValue, SettingSource, SnapshotOperationalSettings};
 use erabi_observability::{CorrelationContext, SemanticEvent, TelemetryCode, TelemetryId, emit};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     AppState,
@@ -38,7 +40,7 @@ pub(crate) const QUICK_SCRAPE_BATCH_BODY_LIMIT_BYTES: usize = 48 * 1024;
 
 /// The deliberately small Task 6 API: exactly one target and, optionally, a
 /// fresh reasoned robots override. There are no provider fields or batch URLs.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct QuickScrapeRequest {
     target_url: String,
@@ -46,19 +48,19 @@ pub(crate) struct QuickScrapeRequest {
     robots_override: Option<RobotsOverrideRequest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct RobotsOverrideRequest {
     reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct QuickScrapeBatchRequest {
     items: Vec<QuickScrapeRequest>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[allow(clippy::struct_field_names)] // Wire contract intentionally uses durable identity names.
 pub(crate) struct QuickScrapeAcceptedResponse {
     run_id: String,
@@ -66,7 +68,7 @@ pub(crate) struct QuickScrapeAcceptedResponse {
     source_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct QuickScrapeBatchResponse {
     halted: bool,
     items: Vec<QuickScrapeBatchOutcome>,
@@ -75,7 +77,7 @@ struct QuickScrapeBatchResponse {
 /// Ordered wire outcomes for the convenience envelope. `CONFLICT` is omitted
 /// deliberately: Task 6's single-item primitive has no legitimate conflict
 /// error, so the batch route must not manufacture one.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE")]
 enum QuickScrapeBatchOutcome {
     Accepted {
@@ -107,6 +109,16 @@ enum QuickScrapeBatchItemError {
     System,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/quick-scrapes",
+    request_body = QuickScrapeRequest,
+    responses(
+        (status = 202, description = "Quick Scrape accepted", body = QuickScrapeAcceptedResponse),
+        (status = 400, description = "Invalid Quick Scrape request", body = ApiErrorEnvelope),
+        (status = 503, description = "Quick Scrape unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn start_quick_scrape(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -155,6 +167,17 @@ pub(crate) async fn start_quick_scrape(
 /// delegates to the Task 6 primitive; this route owns neither a batch run nor
 /// a batch transaction.
 #[allow(clippy::too_many_lines)]
+#[utoipa::path(
+    post,
+    path = "/api/v1/quick-scrapes/batch",
+    request_body = QuickScrapeBatchRequest,
+    responses(
+        (status = 202, description = "Quick Scrape batch accepted", body = QuickScrapeBatchResponse),
+        (status = 400, description = "Invalid Quick Scrape batch request", body = ApiErrorEnvelope),
+        (status = 413, description = "Quick Scrape batch body is too large", body = ApiErrorEnvelope),
+        (status = 503, description = "Quick Scrape unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn start_quick_scrape_batch(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -336,6 +359,18 @@ pub(crate) async fn start_quick_scrape_batch(
         }),
     )
         .into_response()
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new()
+        .routes(routes!(start_quick_scrape))
+        .merge(
+            OpenApiRouter::<AppState>::new()
+                .routes(routes!(start_quick_scrape_batch))
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    QUICK_SCRAPE_BATCH_BODY_LIMIT_BYTES,
+                )),
+        )
 }
 
 impl QuickScrapeRequest {

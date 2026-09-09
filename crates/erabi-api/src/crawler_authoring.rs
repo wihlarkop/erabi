@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json,
@@ -14,6 +17,8 @@ use erabi_domain::{
     Crawler, CrawlerId, CrawlerVersionId, CrawlerVersionState, VersionValidationReport,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::{
@@ -47,35 +52,37 @@ impl CrawlerAuthoringService {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateCrawlerRequest {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateDraftRequest {
     base_version_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct ActorRequest {
     actor: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 struct CrawlerDto {
     id: String,
     name: String,
     collection_id: Option<String>,
     active_draft_version_id: Option<String>,
     active_published_version_id: Option<String>,
+    #[schema(value_type = Object)]
     operational_defaults: erabi_domain::OperationalOverrides,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 struct CrawlerVersionDto {
     id: String,
     crawler_id: String,
+    #[schema(value_type = String)]
     state: CrawlerVersionState,
     active_draft: bool,
     active_published: bool,
@@ -89,6 +96,104 @@ struct CrawlerVersionDto {
     warning_summary: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, ToSchema)]
+struct PublicationValidationResponse {
+    version_id: String,
+    config_hash: String,
+    blockers: Vec<PublicationValidationIssue>,
+    warnings: Vec<PublicationValidationIssue>,
+    publishable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+struct PublicationValidationIssue {
+    code: String,
+    severity: PublicationValidationSeverity,
+    contributor: Option<String>,
+    message: String,
+    subject: Option<PublicationValidationSubject>,
+    details: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PublicationValidationSeverity {
+    Blocker,
+    Warning,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+struct PublicationValidationSubject {
+    kind: String,
+    id: Option<String>,
+}
+
+impl From<VersionValidationReport> for PublicationValidationResponse {
+    fn from(report: VersionValidationReport) -> Self {
+        Self {
+            version_id: report.version_id.to_string(),
+            config_hash: report.config_hash,
+            blockers: report
+                .blockers
+                .into_iter()
+                .map(PublicationValidationIssue::from)
+                .collect(),
+            warnings: report
+                .warnings
+                .into_iter()
+                .map(PublicationValidationIssue::from)
+                .collect(),
+            publishable: report.publishable,
+        }
+    }
+}
+
+impl From<erabi_domain::VersionValidationIssue> for PublicationValidationIssue {
+    fn from(issue: erabi_domain::VersionValidationIssue) -> Self {
+        Self {
+            code: serialized_identifier(&issue.code),
+            severity: match issue.severity {
+                erabi_domain::VersionValidationSeverity::Blocker => {
+                    PublicationValidationSeverity::Blocker
+                }
+                erabi_domain::VersionValidationSeverity::Warning => {
+                    PublicationValidationSeverity::Warning
+                }
+            },
+            contributor: issue.contributor.as_ref().map(serialized_identifier),
+            message: issue.message,
+            subject: issue.subject.map(PublicationValidationSubject::from),
+            details: issue.details,
+        }
+    }
+}
+
+impl From<erabi_domain::VersionValidationSubject> for PublicationValidationSubject {
+    fn from(subject: erabi_domain::VersionValidationSubject) -> Self {
+        Self {
+            kind: serialized_identifier(&subject.kind),
+            id: subject.id,
+        }
+    }
+}
+
+fn serialized_identifier<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers",
+    request_body = CreateCrawlerRequest,
+    responses(
+        (status = 201, description = "Crawler created", body = CrawlerDto),
+        (status = 400, description = "Invalid Crawler request", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn create_crawler(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -111,6 +216,14 @@ pub(crate) async fn create_crawler(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers",
+    responses(
+        (status = 200, description = "Crawlers", body = [CrawlerDto]),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn list_crawlers(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -124,6 +237,17 @@ pub(crate) async fn list_crawlers(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}",
+    params(("crawler_id" = String, Path, description = "Crawler identifier")),
+    responses(
+        (status = 200, description = "Crawler", body = CrawlerDto),
+        (status = 400, description = "Invalid Crawler identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "Crawler not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_crawler(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -149,6 +273,17 @@ pub(crate) async fn read_crawler(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions",
+    params(("crawler_id" = String, Path, description = "Crawler identifier")),
+    responses(
+        (status = 200, description = "Crawler versions", body = [CrawlerVersionDto]),
+        (status = 400, description = "Invalid Crawler identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "Crawler not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn list_versions(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -182,6 +317,20 @@ pub(crate) async fn list_versions(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}",
+    params(
+        ("crawler_id" = String, Path, description = "Crawler identifier"),
+        ("version_id" = String, Path, description = "CrawlerVersion identifier")
+    ),
+    responses(
+        (status = 200, description = "Crawler version", body = CrawlerVersionDto),
+        (status = 400, description = "Invalid CrawlerVersion identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn read_version(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -212,6 +361,19 @@ pub(crate) async fn read_version(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/drafts",
+    params(("crawler_id" = String, Path, description = "Crawler identifier")),
+    request_body = CreateDraftRequest,
+    responses(
+        (status = 201, description = "Draft created", body = CrawlerVersionDto),
+        (status = 400, description = "Invalid draft request", body = ApiErrorEnvelope),
+        (status = 404, description = "Crawler not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Draft conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn create_draft(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -266,6 +428,22 @@ pub(crate) async fn create_draft(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish",
+    params(
+        ("crawler_id" = String, Path, description = "Crawler identifier"),
+        ("version_id" = String, Path, description = "CrawlerVersion identifier")
+    ),
+    request_body = ActorRequest,
+    responses(
+        (status = 200, description = "Published CrawlerVersion", body = CrawlerVersionDto),
+        (status = 400, description = "Invalid publish request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Publication conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn publish_version(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -283,6 +461,21 @@ pub(crate) async fn publish_version(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/publish-validation",
+    params(
+        ("crawler_id" = String, Path, description = "Crawler identifier"),
+        ("version_id" = String, Path, description = "CrawlerVersion identifier")
+    ),
+    responses(
+        (status = 200, description = "Publication validation report", body = PublicationValidationResponse),
+        (status = 400, description = "Invalid CrawlerVersion identifier", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 422, description = "Publication validation failed", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn publish_validation(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -306,11 +499,27 @@ pub(crate) async fn publish_validation(
         .publish_validation(crawler_id, version_id)
         .await
     {
-        Ok(report) => Json(report).into_response(),
+        Ok(report) => Json(PublicationValidationResponse::from(report)).into_response(),
         Err(error) => crawler_error(error, &trace),
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/crawlers/{crawler_id}/versions/{version_id}/reactivate",
+    params(
+        ("crawler_id" = String, Path, description = "Crawler identifier"),
+        ("version_id" = String, Path, description = "CrawlerVersion identifier")
+    ),
+    request_body = ActorRequest,
+    responses(
+        (status = 200, description = "Reactivated CrawlerVersion", body = CrawlerVersionDto),
+        (status = 400, description = "Invalid reactivation request", body = ApiErrorEnvelope),
+        (status = 404, description = "CrawlerVersion not found", body = ApiErrorEnvelope),
+        (status = 409, description = "Reactivation conflict", body = ApiErrorEnvelope),
+        (status = 503, description = "Crawler authoring unavailable", body = ApiErrorEnvelope)
+    )
+)]
 pub(crate) async fn reactivate_version(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
@@ -326,6 +535,18 @@ pub(crate) async fn reactivate_version(
         false,
     )
     .await
+}
+
+pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::<AppState>::new()
+        .routes(routes!(list_crawlers, create_crawler))
+        .routes(routes!(read_crawler))
+        .routes(routes!(list_versions))
+        .routes(routes!(read_version))
+        .routes(routes!(create_draft))
+        .routes(routes!(publish_version))
+        .routes(routes!(publish_validation))
+        .routes(routes!(reactivate_version))
 }
 
 async fn lifecycle_version(
@@ -581,48 +802,6 @@ fn publication_validation_error(report: VersionValidationReport, trace: &TraceId
             trace,
         ),
     }
-}
-
-pub(crate) fn publication_validation_openapi_schemas()
--> std::collections::BTreeMap<&'static str, serde_json::Value> {
-    let mut schemas = std::collections::BTreeMap::new();
-    schemas.insert(
-        "VersionValidationSeverity",
-        serde_json::json!({"type":"string","enum":["BLOCKER","WARNING"]}),
-    );
-    schemas.insert(
-        "ValidationIssueCode",
-        serde_json::json!({"type":"string","pattern":"^[A-Za-z][A-Za-z0-9_-]{0,63}$"}),
-    );
-    schemas.insert(
-        "ValidationSubjectKind",
-        serde_json::json!({"type":"string","pattern":"^[A-Za-z][A-Za-z0-9_-]{0,63}$"}),
-    );
-    schemas.insert(
-        "VersionValidationSubject",
-        serde_json::json!({"type":"object","required":["kind","id"],"properties":{"kind":{"$ref":"#/components/schemas/ValidationSubjectKind"},"id":{"type":["string","null"],"maxLength":256}}}),
-    );
-    schemas.insert(
-        "VersionValidationIssue",
-        serde_json::json!({"type":"object","required":["code","severity","contributor","message","subject","details"],"properties":{"code":{"$ref":"#/components/schemas/ValidationIssueCode"},"severity":{"$ref":"#/components/schemas/VersionValidationSeverity"},"contributor":{"anyOf":[{"$ref":"#/components/schemas/ValidationContributorKey"},{"type":"null"}]},"message":{"type":"string","maxLength":512},"subject":{"anyOf":[{"$ref":"#/components/schemas/VersionValidationSubject"},{"type":"null"}]},"details":{"type":"object","additionalProperties":{"type":"string","maxLength":256}}}}),
-    );
-    schemas.insert(
-        "ValidationContributorKey",
-        serde_json::json!({"type":"string","pattern":"^[A-Za-z][A-Za-z0-9_-]{0,63}$"}),
-    );
-    schemas.insert(
-        "VersionValidationReport",
-        serde_json::json!({"type":"object","required":["version_id","config_hash","blockers","warnings","publishable"],"properties":{"version_id":{"type":"string","format":"uuid"},"config_hash":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"},"blockers":{"type":"array","items":{"$ref":"#/components/schemas/VersionValidationIssue"}},"warnings":{"type":"array","items":{"$ref":"#/components/schemas/VersionValidationIssue"}},"publishable":{"type":"boolean"}}}),
-    );
-    schemas.insert(
-        "CrawlerVersionResponse",
-        serde_json::json!({"type":"object","required":["id","crawler_id","state","active_draft","active_published","seed_count","page_type_count","transition_count","config_hash","base_version_id","actor","occurred_at","warning_summary"],"properties":{"id":{"type":"string","format":"uuid"},"crawler_id":{"type":"string","format":"uuid"},"state":{"type":"string","enum":["DRAFT","PUBLISHED"]},"active_draft":{"type":"boolean"},"active_published":{"type":"boolean"},"seed_count":{"type":"integer","minimum":0},"page_type_count":{"type":"integer","minimum":0},"transition_count":{"type":"integer","minimum":0},"config_hash":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{64}$"},"base_version_id":{"type":["string","null"],"format":"uuid"},"actor":{"type":["string","null"]},"occurred_at":{"type":["string","null"]},"warning_summary":{"type":"array","items":{"type":"string","maxLength":512}}}}),
-    );
-    schemas.insert(
-        "PublishValidationFailed",
-        serde_json::json!({"type":"object","required":["code","message","details","trace_id"],"properties":{"code":{"const":"PUBLISH_VALIDATION_FAILED"},"message":{"type":"string"},"details":{"$ref":"#/components/schemas/VersionValidationReport"},"trace_id":{"type":"string"}}}),
-    );
-    schemas
 }
 
 fn unavailable(trace: &TraceId) -> Response {
