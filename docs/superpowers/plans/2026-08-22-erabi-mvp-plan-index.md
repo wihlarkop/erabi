@@ -66,19 +66,39 @@ Do **not** intentionally create failing tests first, perform RED/GREEN ceremony,
 
 ## Migration Ownership
 
-Migration numbering is reserved by the plan that owns the bounded persistence model. Do not reuse or renumber an already-committed migration after implementation begins.
+Migration allocation is governed by the canonical planning ledger in
+[`migrations/README.md`](../../../migrations/README.md). Runtime migration
+truth remains the executable SQL files and the bundled `MigrationRunner` chain.
+Do not reuse or renumber an implemented migration after it enters supported
+history.
 
-| Migration | Owner | Scope |
-|---|---|---|
-| `0001_system.sql` | Plan 02 | migration tracking, settings, audit/system metadata |
-| `0002_crawler_core.sql` | Plan 02 | Collections, Sources, Crawlers/Versions, Seeds, Page Types, matchers, transitions, Run Profiles, Test Evidence |
-| `0003_runs.sql` | Plan 02 | Crawl Runs, immutable snapshots, discovered URL/artifact metadata foundation |
-| `0004_jobs.sql` | Plan 04 | durable jobs, attempts, checkpoints, progress events |
-| `0005_crawl_execution.sql` | Plan 06 | crawl page results and summaries |
-| `0006_curated_data.sql` | Plan 07 | Datasets, Record versions/candidates, validation, reviews, provenance, relationships |
-| `0007_assets_exports_backups.sql` | Plan 08 | Assets, Export Runs/destinations, backups, retention/integrity metadata |
+| Migration | Owner | Status | Scope |
+|---|---|---|---|
+| `0001_system.sql` | Plan 02 | implemented | migration tracking, settings, audit/system metadata |
+| `0002_crawler_core.sql` | Plan 02 | implemented | Collections, Sources, Crawlers/Versions, Seeds, Page Types, matchers, transitions, Run Profiles, Test Evidence |
+| `0003_runs.sql` | Plan 02 | implemented | Crawl Runs, immutable snapshots, discovered URL/artifact metadata foundation |
+| `0004_jobs.sql` | Plan 04 | implemented | durable jobs, attempts, checkpoints, progress events |
+| `0005_crawl_execution.sql` | Plan 06 | implemented | crawl page results and summaries |
+| `0006_crawl_traversal_state.sql` | Plan 06 | implemented | crawl traversal state, recovery action lineage, traversal counters, and execution recovery relationships |
+| `0007_curated_data.sql` | Plan 07 | reserved | Datasets, Record versions/candidates, validation, reviews, provenance, relationships |
+| `0008_assets_exports_backups.sql` | Plan 08 | reserved | Assets, Export Runs/destinations, backups, retention/integrity metadata |
 
-A later task that needs a new persisted concept after its owning migration is committed creates the next additive migration rather than editing historical migration semantics silently.
+Implemented migration identities are append-only and are never reused or
+renumbered. Exact future migration numbers require a reviewed reservation in
+the canonical ledger before an active plan may claim them. A reserved entry is
+planning ownership, not executable migration state: it creates no placeholder
+SQL, runner entry, or database migration record.
+
+A later persistence need allocates the next unallocated version after the
+complete implemented plus reserved chain. Implementing a reservation must
+consume its reserved version and logical name. If the ledger and an active plan
+disagree, STOP and reconcile the authoritative planning documents; do not
+silently auto-renumber. A later task that needs a new persisted concept after
+its owning migration is committed creates the next additive migration rather
+than editing historical migration semantics silently.
+
+The next unallocated migration version after the implemented and reserved
+entries is `0009`.
 
 ## Cross-plan interface handoffs
 

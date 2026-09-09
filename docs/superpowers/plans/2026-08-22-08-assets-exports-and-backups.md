@@ -11,7 +11,8 @@
 **Spec:** `docs/specs/07-exports-assets-retention-and-backups.md`, `docs/specs/05-system-architecture-and-persistence.md`, `docs/specs/06-security-reliability-and-operations.md`  
 **Spec revision:** `679b499e617fcef14e4e40b9a7fc826b379b8a30`
 
-**Migration ownership:** `migrations/0007_assets_exports_backups.sql`.
+**Migration ownership:** `migrations/0008_assets_exports_backups.sql` is
+reserved by the canonical migration allocation ledger.
 
 ---
 

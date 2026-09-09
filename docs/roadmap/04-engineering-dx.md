@@ -28,9 +28,9 @@ The DX track is subordinate to the canonical product specifications. A DX packag
 | DX-08-04 | MERGED | Stabilize migration checksums across Windows line-ending behavior. |
 | DX-D02a | MERGED | Safe structured tracing foundation, bounded telemetry APIs, exact target filtering, and sanitized HTTP request tracing. |
 | DX-D02b | MERGED | Semantic runtime observability across jobs, crawler, API, CLI, provider execution, diagnostics, and terminal repair without changing business truth. Merged via PR #12 (`2681c8880f7f23ad72b80418e36532983d517bbe`). |
-| **DX-S06** | **NEXT** | **Generated OpenAPI contract and Scalar API reference for the backend.** |
+| **DX-S06** | **MERGED** | **Generated OpenAPI contract and Scalar API reference for the backend.** |
 | DX-D03 | OPEN | Decide checkpoint compatibility/version naming without breaking live compatibility. |
-| DX-D04 | OPEN | Reconcile migration-number allocation drift before the next persistence-owning MVP plan. |
+| **DX-D04** | **CURRENT** | **Reconcile migration-number allocation drift before the next persistence-owning MVP plan.** |
 | DX-D05 | OPEN | Clarify Production orchestration ownership/extraction boundaries. |
 | DX-D06 | OPEN | Separate semantic traversal responsibilities from service orchestration where warranted. |
 | DX-D07 | OPEN | Improve crawler repository private module ownership without changing persistence semantics. |
@@ -116,6 +116,46 @@ DX-S06 is complete when:
 ### Relationship to DX-S03
 
 DX-S06 owns the **generated API contract and interactive reference migration**. DX-S03 must not duplicate that migration. After DX-S06, DX-S03 is limited to any remaining internal OpenAPI composition cleanup and deriving schema/version metadata from authoritative domain constants where that work is still necessary.
+
+---
+
+## DX-D04 - Migration Allocation Reconciliation
+
+### Why before Plan 07
+
+The runtime migration chain already consumes `0006` for crawl traversal state,
+while the active Plan 07 and Plan 08 documents previously claimed `0006` and
+`0007`. Reconcile the allocation before Plan 07 creates persistence so neither
+plan can reuse an implemented migration number.
+
+### Goal
+
+Keep implemented migration history immutable and make future persistence
+ownership deterministic through a reviewed, append-only planning ledger.
+
+### Intended scope
+
+- Maintain [`migrations/README.md`](../../migrations/README.md) as the canonical
+  planning allocation ledger.
+- Record `0001`-`0006` as implemented history, reserve `0007` for Plan 07,
+  reserve `0008` for Plan 08, and identify `0009` as next unallocated.
+- Reconcile the MVP plan index and active Plan 07/08 migration references with
+  those reservations.
+- Require fail-closed reconciliation when a plan and the ledger disagree.
+
+### Explicit non-goals
+
+DX-D04 does not change executable SQL, `MigrationRunner`, migration checksums,
+database migration state or locking, runtime migration behavior, product
+milestone order, or Plan 07/08 persistence and product semantics. Reservations
+are planning metadata only; they do not create placeholder SQL or runtime
+state.
+
+### Exit evidence
+
+DX-D04 exits with unchanged SQL and runtime migration code, no `0007`/`0008`
+placeholder migrations, consistent active planning references, a clean
+documentation diff, and an uncommitted candidate ready for independent review.
 
 ---
 
