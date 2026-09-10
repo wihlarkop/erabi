@@ -5,6 +5,9 @@ mod configuration;
 mod integrity;
 mod migrate;
 pub mod repositories;
+// Stage 1 keeps the worker as an intentionally unconnected private proof.
+#[allow(dead_code)]
+mod worker;
 
 use std::{path::Path, sync::Arc};
 
