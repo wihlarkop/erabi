@@ -7,7 +7,7 @@ use std::{
 };
 
 use erabi_crawler::{
-    CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
+    CrawlRecoveryCheckpoint, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
     CrawlerArtifactEvidence, CrawlerCapabilities, CrawlerExecuteRequest, CrawlerExecuteResult,
     CrawlerFuture, CrawlerHealth, CrawlerHealthStatus, CrawlerMediaType, CrawlerResponseMetadata,
     ManualPreviewClock, NetworkTargetPolicy, ObservedLink, PacingClock, PacingService,
@@ -878,6 +878,151 @@ async fn production_robots_admission_keeps_pacing_failure_secondary()
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn invalid_recovery_is_rejected_before_production_provider_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (crawler, version_id, _) = published_graph(
+        &database,
+        vec![seed("https://example.test/listing/a")?],
+        GraphOptions::default(),
+    )
+    .await?;
+    let accepted = ProductionRunSubmissionService::new(database.clone())
+        .submit(request(&crawler, version_id, 10, 60, 30_000), 100)
+        .await?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot(accepted.run_id)
+        .await?;
+    let version = CrawlerRepository::new(&database)
+        .version(crawler.id(), version_id)
+        .await?
+        .version;
+    let seed_id = version
+        .seeds()
+        .first()
+        .ok_or("production recovery fixture seed missing")?
+        .id
+        .to_string();
+    let canonical_url = "https://example.test/listing/a";
+    let state_id = format!(
+        "crawl:{}",
+        erabi_domain::canonical_sha256(&format!("{}:{canonical_url}", accepted.run_id))?
+    );
+    let state = CrawlUrlStateRecord {
+        id: state_id,
+        crawl_run_id: accepted.run_id,
+        canonical_url: canonical_url.to_owned(),
+        first_discovered_url_id: None,
+        requested_url: canonical_url.to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(0),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Pending),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: vec![seed_id],
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let control = CrawlTraversalControl {
+        crawl_run_id: accepted.run_id,
+        consumed_bytes: 0,
+        raw_link_count: 0,
+        duplicate_count: 0,
+        robots_excluded_count: 0,
+        provider_error_count: 0,
+        external_url_count: 0,
+        blocked_url_count: 0,
+        peak_expansion_count: 0,
+        elapsed_millis: 0,
+        time_budget_hit: false,
+        duration_work_not_expanded: false,
+        pagination_truncation_count: 0,
+        next_admission_sequence: 1,
+    };
+    CrawlTraversalRepository::new(&database)
+        .initialize_run_state(accepted.run_id, &[state], &control)
+        .await?;
+
+    let root_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    let jobs = JobRepository::new(&database);
+    let acquired = jobs
+        .acquire_next("production-invalid-recovery-source", 100, 30)
+        .await?
+        .ok_or("production source job was not acquired")?;
+    let lease = acquired.job.lease.clone().ok_or("source lease missing")?;
+    let mut checkpoint =
+        CrawlRecoveryCheckpoint::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
+            .to_envelope()?;
+    checkpoint.payload["format_version"] = serde_json::json!(2);
+    jobs.append_checkpoint(&root_id, &acquired.attempt.id, &lease, &checkpoint, 100)
+        .await?;
+    jobs.cancel(&root_id, &lease, 101).await?;
+    let recovery_job = jobs
+        .enqueue_action_child(
+            &root_id,
+            JobKind::new("RESUME_CHECKPOINT")?,
+            102,
+            ActionRunAssociation::SameSourceRun,
+            Some(1),
+        )
+        .await?;
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let temporary = tempfile::tempdir()?;
+    let handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            pages: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+            clock: None,
+        }),
+        ArtifactStore::new(temporary.path())?,
+        None,
+    );
+    let turn = runtime(&database)?.execute_next_at(&handler, 102).await?;
+    let diagnostics = match &turn {
+        WorkerTurn::Succeeded { diagnostics, .. }
+        | WorkerTurn::RetryScheduled { diagnostics, .. }
+        | WorkerTurn::Failed { diagnostics, .. }
+        | WorkerTurn::Cancelled { diagnostics, .. } => diagnostics
+            .as_ref()
+            .ok_or("invalid production recovery diagnostics were missing")?,
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let primary = diagnostics
+        .primary
+        .as_ref()
+        .ok_or("invalid production recovery primary diagnostic was missing")?;
+    assert_eq!(primary.code, "CHECKPOINT_FORMAT_UNSUPPORTED");
+    assert_eq!(
+        primary.category,
+        OrchestrationErrorCategory::CheckpointRecovery
+    );
+    assert!(calls.lock().map_err(|_| "calls lock poisoned")?.is_empty());
+    assert_eq!(
+        JobRepository::new(&database)
+            .job(&recovery_job.id)
+            .await?
+            .state,
+        erabi_db::repositories::JobState::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn retry_failed_parts_dispatches_only_current_failed_and_partial_work()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
@@ -998,7 +1143,7 @@ async fn retry_failed_parts_dispatches_only_current_failed_and_partial_work()
         .clone()
         .ok_or("failed-parts source lease missing")?;
     let checkpoint =
-        CrawlCheckpointV2::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
+        CrawlRecoveryCheckpoint::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
             .to_envelope()?;
     jobs.append_checkpoint(
         &root_job_id,
@@ -1220,7 +1365,7 @@ async fn frontier_newer_than_checkpoint_is_recovered_from_durable_state()
         .clone()
         .ok_or("frontier source lease missing")?;
     let checkpoint =
-        CrawlCheckpointV2::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
+        CrawlRecoveryCheckpoint::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
             .to_envelope()?;
     jobs.append_checkpoint(
         &root_job_id,
@@ -1521,7 +1666,7 @@ async fn production_recovery_restores_zero_transition_page_schedule_and_preserve
         .clone()
         .ok_or("integrated recovery source lease missing")?;
     let checkpoint =
-        CrawlCheckpointV2::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
+        CrawlRecoveryCheckpoint::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
             .to_envelope()?;
     jobs.append_checkpoint(
         &root_job_id,
@@ -1593,7 +1738,11 @@ async fn production_recovery_restores_zero_transition_page_schedule_and_preserve
         .latest_checkpoint_for_lineage(&recovery_action.id)
         .await?
         .ok_or("recovery checkpoint was not persisted")?;
-    CrawlCheckpointV2::from_envelope(&latest_checkpoint.checkpoint, &snapshot, accepted.run_id)?;
+    CrawlRecoveryCheckpoint::from_envelope(
+        &latest_checkpoint.checkpoint,
+        &snapshot,
+        accepted.run_id,
+    )?;
     let durable_after = traversal_repository
         .reconstruct_recovery_state(accepted.run_id)
         .await?;

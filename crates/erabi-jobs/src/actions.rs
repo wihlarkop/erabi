@@ -1,13 +1,12 @@
 //! Explicit retry, recovery, cancellation, and queue actions.
 
-use erabi_crawler::{CrawlCheckpoint, CrawlCheckpointV2};
 use erabi_db::{
     ErabiDatabase,
     repositories::{
-        ActionRunAssociation, CheckpointCompatibility, CheckpointIdentity,
-        CheckpointRepositoryError, CrawlRunRepository, CrawlRunRepositoryError,
-        CrawlTraversalRepository, CrawlWorkState, JobId, JobKind, JobRecord, JobRepository,
-        JobRepositoryError, JobState,
+        ActionRunAssociation, CheckpointRepositoryError, CrawlExecutionRepository,
+        CrawlExecutionRepositoryError, CrawlRunRepository, CrawlRunRepositoryError,
+        CrawlTraversalRepository, CrawlTraversalRepositoryError, CrawlWorkState, JobId, JobKind,
+        JobRecord, JobRepository, JobRepositoryError, JobState,
     },
 };
 use erabi_domain::{
@@ -18,7 +17,11 @@ use erabi_observability::{
     CorrelationContext, EventOutcome, JobActionToken, RecoveryAction, SemanticEvent, emit,
 };
 
-use crate::{CancellationController, JobRuntimeError, request_job_cancellation};
+use crate::{
+    CancellationController, JobRuntimeError, recovery::CrawlRecoveryValidationError,
+    recovery::map_checkpoint_repository_error, recovery::validate_crawl_recovery,
+    request_job_cancellation,
+};
 
 /// A durable user-requested operation with distinct recovery semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,10 +73,14 @@ pub enum JobActionError {
     RobotsOverrideReasonInvalid,
     #[error("no durable checkpoint is available")]
     CheckpointMissing,
-    #[error("the durable checkpoint is unsafe to use")]
-    CheckpointUnsafe,
-    #[error("the durable checkpoint does not match the immutable run snapshot")]
-    CheckpointIncompatible,
+    #[error("the durable checkpoint format is unsupported")]
+    CheckpointFormatUnsupported,
+    #[error("the durable checkpoint is malformed")]
+    CheckpointMalformed,
+    #[error("the durable checkpoint does not match the immutable run identity")]
+    CheckpointIdentityMismatch,
+    #[error("the durable crawl recovery state is invalid")]
+    RecoveryStateInvalid,
     #[error("the job is not safe to remove")]
     NotRemovable,
     #[error("the job is not currently reprioritizable")]
@@ -114,8 +121,10 @@ impl JobActionService {
         if source.current_attempt == 0 {
             return Err(JobActionError::IllegalLifecycleState);
         }
-        if self.is_production(&source).await? {
+        if source.crawl_run_id.is_some() {
             self.compatible_checkpoint(&source).await?;
+        }
+        if self.is_production(&source).await? {
             let job = JobRepository::new(&self.database)
                 .enqueue_action_child(
                     job_id,
@@ -146,9 +155,9 @@ impl JobActionService {
         Ok(result(JobAction::Retry, job, None))
     }
 
-    /// Queues a typed failed-parts action only when the latest compatible
-    /// checkpoint identifies at least one failed unit. Successful units are
-    /// never rewritten or copied into the child as failures.
+    /// Queues a typed failed-parts action only when current durable logical
+    /// work identifies at least one failed or partial item. Successful work is
+    /// never rewritten or copied into the child as failure evidence.
     ///
     /// # Errors
     /// Returns a typed checkpoint, lifecycle, attempt, lineage, or persistence
@@ -404,75 +413,55 @@ impl JobActionService {
         let run_id = source
             .crawl_run_id
             .as_deref()
-            .ok_or(JobActionError::CheckpointIncompatible)?;
+            .ok_or(JobActionError::CheckpointMissing)?;
         let snapshot = CrawlRunRepository::new(&self.database)
             .snapshot_by_stored_id(run_id)
             .await
             .map_err(run_repository_error)?;
-        let identity = CheckpointIdentity::new(
-            run_id,
-            snapshot.snapshot_hash(),
-            snapshot.checkpoint_compatibility_hash(),
-        )
-        .map_err(|_| JobActionError::CheckpointUnsafe)?;
         let checkpoint = JobRepository::new(&self.database)
             .latest_checkpoint_for_lineage(&source.id)
             .await
             .map_err(checkpoint_error)?
             .ok_or(JobActionError::CheckpointMissing)?;
-        if checkpoint.checkpoint.compatibility_with(&identity)
-            != CheckpointCompatibility::Compatible
-        {
-            return Err(JobActionError::CheckpointIncompatible);
-        }
-        let parsed_run_id = parse_run_id(run_id).ok_or(JobActionError::CheckpointIncompatible)?;
-        let unsafe_checkpoint = |error: erabi_crawler::CrawlCheckpointError| match error {
-            erabi_crawler::CrawlCheckpointError::IncompatibleIdentity => {
-                JobActionError::CheckpointIncompatible
-            }
-            erabi_crawler::CrawlCheckpointError::Envelope(_)
-            | erabi_crawler::CrawlCheckpointError::MalformedPayload
-            | erabi_crawler::CrawlCheckpointError::InvalidUnit
-            | erabi_crawler::CrawlCheckpointError::DuplicateUnit
-            | erabi_crawler::CrawlCheckpointError::Identity
-            | erabi_crawler::CrawlCheckpointError::Serialization
-            | erabi_crawler::CrawlCheckpointError::UnsupportedRunType => {
-                JobActionError::CheckpointUnsafe
-            }
-        };
-        let compact_checkpoint = checkpoint
-            .checkpoint
-            .payload
-            .as_deref()
-            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
-            .and_then(|payload| {
-                payload
-                    .get("payload_version")
-                    .and_then(serde_json::Value::as_u64)
+        let parsed_run_id =
+            parse_run_id(run_id).ok_or(JobActionError::CheckpointIdentityMismatch)?;
+        let current_status = CrawlRunRepository::new(&self.database)
+            .status(parsed_run_id)
+            .await
+            .map_err(run_repository_error)?;
+        let executions = CrawlExecutionRepository::new(&self.database)
+            .list_for_run(parsed_run_id)
+            .await
+            .map_err(execution_repository_error)?;
+        let discovered = CrawlRunRepository::new(&self.database)
+            .discovered_urls(parsed_run_id)
+            .await
+            .map_err(run_repository_error)?;
+        let durable = CrawlTraversalRepository::new(&self.database)
+            .reconstruct_recovery_state(parsed_run_id)
+            .await
+            .map_err(traversal_repository_error)?;
+        validate_crawl_recovery(
+            Some(&checkpoint),
+            &snapshot,
+            parsed_run_id,
+            current_status,
+            &executions,
+            &discovered,
+            Some(&durable),
+        )
+        .map_err(action_recovery_error)?;
+        let failed_part_count = durable
+            .work
+            .iter()
+            .filter(|work| {
+                work.admission_state == erabi_db::repositories::CrawlAdmissionState::Admitted
+                    && matches!(
+                        work.current_work_state,
+                        Some(CrawlWorkState::Failed | CrawlWorkState::Partial)
+                    )
             })
-            == Some(2);
-        let failed_part_count =
-            if snapshot.run_type() == CrawlRunType::ProductionRun || compact_checkpoint {
-                CrawlCheckpointV2::from_envelope(&checkpoint.checkpoint, &snapshot, parsed_run_id)
-                    .map_err(unsafe_checkpoint)?;
-                CrawlTraversalRepository::new(&self.database)
-                    .reconstruct_recovery_state(parsed_run_id)
-                    .await
-                    .map_err(|_| JobActionError::CheckpointUnsafe)?
-                    .work
-                    .iter()
-                    .filter(|work| {
-                        matches!(
-                            work.current_work_state,
-                            Some(CrawlWorkState::Failed | CrawlWorkState::Partial)
-                        )
-                    })
-                    .count()
-            } else {
-                CrawlCheckpoint::from_envelope(&checkpoint.checkpoint, &snapshot, parsed_run_id)
-                    .map_err(unsafe_checkpoint)?;
-                checkpoint.checkpoint.failed_units.len()
-            };
+            .count();
         Ok((snapshot, failed_part_count))
     }
 }
@@ -635,17 +624,83 @@ fn action_kind(action: JobAction) -> Result<JobKind, JobActionError> {
 
 fn checkpoint_error(error: JobRepositoryError) -> JobActionError {
     match error {
+        JobRepositoryError::Checkpoint(CheckpointRepositoryError::UnsupportedFormatVersion) => {
+            JobActionError::CheckpointFormatUnsupported
+        }
         JobRepositoryError::Checkpoint(
             CheckpointRepositoryError::Malformed
-            | CheckpointRepositoryError::Inconsistent
             | CheckpointRepositoryError::InvalidEnvelope
             | CheckpointRepositoryError::PayloadTooLarge
             | CheckpointRepositoryError::Serialization,
-        ) => JobActionError::CheckpointUnsafe,
+        ) => JobActionError::CheckpointMalformed,
         JobRepositoryError::Checkpoint(CheckpointRepositoryError::NotFound) => {
             JobActionError::NotFound
         }
         other => action_repository_error(other),
+    }
+}
+
+fn action_recovery_error(error: CrawlRecoveryValidationError) -> JobActionError {
+    match error {
+        CrawlRecoveryValidationError::Missing => JobActionError::CheckpointMissing,
+        CrawlRecoveryValidationError::FormatUnsupported => {
+            JobActionError::CheckpointFormatUnsupported
+        }
+        CrawlRecoveryValidationError::Malformed => JobActionError::CheckpointMalformed,
+        CrawlRecoveryValidationError::IdentityMismatch => {
+            JobActionError::CheckpointIdentityMismatch
+        }
+        CrawlRecoveryValidationError::StateInvalid => JobActionError::RecoveryStateInvalid,
+    }
+}
+
+fn execution_repository_error(error: CrawlExecutionRepositoryError) -> JobActionError {
+    match error {
+        CrawlExecutionRepositoryError::CrawlRunNotFound
+        | CrawlExecutionRepositoryError::NotFound
+        | CrawlExecutionRepositoryError::SummaryNotFound => JobActionError::NotFound,
+        CrawlExecutionRepositoryError::Database(error) => {
+            JobActionError::Repository(JobRepositoryError::Database(error))
+        }
+        CrawlExecutionRepositoryError::CorruptState
+        | CrawlExecutionRepositoryError::CompletedExceedsPlanned
+        | CrawlExecutionRepositoryError::InvalidReference
+        | CrawlExecutionRepositoryError::InvalidInput(_)
+        | CrawlExecutionRepositoryError::CounterOutOfRange
+        | CrawlExecutionRepositoryError::ArtifactNotFound
+        | CrawlExecutionRepositoryError::ArtifactNotOwnedByRun
+        | CrawlExecutionRepositoryError::SourceNotFound
+        | CrawlExecutionRepositoryError::SourceNotOwnedByRun
+        | CrawlExecutionRepositoryError::PageTypeNotApplicable
+        | CrawlExecutionRepositoryError::PageTypeNotFound
+        | CrawlExecutionRepositoryError::PageTypeNotOwnedByRun
+        | CrawlExecutionRepositoryError::TransitionNotApplicable
+        | CrawlExecutionRepositoryError::TransitionNotFound
+        | CrawlExecutionRepositoryError::TransitionNotOwnedByRun
+        | CrawlExecutionRepositoryError::TransitionDoesNotMatchPageType
+        | CrawlExecutionRepositoryError::DiscoveredUrlNotOwnedByRun => {
+            JobActionError::RecoveryStateInvalid
+        }
+        CrawlExecutionRepositoryError::DuplicateExecution => JobActionError::RecoveryStateInvalid,
+    }
+}
+
+fn traversal_repository_error(error: CrawlTraversalRepositoryError) -> JobActionError {
+    match error {
+        CrawlTraversalRepositoryError::CrawlRunNotFound
+        | CrawlTraversalRepositoryError::InvalidState
+        | CrawlTraversalRepositoryError::CorruptState => JobActionError::RecoveryStateInvalid,
+        CrawlTraversalRepositoryError::Database(error) => {
+            JobActionError::Repository(JobRepositoryError::Database(error))
+        }
+        CrawlTraversalRepositoryError::Checkpoint(error) => {
+            if let Some(mapped) = map_checkpoint_repository_error(&error) {
+                action_recovery_error(mapped)
+            } else {
+                action_repository_error(JobRepositoryError::Checkpoint(error))
+            }
+        }
+        CrawlTraversalRepositoryError::Discovery(error) => run_repository_error(error),
     }
 }
 
@@ -670,12 +725,12 @@ mod tests {
     use erabi_db::DbError;
 
     #[test]
-    fn malformed_checkpoint_evidence_maps_to_the_unsafe_action_error() {
+    fn malformed_checkpoint_evidence_maps_to_the_malformed_action_error() {
         assert!(matches!(
             checkpoint_error(JobRepositoryError::Checkpoint(
                 CheckpointRepositoryError::Malformed
             )),
-            JobActionError::CheckpointUnsafe
+            JobActionError::CheckpointMalformed
         ));
     }
 

@@ -88,49 +88,41 @@ impl ProductionCrawlJobHandler {
         let latest = JobRepository::new(&self.database)
             .latest_checkpoint_for_lineage(context.job_id())
             .await
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_LOAD_FAILED",
-                )
-            })?;
-        let _checkpoint = latest
-            .as_ref()
-            .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, snapshot, run_id))
-            .transpose()
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_INVALID",
-                )
+            .map_err(|error| {
+                production_checkpoint_load_error(ExecutionOperation::LoadCheckpoint, &error)
             })?;
         let durable = CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
             .await
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
-                )
+            .map_err(|error| {
+                production_traversal_error(ExecutionOperation::LoadCheckpoint, error)
             })?;
+        if let Some(record) = latest.as_ref() {
+            validate_crawl_recovery(
+                Some(record),
+                snapshot,
+                run_id,
+                current_status,
+                &executions,
+                &discovered,
+                Some(&durable),
+            )
+            .map_err(|error| {
+                production_recovery_error(ExecutionOperation::LoadCheckpoint, error)
+            })?;
+        }
         let facts = erabi_crawler::reconstruct_crawl_structural_facts(
             snapshot,
             current_status,
             &executions,
             &discovered,
-            None,
             Some(&durable.control),
             Some(&durable.work),
         )
         .map_err(|_| {
-            ProductionError::new(
-                ExecutionDiagnostic::new(
-                    OrchestrationErrorCategory::Finalization,
-                    ExecutionOperation::FinalizeRun,
-                    ExecutionAction::Retry,
-                    "CRAWL_RUN_FINALIZATION_FAILED",
-                )
-                .with_run(run_id),
+            production_recovery_error(
+                ExecutionOperation::FinalizeRun,
+                CrawlRecoveryValidationError::StateInvalid,
             )
         })?;
         let structural_input = complete_snapshot_input(snapshot, &facts, extraction_health);

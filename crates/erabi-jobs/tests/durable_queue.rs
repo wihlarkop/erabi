@@ -14,7 +14,7 @@ use erabi_db::{
     },
 };
 use erabi_jobs::{
-    CheckpointEnvelope, CheckpointIdentity, CheckpointUnitId, JobExecutionContext,
+    CheckpointEnvelope, CheckpointIdentity, CheckpointPayloadKind, JobExecutionContext,
     JobExecutionError, JobHandler, JobRuntime, JobRuntimeError, WorkerPolicy, WorkerTurn,
     recover_and_rebuild_at,
 };
@@ -293,11 +293,11 @@ struct BarrierThenSuccess {
 
 fn checkpoint(unit: &str) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
     let identity = CheckpointIdentity::new("generic-job", "a".repeat(64), "b".repeat(64))?;
-    let mut checkpoint = CheckpointEnvelope::new(identity);
-    checkpoint
-        .completed_units
-        .push(CheckpointUnitId::new(unit)?);
-    Ok(checkpoint)
+    Ok(CheckpointEnvelope::new(
+        identity,
+        CheckpointPayloadKind::new("TEST_CHECKPOINT")?,
+        serde_json::json!({"unit": unit}),
+    )?)
 }
 
 struct CheckpointThenWait {
@@ -420,9 +420,7 @@ impl JobHandler for InvalidCheckpointThenWait {
     ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
         let started = Arc::clone(&self.started);
         let mut checkpoint = self.checkpoint.clone();
-        checkpoint
-            .pending_units
-            .clone_from(&checkpoint.completed_units);
+        checkpoint.format_version = 2;
         let checkpoint_failed = Arc::clone(&self.checkpoint_failed);
         async move {
             if context.checkpoint(&checkpoint).await.is_err() {
@@ -613,16 +611,15 @@ async fn runtime_owned_checkpoint_time_preserves_history_and_latest_order()
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].created_at, 0);
     assert_eq!(records[1].created_at, 1);
-    assert_eq!(records[0].checkpoint.completed_units[0].as_str(), "first");
-    assert_eq!(records[1].checkpoint.completed_units[0].as_str(), "second");
+    assert_eq!(records[0].checkpoint.payload["unit"], "first");
+    assert_eq!(records[1].checkpoint.payload["unit"], "second");
     assert_eq!(
         repository
             .latest_checkpoint(&job.id)
             .await?
             .ok_or("latest checkpoint missing")?
             .checkpoint
-            .completed_units[0]
-            .as_str(),
+            .payload["unit"],
         "second"
     );
     Ok(())

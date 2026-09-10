@@ -10,12 +10,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use erabi_crawler::{
-    CrawlCheckpoint, CrawlCheckpointUnit, CrawlCheckpointUnitState, SemanticTraversalCheckpoint,
-};
+use erabi_crawler::{CrawlRecoveryCheckpoint, CrawlRecoveryPhase};
 use erabi_db::repositories::{
-    CheckpointEnvelope, CrawlRunRepository, JobFailureCode, JobKind, JobRepository,
-    JobRepositoryError, JobState, NewJob,
+    CheckpointEnvelope, CrawlAdmissionState, CrawlRunRepository, CrawlTraversalControl,
+    CrawlTraversalRepository, CrawlUrlStateRecord, CrawlWorkState, JobFailureCode, JobKind,
+    JobRepository, JobRepositoryError, JobState, NewJob,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
@@ -46,30 +45,10 @@ fn checkpoint(
 ) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
     let crawl_run_id = CrawlRunId::from_uuid(uuid::Uuid::parse_str(run_id)?)
         .ok_or_else(|| std::io::Error::other("checkpoint run id is not UUIDv7"))?;
-    Ok(CrawlCheckpoint::new(
-        crawl_run_id,
-        snapshot,
-        SemanticTraversalCheckpoint::empty(snapshot.selected_seed_ids().to_vec()),
-        vec![CrawlCheckpointUnit {
-            state: CrawlCheckpointUnitState::Completed,
-            requested_url: "https://example.test/unit-1".to_owned(),
-            canonical_url: "https://example.test/unit-1".to_owned(),
-            discovered_url_id: None,
-            depth: 0,
-            page_type_id: None,
-            transition_id: None,
-            parent_canonical_url: None,
-            final_canonical_url: None,
-            pagination: false,
-            seed_ids: Vec::new(),
-            execution_ids: Vec::new(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    )?
-    .to_envelope()?)
+    Ok(
+        CrawlRecoveryCheckpoint::new(crawl_run_id, snapshot, CrawlRecoveryPhase::Traversing)?
+            .to_envelope()?,
+    )
 }
 
 fn snapshot() -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {
@@ -125,6 +104,55 @@ async fn heavy_job(
     let mut job = NewJob::new(JobKind::new("TEST_WORK")?, priority, 0, max_attempts)?;
     job.crawl_run_id = Some(run_id.to_string());
     JobRepository::new(database).enqueue(&job, 0).await?;
+    let digest = erabi_domain::canonical_sha256(&format!("{run_id}:https://example.test/item"))?;
+    CrawlTraversalRepository::new(database)
+        .initialize_run_state(
+            run_id,
+            &[CrawlUrlStateRecord {
+                id: format!("crawl:{digest}"),
+                crawl_run_id: run_id,
+                canonical_url: "https://example.test/item".to_owned(),
+                first_discovered_url_id: None,
+                requested_url: "https://example.test/item".to_owned(),
+                parent_url_state_id: None,
+                parent_discovered_url_id: None,
+                admission_state: CrawlAdmissionState::Admitted,
+                preserve_reason: None,
+                resolved_to_url_state_id: None,
+                admission_sequence: Some(0),
+                depth: Some(0),
+                target_page_type_id: None,
+                transition_id: None,
+                pagination: false,
+                final_canonical_url: None,
+                current_work_state: Some(CrawlWorkState::Pending),
+                work_generation: 0,
+                current_execution_id: None,
+                seed_provenance: Vec::new(),
+                seen: true,
+                sampled: false,
+                expanded: false,
+                in_scope: false,
+                page_type_match_state: None,
+            }],
+            &CrawlTraversalControl {
+                crawl_run_id: run_id,
+                consumed_bytes: 0,
+                raw_link_count: 0,
+                duplicate_count: 0,
+                robots_excluded_count: 0,
+                provider_error_count: 0,
+                external_url_count: 0,
+                blocked_url_count: 0,
+                peak_expansion_count: 0,
+                elapsed_millis: 0,
+                time_budget_hit: false,
+                duration_work_not_expanded: false,
+                pagination_truncation_count: 0,
+                next_admission_sequence: 1,
+            },
+        )
+        .await?;
     Ok(job)
 }
 
@@ -679,9 +707,7 @@ async fn failed_checkpoint_write_does_not_make_pressure_interruption_resumable()
         .snapshot_by_stored_id(run_id)
         .await?;
     let mut invalid = checkpoint(run_id, &snapshot)?;
-    invalid
-        .completed_units
-        .push(invalid.completed_units[0].clone());
+    invalid.format_version = 2;
     let probe = MutableProbe::new(Ok(101));
     let monitor =
         StoragePressureMonitor::new(probe.clone(), PathBuf::from("C:\\erabi-data"), policy()?);

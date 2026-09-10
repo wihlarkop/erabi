@@ -339,17 +339,27 @@ fn action_error(action: JobAction, error: &JobActionError, trace: &TraceId) -> R
         JobActionError::CheckpointMissing => (
             StatusCode::CONFLICT,
             "CHECKPOINT_MISSING",
-            "No durable checkpoint is available for resume.",
+            "The requested recovery action cannot proceed because no durable checkpoint is available.",
         ),
-        JobActionError::CheckpointUnsafe => (
+        JobActionError::CheckpointFormatUnsupported => (
             StatusCode::CONFLICT,
-            "CHECKPOINT_UNSAFE",
-            "The durable checkpoint cannot be used safely.",
+            "CHECKPOINT_FORMAT_UNSUPPORTED",
+            "The requested recovery action cannot proceed because the checkpoint format is unsupported.",
         ),
-        JobActionError::CheckpointIncompatible => (
+        JobActionError::CheckpointMalformed => (
             StatusCode::CONFLICT,
-            "CHECKPOINT_INCOMPATIBLE",
-            "The checkpoint does not match the immutable run snapshot.",
+            "CHECKPOINT_MALFORMED",
+            "The requested recovery action cannot proceed because the checkpoint is malformed.",
+        ),
+        JobActionError::CheckpointIdentityMismatch => (
+            StatusCode::CONFLICT,
+            "CHECKPOINT_IDENTITY_MISMATCH",
+            "The requested recovery action cannot proceed because the checkpoint identity does not match the immutable run.",
+        ),
+        JobActionError::RecoveryStateInvalid => (
+            StatusCode::CONFLICT,
+            "RECOVERY_STATE_INVALID",
+            "The requested recovery action cannot proceed because durable recovery state is inconsistent.",
         ),
         JobActionError::NotRemovable => (
             StatusCode::CONFLICT,
@@ -484,4 +494,88 @@ pub(crate) fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(cancel))
         .routes(routes!(reprioritize))
         .routes(routes!(remove))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, http::StatusCode};
+
+    use super::*;
+
+    async fn assert_recovery_error(
+        error: JobActionError,
+        expected_code: &str,
+        expected_message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let response = action_error(JobAction::ResumeCheckpoint, &error, &TraceId::for_test());
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["code"], expected_code);
+        assert_eq!(value["message"], expected_message);
+        assert_eq!(value["trace_id"], "test-trace-id");
+        assert!(value.get("details").is_none());
+        assert!(value.get("recoverability").is_none());
+        assert!(
+            !body
+                .windows(b"checkpoint_json".len())
+                .any(|window| { window == b"checkpoint_json" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_missing_maps_to_a_bounded_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_recovery_error(
+            JobActionError::CheckpointMissing,
+            "CHECKPOINT_MISSING",
+            "The requested recovery action cannot proceed because no durable checkpoint is available.",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn checkpoint_format_unsupported_maps_to_a_bounded_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_recovery_error(
+            JobActionError::CheckpointFormatUnsupported,
+            "CHECKPOINT_FORMAT_UNSUPPORTED",
+            "The requested recovery action cannot proceed because the checkpoint format is unsupported.",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn checkpoint_malformed_maps_to_a_bounded_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_recovery_error(
+            JobActionError::CheckpointMalformed,
+            "CHECKPOINT_MALFORMED",
+            "The requested recovery action cannot proceed because the checkpoint is malformed.",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_mismatch_maps_to_a_bounded_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_recovery_error(
+            JobActionError::CheckpointIdentityMismatch,
+            "CHECKPOINT_IDENTITY_MISMATCH",
+            "The requested recovery action cannot proceed because the checkpoint identity does not match the immutable run.",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recovery_state_invalid_maps_to_a_bounded_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_recovery_error(
+            JobActionError::RecoveryStateInvalid,
+            "RECOVERY_STATE_INVALID",
+            "The requested recovery action cannot proceed because durable recovery state is inconsistent.",
+        )
+        .await
+    }
 }

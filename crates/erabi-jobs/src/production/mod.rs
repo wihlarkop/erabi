@@ -11,7 +11,7 @@ use std::{
 };
 
 use erabi_crawler::{
-    CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
+    CrawlRecoveryCheckpoint, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
     CrawlerArtifactEvidence, CrawlerArtifactKind, CrawlerEvidencePolicy, CrawlerExecuteRequest,
     CrawlerResultCompleteness, DiscoveryPreviewObservationRequest, DiscoveryPreviewProvider,
     DiscoveryPreviewProviderError, DiscoveryPreviewProviderOutcome, NetworkTargetPolicy, OriginKey,
@@ -28,8 +28,9 @@ use erabi_db::{
         CrawlExecutionRepositoryError, CrawlExecutionSummary, CrawlInFlightWork,
         CrawlPageTypeMatchState, CrawlRedirectReconciliation, CrawlRunRepository,
         CrawlTransitionSourceCount, CrawlTraversalControl, CrawlTraversalPageTypeCounts,
-        CrawlTraversalRepository, CrawlTraversalSemanticProjection, CrawlTraversalUrlSemanticState,
-        CrawlUrlStateRecord, CrawlWorkState, DiscoveredUrlRecord, JobRepository,
+        CrawlTraversalRepository, CrawlTraversalRepositoryError, CrawlTraversalSemanticProjection,
+        CrawlTraversalUrlSemanticState, CrawlUrlStateRecord, CrawlWorkState, DiscoveredUrlRecord,
+        JobRepository,
     },
 };
 use erabi_domain::{
@@ -51,6 +52,10 @@ use crate::{
     JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent,
     OrchestrationErrorCategory, ProgressAttemptId, ProgressKey, ProgressLiveHub, ProgressMetadata,
     ProgressPublication, ProgressService, ProgressTerminalState,
+    recovery::{
+        CrawlRecoveryValidationError, checkpoint_error_code, map_checkpoint_repository_error,
+        validate_crawl_recovery,
+    },
 };
 
 const PRODUCTION_CRAWL_JOB_KIND: &str = "PRODUCTION_CRAWL";
@@ -132,6 +137,49 @@ fn is_production_job_kind(kind: &str) -> bool {
             | "RESUME_CHECKPOINT"
             | "RERUN_FULL_CRAWL"
     )
+}
+
+fn production_recovery_error(
+    operation: ExecutionOperation,
+    error: CrawlRecoveryValidationError,
+) -> ProductionError {
+    ProductionError::checkpoint(operation, error.diagnostic_code())
+}
+
+fn production_checkpoint_load_error(
+    operation: ExecutionOperation,
+    error: &erabi_db::repositories::JobRepositoryError,
+) -> ProductionError {
+    ProductionError::checkpoint(
+        operation,
+        checkpoint_error_code(error).unwrap_or("CHECKPOINT_LOAD_FAILED"),
+    )
+}
+
+fn production_traversal_error(
+    operation: ExecutionOperation,
+    error: CrawlTraversalRepositoryError,
+) -> ProductionError {
+    match error {
+        CrawlTraversalRepositoryError::CrawlRunNotFound
+        | CrawlTraversalRepositoryError::InvalidState
+        | CrawlTraversalRepositoryError::CorruptState => {
+            production_recovery_error(operation, CrawlRecoveryValidationError::StateInvalid)
+        }
+        CrawlTraversalRepositoryError::Checkpoint(error) => {
+            if let Some(mapped) = map_checkpoint_repository_error(&error) {
+                production_recovery_error(operation, mapped)
+            } else {
+                ProductionError::checkpoint(operation, "CHECKPOINT_LOAD_FAILED")
+            }
+        }
+        CrawlTraversalRepositoryError::Database(_) => {
+            ProductionError::repository(operation, "TRAVERSAL_STATE_LOAD_FAILED")
+        }
+        CrawlTraversalRepositoryError::Discovery(_) => {
+            ProductionError::repository(operation, "DISCOVERY_LOAD_FAILED")
+        }
+    }
 }
 
 /// Runtime dependencies are injected by the process composition root. In

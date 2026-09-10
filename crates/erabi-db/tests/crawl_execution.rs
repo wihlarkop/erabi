@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use erabi_db::{
     ErabiDatabase, MigrationRunner,
     repositories::{
-        ArtifactRepository, CheckpointEnvelope, CheckpointIdentity, CrawlAdmissionState,
-        CrawlExecutionArtifact, CrawlExecutionArtifactKind, CrawlExecutionRecord,
-        CrawlExecutionRepository, CrawlExecutionRepositoryError, CrawlExecutionSummary,
-        CrawlRecoveryActionKind, CrawlRunRepository, CrawlTraversalControl,
+        ArtifactRepository, CheckpointEnvelope, CheckpointIdentity, CheckpointPayloadKind,
+        CrawlAdmissionState, CrawlExecutionArtifact, CrawlExecutionArtifactKind,
+        CrawlExecutionRecord, CrawlExecutionRepository, CrawlExecutionRepositoryError,
+        CrawlExecutionSummary, CrawlRecoveryActionKind, CrawlRunRepository, CrawlTraversalControl,
         CrawlTraversalRepository, CrawlTraversalSemanticProjection, CrawlUrlStateRecord,
         CrawlWorkState, CrawlerRepository, DiscoveredUrlRecord, JobKind, JobRepository, NewJob,
     },
@@ -1524,11 +1524,15 @@ async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
         discovered_at: "unix:1".to_owned(),
         detail: serde_json::json!({"origin":"SEED","seed_ids":[]}),
     };
-    let checkpoint = CheckpointEnvelope::new(CheckpointIdentity::new(
-        run_id.to_string(),
-        snapshot.snapshot_hash(),
-        snapshot.checkpoint_compatibility_hash(),
-    )?);
+    let checkpoint = CheckpointEnvelope::new(
+        CheckpointIdentity::new(
+            run_id.to_string(),
+            snapshot.snapshot_hash(),
+            snapshot.checkpoint_compatibility_hash(),
+        )?,
+        CheckpointPayloadKind::new("TEST_PAYLOAD")?,
+        serde_json::json!({}),
+    )?;
     let projection = CrawlTraversalSemanticProjection {
         url_states: Vec::new(),
         page_type_counts: Vec::new(),

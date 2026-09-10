@@ -324,9 +324,9 @@ pub struct AcquiredJob {
 pub struct StaleJobRecovery {
     pub requeued: u32,
     pub failed: u32,
-    pub recoverable: u32,
+    pub resume_candidates: u32,
     pub restart_required: u32,
-    pub unsafe_checkpoints: u32,
+    pub invalid_checkpoints: u32,
 }
 
 /// The durable Job/JobAttempt result selected from an authoritative terminal
@@ -2141,19 +2141,19 @@ async fn recover_expired_in_transaction(
         let checkpoint_allows_recovery = !matches!(
             disposition,
             Some(
-                super::checkpoint::CheckpointRecoveryDisposition::RestartRequired
-                    | super::checkpoint::CheckpointRecoveryDisposition::Unsafe
+                super::checkpoint::CheckpointEnvelopeDisposition::RestartRequired
+                    | super::checkpoint::CheckpointEnvelopeDisposition::Invalid
             )
         );
         match disposition {
-            Some(super::checkpoint::CheckpointRecoveryDisposition::Recoverable) => {
-                recovery.recoverable = recovery.recoverable.saturating_add(1);
+            Some(super::checkpoint::CheckpointEnvelopeDisposition::ResumeCandidate) => {
+                recovery.resume_candidates = recovery.resume_candidates.saturating_add(1);
             }
-            Some(super::checkpoint::CheckpointRecoveryDisposition::RestartRequired) => {
+            Some(super::checkpoint::CheckpointEnvelopeDisposition::RestartRequired) => {
                 recovery.restart_required = recovery.restart_required.saturating_add(1);
             }
-            Some(super::checkpoint::CheckpointRecoveryDisposition::Unsafe) => {
-                recovery.unsafe_checkpoints = recovery.unsafe_checkpoints.saturating_add(1);
+            Some(super::checkpoint::CheckpointEnvelopeDisposition::Invalid) => {
+                recovery.invalid_checkpoints = recovery.invalid_checkpoints.saturating_add(1);
             }
             None => {}
         }

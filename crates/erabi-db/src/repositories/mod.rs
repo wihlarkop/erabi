@@ -15,11 +15,9 @@ mod test_evidence;
 
 pub use artifact::ArtifactRepository;
 pub use checkpoint::{
-    CURRENT_CHECKPOINT_SCHEMA_VERSION, CheckpointArtifactReference, CheckpointCompatibility,
-    CheckpointEnvelope, CheckpointIdentity, CheckpointPosition, CheckpointRecord,
-    CheckpointRecoveryAssessment, CheckpointRecoveryDisposition, CheckpointRepository,
-    CheckpointRepositoryError, CheckpointUnitId, ExtractionResumePhase, ExtractionResumeState,
-    MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
+    CHECKPOINT_ENVELOPE_FORMAT_VERSION, CheckpointEnvelope, CheckpointIdentity,
+    CheckpointPayloadKind, CheckpointRecord, CheckpointRepository, CheckpointRepositoryError,
+    MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_PAYLOAD_KIND_BYTES,
 };
 pub use configuration::ConfigurationRepository;
 pub use crawl_execution::{

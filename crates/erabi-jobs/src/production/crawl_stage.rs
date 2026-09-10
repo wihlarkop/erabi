@@ -191,13 +191,22 @@ impl ProductionCrawlJobHandler {
             JobRepository::new(&self.database)
                 .latest_checkpoint_for_lineage(context.job_id())
                 .await
-                .map_err(|_| {
-                    ProductionError::checkpoint(
-                        ExecutionOperation::LoadCheckpoint,
-                        "CHECKPOINT_LOAD_FAILED",
-                    )
+                .map_err(|error| {
+                    production_checkpoint_load_error(ExecutionOperation::LoadCheckpoint, &error)
                 })?
         };
+
+        if checkpoint.is_none()
+            && matches!(
+                context.kind().as_str(),
+                "RETRY" | "RETRY_FAILED_PARTS" | "RESUME_CHECKPOINT"
+            )
+        {
+            return Err(production_recovery_error(
+                ExecutionOperation::LoadCheckpoint,
+                CrawlRecoveryValidationError::Missing,
+            ));
+        }
 
         if checkpoint.is_none() && (!executions.is_empty() || !discovered.is_empty()) {
             if !durable_production_completion_without_checkpoint(&executions, &discovered) {
@@ -223,6 +232,36 @@ impl ProductionCrawlJobHandler {
                 snapshot,
                 current_status,
             }));
+        }
+
+        if let Some(record) = checkpoint.as_ref() {
+            let current_status = CrawlRunRepository::new(&self.database)
+                .status(run_id)
+                .await
+                .map_err(|_| {
+                    ProductionError::repository(
+                        ExecutionOperation::LoadRunSnapshot,
+                        "RUN_STATUS_LOAD_FAILED",
+                    )
+                })?;
+            let durable = CrawlTraversalRepository::new(&self.database)
+                .reconstruct_recovery_state(run_id)
+                .await
+                .map_err(|error| {
+                    production_traversal_error(ExecutionOperation::LoadCheckpoint, error)
+                })?;
+            validate_crawl_recovery(
+                Some(record),
+                &snapshot,
+                run_id,
+                current_status,
+                &executions,
+                &discovered,
+                Some(&durable),
+            )
+            .map_err(|error| {
+                production_recovery_error(ExecutionOperation::LoadCheckpoint, error)
+            })?;
         }
 
         let run_repository = CrawlRunRepository::new(&self.database);
@@ -269,14 +308,6 @@ impl ProductionCrawlJobHandler {
         ));
         let mut provenance = self.load_provenance_ids(run_id).await?;
         let mut traversal = if let Some(record) = checkpoint.as_ref() {
-            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id).map_err(
-                |_| {
-                    ProductionError::checkpoint(
-                        ExecutionOperation::LoadCheckpoint,
-                        "CHECKPOINT_INVALID",
-                    )
-                },
-            )?;
             // A provider result can be durably committed immediately before a
             // process crash and before the following checkpoint append.  The
             // immutable execution rows win over that stale work partition.
@@ -371,7 +402,7 @@ impl ProductionCrawlJobHandler {
             {
                 return Err(ProductionError::checkpoint(
                     ExecutionOperation::LoadCheckpoint,
-                    "RECOVERY_STATE_INCOMPATIBLE",
+                    "RECOVERY_STATE_INVALID",
                 ));
             }
             SemanticTraversal::for_frozen_snapshot(
@@ -1025,20 +1056,21 @@ impl ProductionCrawlJobHandler {
                 }
             }
         }
-        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::Serialization,
-                    "CHECKPOINT_BUILD_FAILED",
-                )
-            })?
-            .to_envelope()
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::Serialization,
-                    "CHECKPOINT_ENVELOPE_FAILED",
-                )
-            })?;
+        let checkpoint =
+            CrawlRecoveryCheckpoint::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
+                .map_err(|_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::Serialization,
+                        "CHECKPOINT_BUILD_FAILED",
+                    )
+                })?
+                .to_envelope()
+                .map_err(|_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::Serialization,
+                        "CHECKPOINT_ENVELOPE_FAILED",
+                    )
+                })?;
         let (job_id, attempt_id, lease, created_at) =
             context.checkpoint_lineage().await.map_err(|_| {
                 ProductionError::checkpoint(
@@ -1084,11 +1116,8 @@ impl ProductionCrawlJobHandler {
         let durable = CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
             .await
-            .map_err(|_| {
-                ProductionError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
-                )
+            .map_err(|error| {
+                production_traversal_error(ExecutionOperation::LoadCheckpoint, error)
             })?;
         emit(SemanticEvent::RecoveryReconstructed {
             context: crate::telemetry_id(&run_id.to_string())
@@ -1364,13 +1393,14 @@ impl ProductionCrawlJobHandler {
         _traversal: &SemanticTraversal,
         _provenance: &ExecutionProvenanceIds,
     ) -> ProductionResult<()> {
-        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
-            .map_err(|_| {
-            ProductionError::checkpoint(
-                ExecutionOperation::Serialization,
-                "CHECKPOINT_BUILD_FAILED",
-            )
-        })?;
+        let checkpoint =
+            CrawlRecoveryCheckpoint::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)
+                .map_err(|_| {
+                    ProductionError::checkpoint(
+                        ExecutionOperation::Serialization,
+                        "CHECKPOINT_BUILD_FAILED",
+                    )
+                })?;
         let envelope = checkpoint.to_envelope().map_err(|_| {
             ProductionError::checkpoint(
                 ExecutionOperation::Serialization,
@@ -1385,11 +1415,9 @@ impl ProductionCrawlJobHandler {
         })?;
         emit(SemanticEvent::CheckpointPersisted {
             context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
-            version: checkpoint.payload_version,
+            version: erabi_crawler::CRAWL_RECOVERY_FORMAT_VERSION,
             phase: crate::telemetry_checkpoint_phase(CrawlRecoveryPhase::Traversing),
-            bytes: envelope
-                .payload
-                .as_ref()
+            bytes: serde_json::to_vec(&envelope.payload)
                 .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
             work_generation: 0,
             outcome: EventOutcome::Durable,

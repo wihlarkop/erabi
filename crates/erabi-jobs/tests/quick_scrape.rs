@@ -9,13 +9,14 @@ use std::{
 };
 
 use erabi_crawler::{
-    ContentEvidence, ContentProbeDecision, ContentProbeExecutor, CrawlerAdapter,
-    CrawlerAdapterError, CrawlerArtifactEvidence, CrawlerCapabilities, CrawlerExecuteRequest,
-    CrawlerExecuteResult, CrawlerFuture, CrawlerHealth, CrawlerHealthStatus, CrawlerMediaType,
-    CrawlerResponseMetadata, DirectFileKind, NetworkTargetPolicy, PacingClock, PacingService,
-    PacingSleepFuture, QuickScrapeSubmissionRequest, QuickScrapeSubmissionService,
-    RetryAfterTiming, RobotsHttpResponse, RobotsPolicyService, RobotsTransport,
-    StaticNetworkResolver, ValidatedNetworkTarget,
+    ContentEvidence, ContentProbeDecision, ContentProbeExecutor, CrawlRecoveryCheckpoint,
+    CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError, CrawlerArtifactEvidence,
+    CrawlerCapabilities, CrawlerExecuteRequest, CrawlerExecuteResult, CrawlerFuture, CrawlerHealth,
+    CrawlerHealthStatus, CrawlerMediaType, CrawlerResponseMetadata, DirectFileKind,
+    NetworkTargetPolicy, PacingClock, PacingService, PacingSleepFuture,
+    QuickScrapeSubmissionRequest, QuickScrapeSubmissionService, RetryAfterTiming,
+    RobotsHttpResponse, RobotsPolicyService, RobotsTransport, StaticNetworkResolver,
+    ValidatedNetworkTarget,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase, MigrationRunner,
@@ -915,6 +916,65 @@ async fn quick_recovery_skips_completed_current_work_from_a_stale_checkpoint()
             .await?,
         erabi_domain::CrawlRunStatus::Succeeded
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_generic_resume_candidate_rejects_invalid_recovery_before_provider_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let accepted = submit(&database, ContentProbeDecision::NormalWebCrawl, 2).await?;
+    let snapshot = CrawlRunRepository::new(&database)
+        .snapshot(accepted.run_id)
+        .await?;
+    let mut checkpoint =
+        CrawlRecoveryCheckpoint::new(accepted.run_id, &snapshot, CrawlRecoveryPhase::Traversing)?
+            .to_envelope()?;
+    checkpoint.payload["format_version"] = serde_json::json!(2);
+
+    let job_id: erabi_db::repositories::JobId = accepted.job_id.parse()?;
+    let jobs = JobRepository::new(&database);
+    let acquired = jobs
+        .acquire_next("quick-stale-invalid-source", 100, 1)
+        .await?
+        .ok_or("quick scrape source job was not acquired")?;
+    let lease = acquired.job.lease.clone().ok_or("source lease missing")?;
+    jobs.append_checkpoint(&job_id, &acquired.attempt.id, &lease, &checkpoint, 100)
+        .await?;
+
+    let recovery = jobs.recover_stale_jobs(102).await?;
+    assert_eq!(recovery.resume_candidates, 1);
+    assert_eq!(recovery.requeued, 1);
+    assert_eq!(recovery.invalid_checkpoints, 0);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let temporary = tempfile::tempdir()?;
+    let handler = handler(
+        database.clone(),
+        Arc::new(FixtureAdapter {
+            mode: AdapterMode::Complete,
+            calls: Arc::clone(&calls),
+        }),
+        ArtifactStore::new(temporary.path())?,
+    );
+    let turn = runtime(&database, "quick-stale-invalid-handler")?
+        .execute_next_at(&handler, 102)
+        .await?;
+    let diagnostics = match &turn {
+        WorkerTurn::Succeeded { diagnostics, .. }
+        | WorkerTurn::RetryScheduled { diagnostics, .. }
+        | WorkerTurn::Failed { diagnostics, .. }
+        | WorkerTurn::Cancelled { diagnostics, .. } => diagnostics
+            .as_ref()
+            .ok_or("invalid recovery diagnostics were missing")?,
+        other => return Err(format!("unexpected worker turn: {other:?}").into()),
+    };
+    let primary = diagnostics
+        .primary
+        .as_ref()
+        .ok_or("invalid recovery primary diagnostic was missing")?;
+    assert_eq!(primary.code, "CHECKPOINT_FORMAT_UNSUPPORTED");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

@@ -1,9 +1,9 @@
-//! Durable Production/Quick Scrape finalization.
+//! Durable crawl structural-facts reconstruction.
 //!
-//! This module is a deep read-side module: callers provide the immutable run
-//! snapshot and validated durable evidence. The canonical reconstruction path
-//! returns crawl-only structural facts; the legacy public finalizers retain
-//! the historical complete-snapshot compatibility surface.
+//! This module is a deep read-side boundary. It reconstructs crawl facts from
+//! durable execution, discovery, traversal-control, and logical-work records.
+//! Recovery checkpoint bytes are control evidence and are intentionally not a
+//! source of structural truth here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,20 +12,15 @@ use erabi_db::repositories::{
     CrawlWorkState, DiscoveredUrlRecord,
 };
 use erabi_domain::{
-    CompleteSnapshotStructuralDecision, CompleteSnapshotStructuralInput,
-    CompleteSnapshotStructuralInputError, CrawlExecutionOutcome, CrawlRunSnapshot, CrawlRunStatus,
-    CrawlRunType, ExtractionHealth,
+    CrawlExecutionOutcome, CrawlRunId, CrawlRunSnapshot, CrawlRunStatus, CrawlRunType,
 };
 
-use crate::CrawlCheckpoint;
-
 /// Crawl-only structural facts reconstructed from authoritative durable
-/// execution, discovery, traversal-control, checkpoint, and logical-work
-/// evidence.
+/// execution, discovery, traversal-control, and logical-work evidence.
 ///
-/// This type deliberately contains no extraction health or application-layer
-/// composition. Production callers combine it with the current extraction
-/// health at their workflow boundary before asking the domain to decide trust.
+/// This type contains no recovery checkpoint or extraction-health state.
+/// Production callers compose it with extraction health at their workflow
+/// boundary before asking the domain to decide trusted snapshot semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrawlStructuralFacts {
     pub status: CrawlRunStatus,
@@ -36,85 +31,66 @@ pub struct CrawlStructuralFacts {
     pub page_type_ambiguity_count: u64,
 }
 
-/// Durable structural facts and the existing Plan 05 complete-snapshot result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CrawlFinalization {
-    pub structural_input: CompleteSnapshotStructuralInput,
-    pub decision: CompleteSnapshotStructuralDecision,
-    pub status: CrawlRunStatus,
-}
-
-/// Typed failures when durable execution evidence cannot describe a coherent
-/// run. The caller must terminalize such a run as FAILED; it must not clamp or
-/// silently repair the counters.
+/// Typed failure when durable crawl evidence cannot describe one coherent run.
 #[derive(Debug, thiserror::Error)]
-pub enum CrawlFinalizationError {
+pub enum CrawlStructuralFactsError {
     #[error("durable crawl structural state is inconsistent")]
-    Invariant,
-    #[error("the complete-snapshot structural input is invalid")]
-    StructuralInput(#[from] CompleteSnapshotStructuralInputError),
+    InconsistentDurableState,
 }
 
 /// Reconstructs crawl-only structural facts from durable execution, discovery,
-/// and optional typed checkpoint evidence. Canonical URL identity is the only
-/// physical-page counting key; historical attempt rows never inflate counts.
+/// traversal-control, and logical-work evidence.
+///
+/// Logical work supersedes historical execution outcomes when present.
+/// Canonical URL identity is the physical-page counting key; historical
+/// attempts do not inflate counts. Recovery checkpoint bytes are not accepted
+/// as a fallback authority.
 ///
 /// # Errors
-/// Returns a typed invariant error when durable rows disagree or the existing
-/// durable evidence cannot describe one coherent crawl result.
+/// Returns [`CrawlStructuralFactsError::InconsistentDurableState`] when
+/// durable evidence disagrees about run identity, URL validity, or structural
+/// counts.
 #[allow(clippy::too_many_lines)]
 pub fn reconstruct_crawl_structural_facts(
     snapshot: &CrawlRunSnapshot,
     current_status: CrawlRunStatus,
     executions: &[CrawlExecutionRecord],
     discovered_urls: &[DiscoveredUrlRecord],
-    checkpoint: Option<&CrawlCheckpoint>,
     control: Option<&CrawlTraversalControl>,
     work: Option<&[CrawlUrlStateRecord]>,
-) -> Result<CrawlStructuralFacts, CrawlFinalizationError> {
-    let mut planned = BTreeSet::new();
-    let expected_run_id = checkpoint
-        .map(|value| value.crawl_run_id)
-        .or_else(|| work.and_then(|values| values.first().map(|value| value.crawl_run_id)))
-        .or_else(|| executions.first().map(|value| value.crawl_run_id))
-        .or_else(|| discovered_urls.first().map(|value| value.crawl_run_id));
+) -> Result<CrawlStructuralFacts, CrawlStructuralFactsError> {
+    let expected_run_id = expected_run_id(executions, discovered_urls, control, work);
     for execution in executions {
         validate_execution(execution)?;
-        if expected_run_id.is_some_and(|run_id| run_id != execution.crawl_run_id) {
-            return Err(CrawlFinalizationError::Invariant);
-        }
-        planned.insert(execution.canonical_url.clone());
+        ensure_run_id(expected_run_id, execution.crawl_run_id)?;
     }
     for discovered in discovered_urls {
-        if expected_run_id.is_some_and(|run_id| run_id != discovered.crawl_run_id) {
-            return Err(CrawlFinalizationError::Invariant);
-        }
+        ensure_run_id(expected_run_id, discovered.crawl_run_id)?;
         validate_fragment_free(&discovered.original_url)?;
         validate_fragment_free(&discovered.canonical_url)?;
     }
+    if let Some(control) = control {
+        ensure_run_id(expected_run_id, control.crawl_run_id)?;
+    }
     if let Some(work) = work {
         for state in work {
-            if expected_run_id.is_some_and(|run_id| run_id != state.crawl_run_id) {
-                return Err(CrawlFinalizationError::Invariant);
-            }
+            ensure_run_id(expected_run_id, state.crawl_run_id)?;
+        }
+    }
+
+    let mut planned = BTreeSet::new();
+    for execution in executions {
+        planned.insert(execution.canonical_url.clone());
+    }
+    if let Some(work) = work {
+        for state in work {
             if state.admission_state == CrawlAdmissionState::Admitted {
                 planned.insert(state.canonical_url.clone());
             }
         }
-    } else if let Some(checkpoint) = checkpoint {
-        for unit in checkpoint
-            .completed_units
-            .iter()
-            .chain(&checkpoint.pending_units)
-            .chain(&checkpoint.failed_units)
-            .chain(&checkpoint.partial_units)
-        {
-            planned.insert(unit.canonical_url.clone());
-        }
     } else {
         for discovered in discovered_urls {
             if discovered.status == "ADMITTED" {
-                validate_fragment_free(&discovered.canonical_url)?;
                 planned.insert(discovered.canonical_url.clone());
             }
         }
@@ -180,30 +156,7 @@ pub fn reconstruct_crawl_structural_facts(
             }
         }
     }
-    if work.is_none()
-        && let Some(checkpoint) = checkpoint
-    {
-        for unit in &checkpoint.pending_units {
-            if completed.contains(&unit.canonical_url) {
-                return Err(CrawlFinalizationError::Invariant);
-            }
-            unresolved.insert(unit.canonical_url.clone());
-        }
-        for unit in &checkpoint.failed_units {
-            if completed.contains(&unit.canonical_url) {
-                return Err(CrawlFinalizationError::Invariant);
-            }
-            unresolved.insert(unit.canonical_url.clone());
-        }
-        for unit in &checkpoint.partial_units {
-            unresolved.insert(unit.canonical_url.clone());
-        }
-        for unit in &checkpoint.completed_units {
-            if !completed.contains(&unit.canonical_url) {
-                return Err(CrawlFinalizationError::Invariant);
-            }
-        }
-    }
+
     let mut ambiguous = BTreeSet::new();
     if let Some(work) = work {
         for state in work {
@@ -212,39 +165,24 @@ pub fn reconstruct_crawl_structural_facts(
             }
         }
     }
-    // Ambiguity is append-only PageType-evaluation evidence. It remains
+    // Ambiguity is append-only Page Type evaluation evidence. It remains
     // durable even when no executable logical unit is admitted for it.
     for discovered in discovered_urls {
         if discovered.status == "AMBIGUOUS_PAGE_TYPE" {
-            validate_fragment_free(&discovered.canonical_url)?;
             ambiguous.insert(discovered.canonical_url.clone());
         }
     }
-    let pagination_truncation_count = control.map_or_else(
-        || checkpoint.map_or(0, |value| value.traversal.pagination_truncation_count),
-        |value| value.pagination_truncation_count,
-    );
-    let planned_count =
-        u64::try_from(planned.len()).map_err(|_| CrawlFinalizationError::Invariant)?;
-    let completed_count =
-        u64::try_from(completed.len()).map_err(|_| CrawlFinalizationError::Invariant)?;
-    // Pagination truncation is structural evidence in its own right, not an
-    // additional unresolved work item.  In particular, a targetful
-    // pagination observation at the duration boundary must not count once as
-    // pagination and again as generic duration work.  The duration flag is
-    // reserved by SemanticTraversal for regular unrepresented work.
-    let unresolved_count = u64::try_from(unresolved.len())
-        .map_err(|_| CrawlFinalizationError::Invariant)?
-        .checked_add(u64::from(control.map_or_else(
-            || checkpoint.is_some_and(|item| item.traversal.duration_work_not_expanded),
-            |value| value.duration_work_not_expanded,
-        )))
-        .ok_or(CrawlFinalizationError::Invariant)?;
-    let ambiguity_count =
-        u64::try_from(ambiguous.len()).map_err(|_| CrawlFinalizationError::Invariant)?;
-    if completed_count > planned_count {
-        return Err(CrawlFinalizationError::Invariant);
-    }
+
+    let pagination_truncation_count = control.map_or(0, |value| value.pagination_truncation_count);
+    let planned_count = count(planned.len())?;
+    let completed_count = count(completed.len())?;
+    ensure_counts_are_coherent(planned_count, completed_count)?;
+    let unresolved_count = count(unresolved.len())?
+        .checked_add(u64::from(
+            control.is_some_and(|value| value.duration_work_not_expanded),
+        ))
+        .ok_or(CrawlStructuralFactsError::InconsistentDurableState)?;
+    let ambiguity_count = count(ambiguous.len())?;
 
     let structurally_incomplete = completed_count < planned_count
         || unresolved_count > 0
@@ -278,108 +216,40 @@ pub fn reconstruct_crawl_structural_facts(
     })
 }
 
-/// Finalizes durable state through the historical complete-snapshot
-/// compatibility surface. The canonical crawl reconstruction is performed
-/// first, then the established run-type extraction-health default is attached
-/// only for this legacy wrapper.
-///
-/// # Errors
-/// Returns an invariant or structural-input error when durable evidence cannot
-/// describe one coherent crawl result.
-#[allow(clippy::too_many_lines)]
-pub fn finalize_durable_state(
-    snapshot: &CrawlRunSnapshot,
-    current_status: CrawlRunStatus,
+fn expected_run_id(
     executions: &[CrawlExecutionRecord],
     discovered_urls: &[DiscoveredUrlRecord],
-    checkpoint: Option<&CrawlCheckpoint>,
-) -> Result<CrawlFinalization, CrawlFinalizationError> {
-    finalize_durable_state_with_control(
-        snapshot,
-        current_status,
-        executions,
-        discovered_urls,
-        checkpoint,
-        None,
-    )
-}
-
-/// Same durable finalization with Task 9 scalar traversal control. The
-/// control row supersedes the old growing checkpoint for pagination/duration
-/// facts.
-///
-/// # Errors
-/// Returns an invariant or structural-input error when durable evidence cannot
-/// describe one coherent crawl result.
-#[allow(clippy::too_many_lines)]
-pub fn finalize_durable_state_with_control(
-    snapshot: &CrawlRunSnapshot,
-    current_status: CrawlRunStatus,
-    executions: &[CrawlExecutionRecord],
-    discovered_urls: &[DiscoveredUrlRecord],
-    checkpoint: Option<&CrawlCheckpoint>,
-    control: Option<&CrawlTraversalControl>,
-) -> Result<CrawlFinalization, CrawlFinalizationError> {
-    finalize_durable_state_with_traversal(
-        snapshot,
-        current_status,
-        executions,
-        discovered_urls,
-        checkpoint,
-        control,
-        None,
-    )
-}
-
-/// Finalizes a Task 9 production run from the authoritative logical-work
-/// projection. `work` takes precedence over append-only execution history:
-/// historical failures cannot make a currently completed generation
-/// unresolved again.
-///
-/// # Errors
-/// Returns an invariant or structural-input error when durable logical work,
-/// immutable snapshot, and append-only evidence disagree.
-#[allow(clippy::too_many_lines)]
-pub fn finalize_durable_state_with_traversal(
-    snapshot: &CrawlRunSnapshot,
-    current_status: CrawlRunStatus,
-    executions: &[CrawlExecutionRecord],
-    discovered_urls: &[DiscoveredUrlRecord],
-    checkpoint: Option<&CrawlCheckpoint>,
     control: Option<&CrawlTraversalControl>,
     work: Option<&[CrawlUrlStateRecord]>,
-) -> Result<CrawlFinalization, CrawlFinalizationError> {
-    let facts = reconstruct_crawl_structural_facts(
-        snapshot,
-        current_status,
-        executions,
-        discovered_urls,
-        checkpoint,
-        control,
-        work,
-    )?;
-    let extraction_health = match snapshot.run_type() {
-        CrawlRunType::ProductionRun => ExtractionHealth::NotEvaluated,
-        CrawlRunType::QuickScrape | CrawlRunType::TestRun | CrawlRunType::DiscoveryPreview => {
-            ExtractionHealth::NotRequired
-        }
-    };
-    let structural_input = CompleteSnapshotStructuralInput {
-        run_type: snapshot.run_type(),
-        status: facts.status,
-        in_scope_pages_planned: facts.in_scope_pages_planned,
-        in_scope_pages_completed: facts.in_scope_pages_completed,
-        pagination_truncation_count: facts.pagination_truncation_count,
-        unresolved_partial_work_count: facts.unresolved_partial_work_count,
-        page_type_ambiguity_count: facts.page_type_ambiguity_count,
-        extraction_health,
-    };
-    let decision = structural_input.decide()?;
-    Ok(CrawlFinalization {
-        structural_input,
-        decision,
-        status: facts.status,
-    })
+) -> Option<CrawlRunId> {
+    work.and_then(|values| values.first().map(|value| value.crawl_run_id))
+        .or_else(|| executions.first().map(|value| value.crawl_run_id))
+        .or_else(|| discovered_urls.first().map(|value| value.crawl_run_id))
+        .or_else(|| control.map(|value| value.crawl_run_id))
+}
+
+fn ensure_run_id(
+    expected_run_id: Option<CrawlRunId>,
+    actual_run_id: CrawlRunId,
+) -> Result<(), CrawlStructuralFactsError> {
+    if expected_run_id.is_some_and(|expected| expected != actual_run_id) {
+        return Err(CrawlStructuralFactsError::InconsistentDurableState);
+    }
+    Ok(())
+}
+
+fn count(value: usize) -> Result<u64, CrawlStructuralFactsError> {
+    u64::try_from(value).map_err(|_| CrawlStructuralFactsError::InconsistentDurableState)
+}
+
+fn ensure_counts_are_coherent(
+    planned: u64,
+    completed: u64,
+) -> Result<(), CrawlStructuralFactsError> {
+    if completed > planned {
+        return Err(CrawlStructuralFactsError::InconsistentDurableState);
+    }
+    Ok(())
 }
 
 fn quick_scrape_current_terminal_status(
@@ -401,19 +271,6 @@ fn quick_scrape_current_terminal_status(
     None
 }
 
-fn validate_execution(record: &CrawlExecutionRecord) -> Result<(), CrawlFinalizationError> {
-    validate_fragment_free(&record.requested_url)?;
-    validate_fragment_free(&record.canonical_url)?;
-    if record
-        .observed_final_url
-        .as_deref()
-        .is_some_and(|value| value.contains('#'))
-    {
-        return Err(CrawlFinalizationError::Invariant);
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum DurablePageOutcome {
     Failed,
@@ -431,9 +288,22 @@ impl DurablePageOutcome {
     }
 }
 
-fn validate_fragment_free(value: &str) -> Result<(), CrawlFinalizationError> {
+fn validate_execution(record: &CrawlExecutionRecord) -> Result<(), CrawlStructuralFactsError> {
+    validate_fragment_free(&record.requested_url)?;
+    validate_fragment_free(&record.canonical_url)?;
+    if record
+        .observed_final_url
+        .as_deref()
+        .is_some_and(|value| value.contains('#'))
+    {
+        return Err(CrawlStructuralFactsError::InconsistentDurableState);
+    }
+    Ok(())
+}
+
+fn validate_fragment_free(value: &str) -> Result<(), CrawlStructuralFactsError> {
     if value.contains('#') || url::Url::parse(value).is_err() {
-        return Err(CrawlFinalizationError::Invariant);
+        return Err(CrawlStructuralFactsError::InconsistentDurableState);
     }
     Ok(())
 }
@@ -447,8 +317,8 @@ mod tests {
         CrawlWorkState, DiscoveredUrlRecord,
     };
     use erabi_domain::{
-        CrawlExecutionId, CrawlRunId, CrawlRunSnapshotDraft, CrawlerId, CrawlerVersionId,
-        ResolvedValue, RobotsAudit, RunConfiguration, SettingSource, SnapshotOperationalSettings,
+        CrawlExecutionId, CrawlRunId, CrawlRunSnapshotDraft, ResolvedValue, RobotsAudit,
+        RunConfiguration, SettingSource, SnapshotOperationalSettings,
     };
 
     use super::*;
@@ -492,10 +362,7 @@ mod tests {
         })?)
     }
 
-    fn execution(
-        run_id: erabi_domain::CrawlRunId,
-        outcome: CrawlExecutionOutcome,
-    ) -> CrawlExecutionRecord {
+    fn execution(run_id: CrawlRunId, outcome: CrawlExecutionOutcome) -> CrawlExecutionRecord {
         CrawlExecutionRecord {
             id: CrawlExecutionId::new(),
             crawl_run_id: run_id,
@@ -569,34 +436,10 @@ mod tests {
         }
     }
 
-    fn production_snapshot() -> Result<CrawlRunSnapshot, Box<dyn std::error::Error>> {
-        let crawler_version_id = CrawlerVersionId::new();
-        Ok(CrawlRunSnapshot::new(CrawlRunSnapshotDraft {
-            run_type: CrawlRunType::ProductionRun,
-            configuration: RunConfiguration::CrawlerVersion {
-                crawler_id: CrawlerId::new(),
-                crawler_version_id,
-                semantic_config_hash: "c".repeat(64),
-            },
-            selected_seed_ids: Vec::new(),
-            run_profile_id: None,
-            settings: snapshot()?.settings().clone(),
-            robots: RobotsAudit::respect(
-                "operator",
-                "unix:1",
-                "https://example.test",
-                "Erabi/0.1",
-                Some(crawler_version_id),
-            ),
-            actor: "operator".to_owned(),
-            created_at: "unix:1".to_owned(),
-        })?)
-    }
-
-    fn discovered(status: &str) -> DiscoveredUrlRecord {
+    fn discovered_for(run_id: CrawlRunId, status: &str) -> DiscoveredUrlRecord {
         DiscoveredUrlRecord {
             id: "discovered-1".to_owned(),
-            crawl_run_id: CrawlRunId::new(),
+            crawl_run_id: run_id,
             source_id: None,
             raw_href: None,
             original_url: "https://example.test/page".to_owned(),
@@ -608,292 +451,249 @@ mod tests {
     }
 
     #[test]
-    fn historical_failure_followed_by_success_is_not_unresolved()
+    fn complete_coherent_durable_work_reconstructs_facts_without_checkpoint_state()
     -> Result<(), Box<dyn std::error::Error>> {
-        let run_id = erabi_domain::CrawlRunId::new();
-        let snapshot = snapshot()?;
-        let records = vec![
-            execution(run_id, CrawlExecutionOutcome::Failed),
-            execution(run_id, CrawlExecutionOutcome::Completed),
-        ];
+        let run_id = CrawlRunId::new();
         let facts = reconstruct_crawl_structural_facts(
-            &snapshot,
+            &snapshot()?,
             CrawlRunStatus::Running,
-            &records,
+            &[execution(run_id, CrawlExecutionOutcome::Completed)],
             &[],
-            None,
             None,
             None,
         )?;
         assert_eq!(facts.status, CrawlRunStatus::Succeeded);
         assert_eq!(facts.in_scope_pages_planned, 1);
         assert_eq!(facts.in_scope_pages_completed, 1);
-        assert_eq!(facts.pagination_truncation_count, 0);
         assert_eq!(facts.unresolved_partial_work_count, 0);
-        assert_eq!(facts.page_type_ambiguity_count, 0);
-        let finalized =
-            finalize_durable_state(&snapshot, CrawlRunStatus::Running, &records, &[], None)?;
-        assert_eq!(finalized.status, CrawlRunStatus::Succeeded);
-        assert_eq!(finalized.structural_input.in_scope_pages_planned, 1);
-        assert_eq!(finalized.structural_input.in_scope_pages_completed, 1);
-        assert_eq!(finalized.structural_input.unresolved_partial_work_count, 0);
-        assert!(matches!(
-            finalized.decision,
-            CompleteSnapshotStructuralDecision::Incomplete { .. }
-        ));
         Ok(())
     }
 
     #[test]
-    fn coherent_partial_work_is_reconstructed_as_crawl_facts()
+    fn historical_failure_followed_by_current_success_is_completed()
     -> Result<(), Box<dyn std::error::Error>> {
         let run_id = CrawlRunId::new();
-        let snapshot = snapshot()?;
+        let records = vec![
+            execution(run_id, CrawlExecutionOutcome::Failed),
+            execution(run_id, CrawlExecutionOutcome::Completed),
+        ];
+        let facts = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &records,
+            &[],
+            None,
+            None,
+        )?;
+        assert_eq!(facts.in_scope_pages_completed, 1);
+        assert_eq!(facts.unresolved_partial_work_count, 0);
+        assert_eq!(facts.status, CrawlRunStatus::Succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn current_logical_work_supersedes_historical_attempt_outcomes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = CrawlRunId::new();
+        let current = quick_work(run_id, CrawlWorkState::Completed, 2);
+        let facts = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &[execution(run_id, CrawlExecutionOutcome::Failed)],
+            &[],
+            Some(&control(run_id)),
+            Some(&[current]),
+        )?;
+        assert_eq!(facts.in_scope_pages_completed, 1);
+        assert_eq!(facts.unresolved_partial_work_count, 0);
+        assert_eq!(facts.status, CrawlRunStatus::Succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_logical_work_counts_as_completed_and_unresolved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = CrawlRunId::new();
         let partial = quick_work(run_id, CrawlWorkState::Partial, 1);
         let facts = reconstruct_crawl_structural_facts(
-            &snapshot,
+            &snapshot()?,
             CrawlRunStatus::Running,
             &[],
             &[],
-            None,
             Some(&control(run_id)),
             Some(&[partial]),
         )?;
-        assert_eq!(facts.status, CrawlRunStatus::PartialResult);
         assert_eq!(facts.in_scope_pages_planned, 1);
         assert_eq!(facts.in_scope_pages_completed, 1);
         assert_eq!(facts.unresolved_partial_work_count, 1);
-        assert_eq!(facts.pagination_truncation_count, 0);
-        assert_eq!(facts.page_type_ambiguity_count, 0);
+        assert_eq!(facts.status, CrawlRunStatus::PartialResult);
         Ok(())
     }
 
     #[test]
-    fn quick_finalization_uses_current_generation_over_historical_outcomes()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn pagination_truncation_comes_from_traversal_control() -> Result<(), Box<dyn std::error::Error>>
+    {
         let run_id = CrawlRunId::new();
-        let snapshot = snapshot()?;
-        let historical = vec![
-            execution(run_id, CrawlExecutionOutcome::Completed),
-            execution(run_id, CrawlExecutionOutcome::Failed),
-        ];
-        let failed = quick_work(run_id, CrawlWorkState::Failed, 1);
-        let finalized = finalize_durable_state_with_traversal(
-            &snapshot,
-            CrawlRunStatus::Running,
-            &historical,
-            &[],
-            None,
-            Some(&control(run_id)),
-            Some(&[failed]),
-        )?;
-        assert_eq!(finalized.status, CrawlRunStatus::Failed);
-        assert_eq!(finalized.structural_input.in_scope_pages_planned, 1);
-        assert_eq!(finalized.structural_input.in_scope_pages_completed, 0);
-        assert_eq!(finalized.structural_input.unresolved_partial_work_count, 1);
-
-        let completed = quick_work(run_id, CrawlWorkState::Completed, 2);
-        let finalized = finalize_durable_state_with_traversal(
-            &snapshot,
-            CrawlRunStatus::Running,
-            &historical,
-            &[],
-            None,
-            Some(&control(run_id)),
-            Some(&[completed]),
-        )?;
-        assert_eq!(finalized.status, CrawlRunStatus::Succeeded);
-        assert_eq!(finalized.structural_input.in_scope_pages_completed, 1);
-        assert_eq!(finalized.structural_input.unresolved_partial_work_count, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn checkpoint_pending_work_is_currently_incomplete() -> Result<(), Box<dyn std::error::Error>> {
-        let run_id = erabi_domain::CrawlRunId::new();
-        let snapshot = snapshot()?;
-        let pending = crate::CrawlCheckpointUnit {
-            state: crate::CrawlCheckpointUnitState::Pending,
-            requested_url: "https://example.test/page".to_owned(),
-            canonical_url: "https://example.test/page".to_owned(),
-            discovered_url_id: None,
-            depth: 0,
-            page_type_id: None,
-            transition_id: None,
-            parent_canonical_url: None,
-            final_canonical_url: None,
-            pagination: false,
-            seed_ids: Vec::new(),
-            execution_ids: Vec::new(),
-        };
-        let checkpoint = crate::CrawlCheckpoint::new(
-            run_id,
-            &snapshot,
-            crate::SemanticTraversalCheckpoint::empty(Vec::new()),
-            Vec::new(),
-            vec![pending],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )?;
-        let finalized = finalize_durable_state(
-            &snapshot,
-            CrawlRunStatus::Running,
-            &[],
-            &[],
-            Some(&checkpoint),
-        )?;
-        assert_eq!(finalized.status, CrawlRunStatus::PartialResult);
-        assert_eq!(finalized.structural_input.unresolved_partial_work_count, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn ambiguity_and_pagination_are_reconstructed_from_durable_evidence()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let run_id = CrawlRunId::new();
-        let snapshot = snapshot()?;
-        let mut traversal = crate::SemanticTraversalCheckpoint::empty(Vec::new());
+        let mut traversal = control(run_id);
         traversal.pagination_truncation_count = 2;
-        let checkpoint = crate::CrawlCheckpoint::new(
-            run_id,
-            &snapshot,
-            traversal,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )?;
-        let mut ambiguity = discovered("AMBIGUOUS_PAGE_TYPE");
-        ambiguity.crawl_run_id = run_id;
         let facts = reconstruct_crawl_structural_facts(
-            &snapshot,
+            &snapshot()?,
             CrawlRunStatus::Running,
             &[],
-            &[ambiguity],
-            Some(&checkpoint),
-            None,
+            &[],
+            Some(&traversal),
             None,
         )?;
         assert_eq!(facts.pagination_truncation_count, 2);
+        assert_eq!(facts.unresolved_partial_work_count, 0);
+        assert_eq!(facts.status, CrawlRunStatus::PartialResult);
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguity_comes_from_durable_discovery_evidence() -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = CrawlRunId::new();
+        let facts = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &[],
+            &[discovered_for(run_id, "AMBIGUOUS_PAGE_TYPE")],
+            Some(&control(run_id)),
+            None,
+        )?;
         assert_eq!(facts.page_type_ambiguity_count, 1);
         assert_eq!(facts.status, CrawlRunStatus::PartialResult);
-        let finalized = finalize_durable_state(
-            &snapshot,
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguity_comes_from_durable_logical_work_evidence() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let run_id = CrawlRunId::new();
+        let mut work = quick_work(run_id, CrawlWorkState::Completed, 1);
+        work.preserve_reason = Some("AMBIGUOUS_PAGE_TYPE".to_owned());
+        let facts = reconstruct_crawl_structural_facts(
+            &snapshot()?,
             CrawlRunStatus::Running,
             &[],
             &[],
-            Some(&checkpoint),
+            Some(&control(run_id)),
+            Some(&[work]),
         )?;
+        assert_eq!(facts.page_type_ambiguity_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_run_durable_evidence_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let first_run = CrawlRunId::new();
+        let second_run = CrawlRunId::new();
+        let result = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &[execution(first_run, CrawlExecutionOutcome::Completed)],
+            &[discovered_for(second_run, "ADMITTED")],
+            None,
+            None,
+        );
         assert!(matches!(
-            finalized.decision,
-            CompleteSnapshotStructuralDecision::Incomplete { .. }
+            result,
+            Err(CrawlStructuralFactsError::InconsistentDurableState)
         ));
         Ok(())
     }
 
     #[test]
-    fn pagination_only_duration_evidence_is_not_double_counted()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let run_id = CrawlRunId::new();
-        let snapshot = snapshot()?;
-        let mut traversal = crate::SemanticTraversalCheckpoint::empty(Vec::new());
-        traversal.pagination_truncation_count = 1;
-        // SemanticTraversal deliberately leaves the generic duration flag
-        // clear for a targetful pagination-only boundary.
-        let checkpoint = crate::CrawlCheckpoint::new(
-            run_id,
-            &snapshot,
-            traversal,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )?;
-        let facts = reconstruct_crawl_structural_facts(
-            &snapshot,
-            CrawlRunStatus::Running,
-            &[],
-            &[],
-            Some(&checkpoint),
-            None,
-            None,
-        )?;
-        assert_eq!(facts.pagination_truncation_count, 1);
-        assert_eq!(facts.unresolved_partial_work_count, 0);
-        Ok(())
+    fn completed_greater_than_planned_fails_closed() {
+        assert!(matches!(
+            ensure_counts_are_coherent(0, 1),
+            Err(CrawlStructuralFactsError::InconsistentDurableState)
+        ));
     }
 
     #[test]
-    fn contradictory_checkpoint_and_execution_evidence_is_rejected()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let run_id = CrawlRunId::new();
-        let snapshot = snapshot()?;
-        let pending = crate::CrawlCheckpointUnit {
-            state: crate::CrawlCheckpointUnitState::Pending,
-            requested_url: "https://example.test/page".to_owned(),
-            canonical_url: "https://example.test/page".to_owned(),
-            discovered_url_id: None,
-            depth: 0,
-            page_type_id: None,
-            transition_id: None,
-            parent_canonical_url: None,
-            final_canonical_url: None,
-            pagination: false,
-            seed_ids: Vec::new(),
-            execution_ids: Vec::new(),
-        };
-        let checkpoint = crate::CrawlCheckpoint::new(
-            run_id,
-            &snapshot,
-            crate::SemanticTraversalCheckpoint::empty(Vec::new()),
-            Vec::new(),
-            vec![pending],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )?;
-        let result = reconstruct_crawl_structural_facts(
-            &snapshot,
-            CrawlRunStatus::Running,
-            &[execution(run_id, CrawlExecutionOutcome::Completed)],
-            &[],
-            Some(&checkpoint),
-            None,
-            None,
-        );
-        assert!(matches!(result, Err(CrawlFinalizationError::Invariant)));
-        Ok(())
-    }
-
-    #[test]
-    fn failed_and_cancelled_statuses_remain_terminal_and_incomplete()
+    fn terminal_failed_and_cancelled_statuses_remain_terminal()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = snapshot()?;
         for status in [CrawlRunStatus::Failed, CrawlRunStatus::Cancelled] {
-            let finalized = finalize_durable_state(&snapshot, status, &[], &[], None)?;
-            assert_eq!(finalized.status, status);
-            assert!(matches!(
-                finalized.decision,
-                CompleteSnapshotStructuralDecision::Incomplete { .. }
-            ));
+            let facts =
+                reconstruct_crawl_structural_facts(&snapshot, status, &[], &[], None, None)?;
+            assert_eq!(facts.status, status);
         }
         Ok(())
     }
 
     #[test]
-    fn production_extraction_remains_not_evaluated() -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = production_snapshot()?;
-        let finalized = finalize_durable_state(&snapshot, CrawlRunStatus::Running, &[], &[], None)?;
-        assert_eq!(
-            finalized.structural_input.extraction_health,
-            ExtractionHealth::NotEvaluated
+    fn quick_scrape_current_failure_and_cancellation_remain_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = snapshot()?;
+        for (work_state, expected_status) in [
+            (CrawlWorkState::Failed, CrawlRunStatus::Failed),
+            (CrawlWorkState::Cancelled, CrawlRunStatus::Cancelled),
+        ] {
+            let run_id = CrawlRunId::new();
+            let work = quick_work(run_id, work_state, 1);
+            let facts = reconstruct_crawl_structural_facts(
+                &snapshot,
+                CrawlRunStatus::Running,
+                &[],
+                &[],
+                Some(&control(run_id)),
+                Some(&[work]),
+            )?;
+            assert_eq!(facts.status, expected_status);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn control_duration_work_is_counted_without_pagination_double_counting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = CrawlRunId::new();
+        let mut traversal = control(run_id);
+        traversal.pagination_truncation_count = 1;
+        traversal.duration_work_not_expanded = false;
+        let facts = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &[],
+            &[],
+            Some(&traversal),
+            None,
+        )?;
+        assert_eq!(facts.pagination_truncation_count, 1);
+        assert_eq!(facts.unresolved_partial_work_count, 0);
+
+        traversal.duration_work_not_expanded = true;
+        let facts = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &[],
+            &[],
+            Some(&traversal),
+            None,
+        )?;
+        assert_eq!(facts.pagination_truncation_count, 1);
+        assert_eq!(facts.unresolved_partial_work_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn control_run_identity_must_agree_with_other_durable_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first_run = CrawlRunId::new();
+        let second_run = CrawlRunId::new();
+        let result = reconstruct_crawl_structural_facts(
+            &snapshot()?,
+            CrawlRunStatus::Running,
+            &[execution(first_run, CrawlExecutionOutcome::Completed)],
+            &[],
+            Some(&control(second_run)),
+            None,
         );
         assert!(matches!(
-            finalized.decision,
-            CompleteSnapshotStructuralDecision::Incomplete { .. }
+            result,
+            Err(CrawlStructuralFactsError::InconsistentDurableState)
         ));
         Ok(())
     }

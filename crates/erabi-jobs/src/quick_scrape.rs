@@ -7,11 +7,12 @@ use std::{
 };
 
 use erabi_crawler::{
-    AdmissionError, CrawlCheckpointV2, CrawlRecoveryPhase, CrawlerAdapter, CrawlerAdapterError,
-    CrawlerArtifactEvidence, CrawlerArtifactKind, CrawlerEvidencePolicy, CrawlerExecuteRequest,
-    CrawlerResultCompleteness, NetworkTargetPolicy, OriginKey, PacingCancellation, PacingOutcome,
-    PacingService, RenderingRequirement, RobotsAdmissionDecision, RobotsPolicyError,
-    RobotsPolicyService, ScreenshotPolicy, quick_scrape_snapshot_target,
+    AdmissionError, CrawlRecoveryCheckpoint, CrawlRecoveryPhase, CrawlerAdapter,
+    CrawlerAdapterError, CrawlerArtifactEvidence, CrawlerArtifactKind, CrawlerEvidencePolicy,
+    CrawlerExecuteRequest, CrawlerResultCompleteness, NetworkTargetPolicy, OriginKey,
+    PacingCancellation, PacingOutcome, PacingService, RenderingRequirement,
+    RobotsAdmissionDecision, RobotsPolicyError, RobotsPolicyService, ScreenshotPolicy,
+    quick_scrape_snapshot_target,
 };
 use erabi_db::{
     ArtifactStore, ErabiDatabase,
@@ -39,6 +40,10 @@ use crate::{
     JobExecutionContext, JobExecutionError, JobHandler, NewProgressEvent,
     OrchestrationErrorCategory, ProgressAttemptId, ProgressKey, ProgressLiveHub, ProgressMetadata,
     ProgressPublication, ProgressService, ProgressTerminalState,
+    recovery::{
+        CrawlRecoveryValidationError, checkpoint_error_code, map_checkpoint_repository_error,
+        validate_crawl_recovery,
+    },
 };
 
 /// A Quick Scrape root performs its initial attempt and one automatic retry.
@@ -258,41 +263,85 @@ impl QuickScrapeJobHandler {
             JobRepository::new(&self.database)
                 .latest_checkpoint_for_lineage(context.job_id())
                 .await
-                .map_err(|_| {
-                    QuickScrapeError::checkpoint(
-                        ExecutionOperation::LoadCheckpoint,
-                        "CHECKPOINT_LOAD_FAILED",
-                    )
+                .map_err(|error| {
+                    quick_checkpoint_load_error(ExecutionOperation::LoadCheckpoint, &error)
                 })?
         };
-        if let Some(record) = latest_checkpoint.as_ref() {
-            CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id).map_err(
-                |_| {
-                    QuickScrapeError::checkpoint(
-                        ExecutionOperation::LoadCheckpoint,
-                        "CHECKPOINT_INVALID",
-                    )
-                },
-            )?;
-        }
         let recovery_kind = match context.kind().as_str() {
             "RETRY" => Some(CrawlRecoveryActionKind::Retry),
             "RETRY_FAILED_PARTS" => Some(CrawlRecoveryActionKind::RetryFailedParts),
             "RESTART_FROM_BEGINNING" => Some(CrawlRecoveryActionKind::RestartFromBeginning),
             _ => None,
         };
+        let durable_state = match CrawlTraversalRepository::new(&self.database)
+            .reconstruct_recovery_state(run_id)
+            .await
+        {
+            Ok(state) => Some(state),
+            Err(CrawlTraversalRepositoryError::CrawlRunNotFound) => None,
+            Err(error) => {
+                return Err(quick_traversal_error(
+                    ExecutionOperation::LoadCheckpoint,
+                    error,
+                ));
+            }
+        };
+        let recovery_requires_validation = latest_checkpoint.is_some()
+            || matches!(
+                context.kind().as_str(),
+                "RETRY" | "RETRY_FAILED_PARTS" | "RESUME_CHECKPOINT"
+            );
+        if recovery_requires_validation {
+            let current_status = CrawlRunRepository::new(&self.database)
+                .status(run_id)
+                .await
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::LoadRunSnapshot,
+                        "RUN_STATUS_LOAD_FAILED",
+                    )
+                })?;
+            let executions = CrawlExecutionRepository::new(&self.database)
+                .list_for_run(run_id)
+                .await
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::LoadRunSnapshot,
+                        "EXECUTIONS_LOAD_FAILED",
+                    )
+                })?;
+            let discovered = CrawlRunRepository::new(&self.database)
+                .discovered_urls(run_id)
+                .await
+                .map_err(|_| {
+                    QuickScrapeError::repository(
+                        ExecutionOperation::LoadRunSnapshot,
+                        "DISCOVERED_URLS_LOAD_FAILED",
+                    )
+                })?;
+            validate_crawl_recovery(
+                latest_checkpoint.as_ref(),
+                &snapshot,
+                run_id,
+                current_status,
+                &executions,
+                &discovered,
+                durable_state.as_ref(),
+            )
+            .map_err(|error| quick_recovery_error(ExecutionOperation::LoadCheckpoint, error))?;
+        }
         if let Some(kind) = recovery_kind {
-            // Persist a compact action marker before mutating logical
-            // generation state. This keeps an action child replayable if the
-            // process dies between action preparation and its next ordinary
-            // checkpoint. A fresh Restart action may have no prior checkpoint;
-            // its marker still remains bounded and is followed by the normal
-            // initialization checkpoint when the durable state is created.
+            // Persist a compact action marker only after canonical checkpoint
+            // and durable-state validation has accepted this recovery. This
+            // keeps an action child replayable if the process dies between
+            // action preparation and its next ordinary checkpoint. A fresh
+            // Restart action may have no prior checkpoint; its marker remains
+            // bounded and is followed by normal initialization.
             let action_checkpoint = latest_checkpoint
                 .as_ref()
                 .map(|record| record.checkpoint.clone())
                 .unwrap_or(
-                    CrawlCheckpointV2::new(run_id, &snapshot, CrawlRecoveryPhase::Traversing)
+                    CrawlRecoveryCheckpoint::new(run_id, &snapshot, CrawlRecoveryPhase::Traversing)
                         .map_err(|_| {
                             QuickScrapeError::checkpoint(
                                 ExecutionOperation::Serialization,
@@ -329,26 +378,14 @@ impl QuickScrapeJobHandler {
                     )
                 })?;
         }
-        let durable_state = match CrawlTraversalRepository::new(&self.database)
-            .reconstruct_recovery_state(run_id)
-            .await
-        {
-            Ok(state) => Some(state),
-            Err(CrawlTraversalRepositoryError::CrawlRunNotFound) => None,
-            Err(_) => {
-                return Err(QuickScrapeError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
-                ));
-            }
-        };
         let current_work_completed = durable_state.as_ref().is_some_and(|state| {
             state.work.iter().any(|work| {
                 work.id == quick_url_state_id(run_id)
                     && work.admission_state == CrawlAdmissionState::Admitted
                     && work.current_work_state == Some(CrawlWorkState::Completed)
             })
-        });
+        }) && recovery_kind
+            != Some(CrawlRecoveryActionKind::RestartFromBeginning);
         if current_work_completed {
             return self
                 .finish_recovered_execution(&context, run_id, snapshot, CrawlRunStatus::Running)
@@ -914,52 +951,13 @@ impl QuickScrapeJobHandler {
         let checkpoint = JobRepository::new(&self.database)
             .latest_checkpoint_for_lineage(context.job_id())
             .await
-            .map_err(|_| {
-                QuickScrapeError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_LOAD_FAILED",
-                )
-            })?;
-        let _checkpoint = checkpoint
-            .as_ref()
-            .map(|record| CrawlCheckpointV2::from_envelope(&record.checkpoint, &snapshot, run_id))
-            .transpose()
-            .map_err(|_| {
-                QuickScrapeError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "CHECKPOINT_INVALID",
-                )
+            .map_err(|error| {
+                quick_checkpoint_load_error(ExecutionOperation::LoadCheckpoint, &error)
             })?;
         let durable = CrawlTraversalRepository::new(&self.database)
             .reconstruct_recovery_state(run_id)
             .await
-            .map_err(|_| {
-                QuickScrapeError::checkpoint(
-                    ExecutionOperation::LoadCheckpoint,
-                    "TRAVERSAL_STATE_RECONSTRUCTION_FAILED",
-                )
-            })?;
-        if let Some(record) = checkpoint.as_ref() {
-            emit(SemanticEvent::CheckpointRecovered {
-                context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
-                version: 2,
-                phase: erabi_observability::CheckpointPhase::Recovery,
-                bytes: record
-                    .checkpoint
-                    .payload
-                    .as_ref()
-                    .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
-                work_generation: 0,
-                outcome: EventOutcome::Reconstructed,
-            });
-        }
-        emit(SemanticEvent::RecoveryReconstructed {
-            context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
-            action: erabi_observability::RecoveryAction::Reconstructed,
-            generation: 0,
-            recovered_count: u64::try_from(durable.work.len()).unwrap_or(u64::MAX),
-            outcome: EventOutcome::Reconstructed,
-        });
+            .map_err(|error| quick_traversal_error(ExecutionOperation::LoadCheckpoint, error))?;
         let authoritative_status = durable
             .work
             .iter()
@@ -992,38 +990,68 @@ impl QuickScrapeJobHandler {
                 }
                 _ => current_status,
             });
-        let finalization = erabi_crawler::finalize_durable_state_with_traversal(
-            &snapshot,
-            authoritative_status,
-            &executions,
-            &discovered,
-            None,
-            Some(&durable.control),
-            Some(&durable.work),
-        )
-        .map_err(|_| {
-            QuickScrapeError::new(
-                ExecutionDiagnostic::new(
-                    OrchestrationErrorCategory::Finalization,
-                    ExecutionOperation::FinalizeRun,
-                    ExecutionAction::Retry,
-                    "CRAWL_RUN_FINALIZATION_FAILED",
+        let validated_recovery = checkpoint
+            .as_ref()
+            .map(|record| {
+                validate_crawl_recovery(
+                    Some(record),
+                    &snapshot,
+                    run_id,
+                    authoritative_status,
+                    &executions,
+                    &discovered,
+                    Some(&durable),
                 )
-                .with_run(run_id),
-            )
-        })?;
+                .map_err(|error| quick_recovery_error(ExecutionOperation::LoadCheckpoint, error))
+            })
+            .transpose()?;
+        if let Some(record) = checkpoint.as_ref() {
+            emit(SemanticEvent::CheckpointRecovered {
+                context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+                version: erabi_crawler::CRAWL_RECOVERY_FORMAT_VERSION,
+                phase: erabi_observability::CheckpointPhase::Recovery,
+                bytes: serde_json::to_vec(&record.checkpoint.payload)
+                    .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                work_generation: 0,
+                outcome: EventOutcome::Reconstructed,
+            });
+        }
+        emit(SemanticEvent::RecoveryReconstructed {
+            context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
+            action: erabi_observability::RecoveryAction::Reconstructed,
+            generation: 0,
+            recovered_count: u64::try_from(durable.work.len()).unwrap_or(u64::MAX),
+            outcome: EventOutcome::Reconstructed,
+        });
+        let facts = validated_recovery.map_or_else(
+            || {
+                erabi_crawler::reconstruct_crawl_structural_facts(
+                    &snapshot,
+                    authoritative_status,
+                    &executions,
+                    &discovered,
+                    Some(&durable.control),
+                    Some(&durable.work),
+                )
+                .map_err(|_| {
+                    quick_recovery_error(
+                        ExecutionOperation::FinalizeRun,
+                        CrawlRecoveryValidationError::StateInvalid,
+                    )
+                })
+            },
+            |validated| Ok(validated.facts),
+        )?;
         let summary = CrawlExecutionSummary {
             crawl_run_id: run_id,
-            in_scope_pages_planned: finalization.structural_input.in_scope_pages_planned,
-            in_scope_pages_completed: finalization.structural_input.in_scope_pages_completed,
-            pagination_truncation_count: finalization.structural_input.pagination_truncation_count,
-            unresolved_partial_work_count: finalization
-                .structural_input
-                .unresolved_partial_work_count,
-            page_type_ambiguity_count: finalization.structural_input.page_type_ambiguity_count,
+            in_scope_pages_planned: facts.in_scope_pages_planned,
+            in_scope_pages_completed: facts.in_scope_pages_completed,
+            pagination_truncation_count: facts.pagination_truncation_count,
+            unresolved_partial_work_count: facts.unresolved_partial_work_count,
+            page_type_ambiguity_count: facts.page_type_ambiguity_count,
         };
         CrawlExecutionRepository::new(&self.database)
-            .finalize(&summary, finalization.status)
+            .finalize(&summary, facts.status)
             .await
             .map_err(|_| {
                 QuickScrapeError::new(
@@ -1036,8 +1064,8 @@ impl QuickScrapeJobHandler {
                     .with_run(run_id),
                 )
             })?;
-        context.mark_terminal_crawl_run(run_id, finalization.status);
-        if finalization.status == CrawlRunStatus::Cancelled
+        context.mark_terminal_crawl_run(run_id, facts.status);
+        if facts.status == CrawlRunStatus::Cancelled
             && let Err(error) = self
                 .progress(context, "CANCELLATION_SAFE_BOUNDARY", None)
                 .await
@@ -1047,7 +1075,7 @@ impl QuickScrapeJobHandler {
         if let Err(error) = self.progress(context, "FINALIZATION_COMPLETED", None).await {
             context.record_secondary_diagnostics(error.diagnostics);
         }
-        let (key, terminal) = match finalization.status {
+        let (key, terminal) = match facts.status {
             CrawlRunStatus::Failed => ("FAILED", ProgressTerminalState::Failed),
             CrawlRunStatus::Cancelled => ("CANCELLED", ProgressTerminalState::Cancelled),
             CrawlRunStatus::PartialResult => ("PARTIAL_RESULT", ProgressTerminalState::Succeeded),
@@ -1079,7 +1107,7 @@ impl QuickScrapeJobHandler {
         run_id: CrawlRunId,
         phase: CrawlRecoveryPhase,
     ) -> QuickScrapeResult<()> {
-        let checkpoint = CrawlCheckpointV2::new(run_id, snapshot, phase).map_err(|_| {
+        let checkpoint = CrawlRecoveryCheckpoint::new(run_id, snapshot, phase).map_err(|_| {
             QuickScrapeError::checkpoint(
                 ExecutionOperation::Serialization,
                 "CHECKPOINT_BUILD_FAILED",
@@ -1099,11 +1127,9 @@ impl QuickScrapeJobHandler {
         })?;
         emit(SemanticEvent::CheckpointPersisted {
             context: crate::telemetry_crawl_context(context, Some(&run_id.to_string()), None),
-            version: checkpoint.payload_version,
+            version: erabi_crawler::CRAWL_RECOVERY_FORMAT_VERSION,
             phase: crate::telemetry_checkpoint_phase(phase),
-            bytes: envelope
-                .payload
-                .as_ref()
+            bytes: serde_json::to_vec(&envelope.payload)
                 .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
             work_generation: 0,
             outcome: EventOutcome::Durable,
@@ -1738,6 +1764,49 @@ fn duplicate_execution_is_ok(
         CrawlExecutionRepositoryError::DuplicateExecution => Ok(()),
         other => Err(other),
     }
+}
+
+fn quick_checkpoint_load_error(
+    operation: ExecutionOperation,
+    error: &erabi_db::repositories::JobRepositoryError,
+) -> QuickScrapeError {
+    QuickScrapeError::checkpoint(
+        operation,
+        checkpoint_error_code(error).unwrap_or("CHECKPOINT_LOAD_FAILED"),
+    )
+}
+
+fn quick_traversal_error(
+    operation: ExecutionOperation,
+    error: CrawlTraversalRepositoryError,
+) -> QuickScrapeError {
+    match error {
+        CrawlTraversalRepositoryError::CrawlRunNotFound
+        | CrawlTraversalRepositoryError::InvalidState
+        | CrawlTraversalRepositoryError::CorruptState => {
+            quick_recovery_error(operation, CrawlRecoveryValidationError::StateInvalid)
+        }
+        CrawlTraversalRepositoryError::Checkpoint(error) => {
+            if let Some(mapped) = map_checkpoint_repository_error(&error) {
+                quick_recovery_error(operation, mapped)
+            } else {
+                QuickScrapeError::checkpoint(operation, "CHECKPOINT_LOAD_FAILED")
+            }
+        }
+        CrawlTraversalRepositoryError::Database(_) => {
+            QuickScrapeError::repository(operation, "TRAVERSAL_STATE_LOAD_FAILED")
+        }
+        CrawlTraversalRepositoryError::Discovery(_) => {
+            QuickScrapeError::repository(operation, "DISCOVERY_LOAD_FAILED")
+        }
+    }
+}
+
+fn quick_recovery_error(
+    operation: ExecutionOperation,
+    error: CrawlRecoveryValidationError,
+) -> QuickScrapeError {
+    QuickScrapeError::checkpoint(operation, error.diagnostic_code())
 }
 
 fn direct_file_media_type(snapshot: &erabi_domain::CrawlRunSnapshot) -> Option<String> {

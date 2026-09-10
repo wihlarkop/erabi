@@ -23,7 +23,10 @@ mod test_lab;
 mod robots_pacing_tests;
 
 pub use adapter::*;
-pub use checkpoint::*;
+pub use checkpoint::{
+    CRAWL_RECOVERY_FORMAT_VERSION, CRAWL_RECOVERY_PAYLOAD_KIND, CrawlRecoveryCheckpoint,
+    CrawlRecoveryCheckpointError, CrawlRecoveryPhase, MAX_CRAWL_RECOVERY_PAYLOAD_BYTES,
+};
 pub use content_probe::*;
 pub use discovery_preview::*;
 pub use finalization::*;

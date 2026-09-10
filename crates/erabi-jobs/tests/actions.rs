@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use erabi_crawler::{
-    CrawlCheckpoint, CrawlCheckpointUnit, CrawlCheckpointUnitState, PRODUCTION_ROOT_MAX_ATTEMPTS,
-    ProductionRunSubmissionRequest, ProductionRunSubmissionService, SemanticTraversalCheckpoint,
+    CrawlRecoveryCheckpoint, CrawlRecoveryPhase, PRODUCTION_ROOT_MAX_ATTEMPTS,
+    ProductionRunSubmissionRequest, ProductionRunSubmissionService,
 };
 use erabi_db::repositories::{
-    CheckpointEnvelope, CheckpointIdentity, CrawlExecutionRecord, CrawlExecutionRepository,
-    CrawlExecutionSummary, CrawlRunRepository, CrawlerRepository, JobFailureCode, JobId, JobKind,
+    CheckpointEnvelope, CrawlAdmissionState, CrawlExecutionRecord, CrawlExecutionRepository,
+    CrawlExecutionSummary, CrawlRunRepository, CrawlTraversalControl, CrawlTraversalRepository,
+    CrawlUrlStateRecord, CrawlWorkState, CrawlerRepository, JobFailureCode, JobId, JobKind,
     JobRepository, JobState, NewJob, NewProgressEvent, ProgressMetadata, ProgressReplayRequest,
     ProgressRepository, ProgressTerminalState,
 };
@@ -254,57 +255,77 @@ fn compatible_checkpoint(
     run_id: CrawlRunId,
     snapshot: &CrawlRunSnapshot,
 ) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
-    Ok(CrawlCheckpoint::new(
-        run_id,
-        snapshot,
-        SemanticTraversalCheckpoint::empty(snapshot.selected_seed_ids().to_vec()),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    )?
-    .to_envelope()?)
+    Ok(
+        CrawlRecoveryCheckpoint::new(run_id, snapshot, CrawlRecoveryPhase::Traversing)?
+            .to_envelope()?,
+    )
 }
 
-fn checkpoint_unit(label: &str, state: CrawlCheckpointUnitState) -> CrawlCheckpointUnit {
-    CrawlCheckpointUnit {
-        state,
-        requested_url: format!("https://example.test/{label}"),
-        canonical_url: format!("https://example.test/{label}"),
-        discovered_url_id: None,
-        depth: 0,
-        page_type_id: None,
-        transition_id: None,
-        parent_canonical_url: None,
-        final_canonical_url: None,
-        pagination: false,
-        seed_ids: Vec::new(),
-        execution_ids: Vec::new(),
-    }
-}
-
-fn checkpoint_with_units(
+async fn initialize_recovery_work(
+    database: &ErabiDatabase,
     run_id: CrawlRunId,
-    snapshot: &CrawlRunSnapshot,
-) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
-    Ok(CrawlCheckpoint::new(
-        run_id,
-        snapshot,
-        SemanticTraversalCheckpoint::empty(snapshot.selected_seed_ids().to_vec()),
-        vec![checkpoint_unit(
-            "success-1",
-            CrawlCheckpointUnitState::Completed,
-        )],
-        Vec::new(),
-        vec![checkpoint_unit(
-            "failed-1",
-            CrawlCheckpointUnitState::Failed,
-        )],
-        Vec::new(),
-        Vec::new(),
-    )?
-    .to_envelope()?)
+    states: Vec<CrawlUrlStateRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    CrawlTraversalRepository::new(database)
+        .initialize_run_state(
+            run_id,
+            &states,
+            &CrawlTraversalControl {
+                crawl_run_id: run_id,
+                consumed_bytes: 0,
+                raw_link_count: 0,
+                duplicate_count: 0,
+                robots_excluded_count: 0,
+                provider_error_count: 0,
+                external_url_count: 0,
+                blocked_url_count: 0,
+                peak_expansion_count: 0,
+                elapsed_millis: 0,
+                time_budget_hit: false,
+                duration_work_not_expanded: false,
+                pagination_truncation_count: 0,
+                next_admission_sequence: states.len() as u64,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn recovery_work_state(
+    run_id: CrawlRunId,
+    canonical_url: &str,
+    state: CrawlWorkState,
+    order: u64,
+) -> CrawlUrlStateRecord {
+    let digest = erabi_domain::canonical_sha256(&format!("{run_id}:{canonical_url}"))
+        .unwrap_or_else(|_| unreachable!("test URL identity is hashable"));
+    CrawlUrlStateRecord {
+        id: format!("crawl:{digest}"),
+        crawl_run_id: run_id,
+        canonical_url: canonical_url.to_owned(),
+        first_discovered_url_id: None,
+        requested_url: canonical_url.to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(order),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(state),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    }
 }
 
 #[tokio::test]
@@ -320,13 +341,24 @@ async fn retry_preserves_attempt_history_and_creates_a_new_attempt()
         None,
     )?)?;
     let (job, run_id, snapshot) = run_backed_job_with_snapshot(&database, 3, snapshot).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
+    cancel_active(
+        &database,
+        &job,
+        Some(compatible_checkpoint(run_id, &snapshot)?),
+    )
+    .await?;
     let repository = JobRepository::new(&database);
-    let acquired = repository
-        .acquire_next("retry-worker", 0, 30)
-        .await?
-        .ok_or("not acquired")?;
-    let lease = acquired.job.lease.clone().ok_or("lease missing")?;
-    repository.cancel(&job.id, &lease, 1).await?;
 
     let service = JobActionService::new(database.clone(), CancellationController::default());
     let result = service.retry(&job.id, 2).await?;
@@ -801,6 +833,17 @@ async fn resume_requires_a_current_compatible_checkpoint() -> Result<(), Box<dyn
 {
     let database = database().await?;
     let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
     cancel_active(
         &database,
         &job,
@@ -845,18 +888,119 @@ async fn resume_rejects_missing_checkpoint() -> Result<(), Box<dyn std::error::E
 #[tokio::test]
 async fn resume_rejects_incompatible_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
-    let (job, _, _) = run_backed_job(&database, 3).await?;
-    let wrong = CheckpointEnvelope::new(CheckpointIdentity::new(
-        "other-run",
-        "a".repeat(64),
-        "b".repeat(64),
-    )?);
+    let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
+    let mut wrong = compatible_checkpoint(run_id, &snapshot)?;
+    wrong.identity.snapshot_id = "other-run".to_owned();
     cancel_active(&database, &job, Some(wrong)).await?;
     let service = JobActionService::new(database, CancellationController::default());
     assert!(matches!(
         service.resume(&job.id, 3).await,
-        Err(JobActionError::CheckpointIncompatible)
+        Err(JobActionError::CheckpointIdentityMismatch)
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_rejects_unsupported_crawl_recovery_format() -> Result<(), Box<dyn std::error::Error>>
+{
+    let database = database().await?;
+    let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
+    let mut unsupported = compatible_checkpoint(run_id, &snapshot)?;
+    unsupported.payload["format_version"] = serde_json::json!(2);
+    cancel_active(&database, &job, Some(unsupported)).await?;
+    let service = JobActionService::new(database, CancellationController::default());
+    assert!(matches!(
+        service.resume(&job.id, 3).await,
+        Err(JobActionError::CheckpointFormatUnsupported)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_rejects_malformed_crawl_recovery_payload() -> Result<(), Box<dyn std::error::Error>>
+{
+    let database = database().await?;
+    let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
+    let mut malformed = compatible_checkpoint(run_id, &snapshot)?;
+    malformed.payload["recovery_phase"] = serde_json::json!(42);
+    cancel_active(&database, &job, Some(malformed)).await?;
+    let service = JobActionService::new(database, CancellationController::default());
+    assert!(matches!(
+        service.resume(&job.id, 3).await,
+        Err(JobActionError::CheckpointMalformed)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retry_rejects_invalid_recovery_without_enqueuing_a_continuation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
+    let mut unsupported = compatible_checkpoint(run_id, &snapshot)?;
+    unsupported.payload["format_version"] = serde_json::json!(2);
+    cancel_active(&database, &job, Some(unsupported)).await?;
+
+    let repository = JobRepository::new(&database);
+    let attempts_before = repository.attempts(&job.id).await?;
+    let checkpoints_before = repository.checkpoints(&job.id).await?;
+    let service = JobActionService::new(database.clone(), CancellationController::default());
+    assert!(matches!(
+        service.retry(&job.id, 3).await,
+        Err(JobActionError::CheckpointFormatUnsupported)
+    ));
+    assert_eq!(repository.attempts(&job.id).await?, attempts_before);
+    assert_eq!(repository.checkpoints(&job.id).await?, checkpoints_before);
+    assert!(
+        repository
+            .acquire_next("retry-invalid-follow-up", 3, 30)
+            .await?
+            .is_none()
+    );
     Ok(())
 }
 
@@ -926,21 +1070,53 @@ async fn retry_failed_parts_preserves_successful_checkpoint_evidence()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
     let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
-    let checkpoint = checkpoint_with_units(run_id, &snapshot)?;
-    cancel_active(&database, &job, Some(checkpoint)).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![
+            recovery_work_state(
+                run_id,
+                "https://example.test/success-1",
+                CrawlWorkState::Completed,
+                0,
+            ),
+            recovery_work_state(
+                run_id,
+                "https://example.test/failed-1",
+                CrawlWorkState::Failed,
+                1,
+            ),
+            recovery_work_state(
+                run_id,
+                "https://example.test/partial-1",
+                CrawlWorkState::Partial,
+                2,
+            ),
+        ],
+    )
+    .await?;
+    cancel_active(
+        &database,
+        &job,
+        Some(compatible_checkpoint(run_id, &snapshot)?),
+    )
+    .await?;
     let service = JobActionService::new(database.clone(), CancellationController::default());
     let result = service.retry_failed_parts(&job.id, 3).await?;
-    assert_eq!(result.failed_part_count, Some(1));
+    assert_eq!(result.failed_part_count, Some(2));
     assert_eq!(result.crawl_run_id, job.crawl_run_id);
     let records = JobRepository::new(&database).checkpoints(&job.id).await?;
-    let typed = CrawlCheckpoint::from_envelope(&records[0].checkpoint, &snapshot, run_id)?;
+    assert_eq!(records.len(), 1);
     assert_eq!(
-        typed.completed_units[0].canonical_url,
-        "https://example.test/success-1"
+        records[0].checkpoint.payload_kind.as_str(),
+        "CRAWL_RECOVERY"
     );
-    assert_eq!(
-        typed.failed_units[0].canonical_url,
-        "https://example.test/failed-1"
+    assert!(
+        !records[0]
+            .checkpoint
+            .payload
+            .to_string()
+            .contains("failed_units")
     );
     Ok(())
 }
@@ -959,6 +1135,17 @@ async fn independent_rerun_requires_fresh_robots_override_evidence()
     )?)?;
     let (job, run_id, source_snapshot) =
         run_backed_job_with_snapshot(&database, 3, source_snapshot).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
     cancel_active(
         &database,
         &job,
@@ -1118,6 +1305,17 @@ async fn concurrent_same_run_recovery_actions_create_one_active_continuation()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
     let (job, run_id, snapshot) = run_backed_job(&database, 3).await?;
+    initialize_recovery_work(
+        &database,
+        run_id,
+        vec![recovery_work_state(
+            run_id,
+            "https://example.test/item",
+            CrawlWorkState::Pending,
+            0,
+        )],
+    )
+    .await?;
     cancel_active(
         &database,
         &job,
@@ -1232,7 +1430,13 @@ async fn active_cancel_action_remains_cooperative_and_uses_task_3_runtime_bounda
 }
 
 #[test]
-fn unsafe_checkpoint_errors_have_a_stable_action_classification() {
-    let error = erabi_jobs::JobActionError::CheckpointUnsafe;
-    assert_eq!(error.to_string(), "the durable checkpoint is unsafe to use");
+fn checkpoint_errors_have_stable_precise_action_classification() {
+    assert_eq!(
+        erabi_jobs::JobActionError::CheckpointMalformed.to_string(),
+        "the durable checkpoint is malformed"
+    );
+    assert_eq!(
+        erabi_jobs::JobActionError::RecoveryStateInvalid.to_string(),
+        "the durable crawl recovery state is invalid"
+    );
 }

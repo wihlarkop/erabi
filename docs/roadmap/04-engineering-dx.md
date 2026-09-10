@@ -42,6 +42,8 @@ The DX track is subordinate to the canonical product specifications. A DX packag
 
 The recommended order is not immutable. A package may move earlier when it removes material risk or duplicate work for the next MVP plan.
 
+DX-D03 references: [approved design](../superpowers/specs/2026-09-10-dx-d03-checkpoint-recovery-contract-design.md) and [implementation plan](../superpowers/plans/2026-09-10-dx-d03-checkpoint-recovery-implementation-plan.md).
+
 ---
 
 ## DX-S06 — Generated OpenAPI & Scalar API Reference

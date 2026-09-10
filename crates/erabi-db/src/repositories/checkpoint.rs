@@ -1,7 +1,5 @@
 //! Bounded, append-only checkpoint evidence for cooperative job recovery.
 
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 use turso::{
     Connection,
@@ -12,19 +10,14 @@ use uuid::Uuid;
 use super::job::{JobId, JobLease};
 use crate::{DbError, ErabiDatabase};
 
-/// The only checkpoint schema currently understood by the generic worker.
-pub const CURRENT_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+/// The only checkpoint envelope format currently understood by the generic
+/// repository.
+pub const CHECKPOINT_ENVELOPE_FORMAT_VERSION: u16 = 1;
 /// Maximum encoded checkpoint size persisted in one append-only row.
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
-/// Maximum number of unit identities across one checkpoint.
-pub const MAX_CHECKPOINT_UNITS: usize = 1_024;
-/// Maximum number of artifact references in one checkpoint.
-pub const MAX_CHECKPOINT_ARTIFACTS: usize = 1_024;
+/// Maximum encoded payload-kind identifier size.
+pub const MAX_CHECKPOINT_PAYLOAD_KIND_BYTES: usize = 64;
 const MAX_SNAPSHOT_ID_BYTES: usize = 128;
-const MAX_UNIT_ID_BYTES: usize = 512;
-const MAX_POSITION_KIND_BYTES: usize = 64;
-const MAX_POSITION_VALUE_BYTES: usize = 8 * 1024;
-const MAX_ARTIFACT_ID_BYTES: usize = 128;
 const MAX_ATTEMPT_ID_BYTES: usize = 128;
 
 /// Immutable run/configuration identity captured by a checkpoint.
@@ -62,95 +55,35 @@ impl CheckpointIdentity {
     }
 }
 
-/// Stable identity of one unit of future crawl/discovery work.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct CheckpointUnitId(String);
+/// Bounded opaque identifier for the subsystem-owned checkpoint payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CheckpointPayloadKind(String);
 
-impl CheckpointUnitId {
-    /// Creates a bounded opaque unit identity; it is not scraped content.
+impl CheckpointPayloadKind {
+    /// Creates a stable upper-case payload-kind identifier.
     ///
     /// # Errors
-    /// Returns an error when the identity is empty or oversized.
+    /// Returns an error when the identifier is empty, oversized, or contains
+    /// anything other than upper-case ASCII letters, digits, or underscores.
     pub fn new(value: impl Into<String>) -> Result<Self, CheckpointRepositoryError> {
-        let value = value.into();
-        bounded_non_empty(&value, MAX_UNIT_ID_BYTES)?;
-        Ok(Self(value))
+        let kind = Self(value.into());
+        kind.validate()?;
+        Ok(kind)
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-/// Opaque but typed position for bounded discovery or pagination resume.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckpointPosition {
-    pub kind: String,
-    pub value: String,
-}
-
-impl CheckpointPosition {
-    /// Creates a bounded typed position without accepting an arbitrary JSON
-    /// object or request/response body.
-    ///
-    /// # Errors
-    /// Returns an error when either field is empty or oversized.
-    pub fn new(
-        kind: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Result<Self, CheckpointRepositoryError> {
-        let position = Self {
-            kind: kind.into(),
-            value: value.into(),
-        };
-        position.validate()?;
-        Ok(position)
-    }
 
     fn validate(&self) -> Result<(), CheckpointRepositoryError> {
-        bounded_non_empty(&self.kind, MAX_POSITION_KIND_BYTES)?;
-        bounded_non_empty(&self.value, MAX_POSITION_VALUE_BYTES)
-    }
-}
-
-/// Resume phase for extraction state that is still safe to continue.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ExtractionResumePhase {
-    NotStarted,
-    InProgress,
-    AwaitingValidation,
-}
-
-/// Typed extraction progress needed to avoid treating partial work as done.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExtractionResumeState {
-    pub phase: ExtractionResumePhase,
-    pub active_unit: Option<CheckpointUnitId>,
-    pub cursor: Option<CheckpointPosition>,
-}
-
-impl ExtractionResumeState {
-    /// Creates an empty, explicitly not-started extraction state.
-    #[must_use]
-    pub const fn not_started() -> Self {
-        Self {
-            phase: ExtractionResumePhase::NotStarted,
-            active_unit: None,
-            cursor: None,
-        }
-    }
-
-    fn validate(&self) -> Result<(), CheckpointRepositoryError> {
-        if let Some(active_unit) = &self.active_unit {
-            bounded_non_empty(active_unit.as_str(), MAX_UNIT_ID_BYTES)?;
-        }
-        if let Some(cursor) = &self.cursor {
-            cursor.validate()?;
-        }
-        if self.phase == ExtractionResumePhase::NotStarted
-            && (self.active_unit.is_some() || self.cursor.is_some())
+        if self.0.is_empty()
+            || self.0.len() > MAX_CHECKPOINT_PAYLOAD_KIND_BYTES
+            || !self
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
         {
             return Err(CheckpointRepositoryError::InvalidEnvelope);
         }
@@ -158,83 +91,48 @@ impl ExtractionResumeState {
     }
 }
 
-/// Reference to an artifact already committed durably elsewhere.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckpointArtifactReference {
-    pub artifact_id: String,
-    pub content_hash: String,
-}
-
-impl CheckpointArtifactReference {
-    /// Creates a bounded artifact reference; content itself is never stored.
-    ///
-    /// # Errors
-    /// Returns an error when the artifact identity or hash is invalid.
-    pub fn new(
-        artifact_id: impl Into<String>,
-        content_hash: impl Into<String>,
-    ) -> Result<Self, CheckpointRepositoryError> {
-        let reference = Self {
-            artifact_id: artifact_id.into(),
-            content_hash: content_hash.into(),
-        };
-        reference.validate()?;
-        Ok(reference)
-    }
-
-    fn validate(&self) -> Result<(), CheckpointRepositoryError> {
-        bounded_non_empty(&self.artifact_id, MAX_ARTIFACT_ID_BYTES)?;
-        valid_hash(&self.content_hash)
-    }
-}
-
 /// Generic bounded checkpoint envelope for future plan-specific typed payloads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointEnvelope {
-    pub schema_version: u16,
+    pub format_version: u16,
     /// Monotonic append position assigned by this repository for one job.
     /// This is persisted in the existing JSON column so recovery does not
     /// infer checkpoint order from row order or UUID lexical order.
-    #[serde(default)]
     pub sequence: u64,
     pub identity: CheckpointIdentity,
-    pub completed_units: Vec<CheckpointUnitId>,
-    pub pending_units: Vec<CheckpointUnitId>,
-    pub failed_units: Vec<CheckpointUnitId>,
-    pub discovery_position: Option<CheckpointPosition>,
-    pub artifact_references: Vec<CheckpointArtifactReference>,
-    pub extraction: ExtractionResumeState,
-    /// Optional bounded plan-specific state. The generic queue owns the
-    /// envelope and lineage validation; the owning plan validates this JSON
-    /// before interpreting it. Large bodies and secrets are never accepted as
-    /// a substitute for a typed plan payload.
-    #[serde(default)]
-    pub payload: Option<String>,
+    pub payload_kind: CheckpointPayloadKind,
+    pub payload: serde_json::Value,
 }
 
 impl CheckpointEnvelope {
-    /// Creates an empty checkpoint for a specific immutable run snapshot.
-    #[must_use]
-    pub fn new(identity: CheckpointIdentity) -> Self {
-        Self {
-            schema_version: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    /// Creates a current-format envelope for a specific immutable run
+    /// snapshot and subsystem-owned structured payload.
+    ///
+    /// # Errors
+    /// Returns [`CheckpointRepositoryError::InvalidEnvelope`] when the
+    /// identity, payload kind, or payload shape violates the current
+    /// transport contract.
+    pub fn new(
+        identity: CheckpointIdentity,
+        payload_kind: CheckpointPayloadKind,
+        payload: serde_json::Value,
+    ) -> Result<Self, CheckpointRepositoryError> {
+        let envelope = Self {
+            format_version: CHECKPOINT_ENVELOPE_FORMAT_VERSION,
             sequence: 0,
             identity,
-            completed_units: Vec::new(),
-            pending_units: Vec::new(),
-            failed_units: Vec::new(),
-            discovery_position: None,
-            artifact_references: Vec::new(),
-            extraction: ExtractionResumeState::not_started(),
-            payload: None,
-        }
+            payload_kind,
+            payload,
+        };
+        envelope.validate()?;
+        Ok(envelope)
     }
 
     /// Validates typed bounds and serializes the envelope for durable storage.
     ///
     /// # Errors
-    /// Returns a typed error when the envelope is malformed, contains duplicate
-    /// unit identities, or exceeds the bounded storage limit.
+    /// Returns a typed error when the envelope is invalid or exceeds the
+    /// bounded storage limit.
     pub fn encode(&self) -> Result<String, CheckpointRepositoryError> {
         self.validate()?;
         let encoded =
@@ -245,99 +143,54 @@ impl CheckpointEnvelope {
         Ok(encoded)
     }
 
-    /// Tests whether this checkpoint matches the current immutable identity.
-    #[must_use]
-    pub fn compatibility_with(&self, current: &CheckpointIdentity) -> CheckpointCompatibility {
-        if self.identity == *current {
-            CheckpointCompatibility::Compatible
-        } else {
-            CheckpointCompatibility::Incompatible
-        }
-    }
-
     fn validate(&self) -> Result<(), CheckpointRepositoryError> {
-        if self.schema_version != CURRENT_CHECKPOINT_SCHEMA_VERSION {
-            return Err(CheckpointRepositoryError::InvalidEnvelope);
+        if self.format_version != CHECKPOINT_ENVELOPE_FORMAT_VERSION {
+            return Err(CheckpointRepositoryError::UnsupportedFormatVersion);
         }
         self.identity.validate()?;
-        if self
-            .payload
-            .as_deref()
-            .is_some_and(|payload| payload.is_empty() || payload.len() > MAX_CHECKPOINT_BYTES)
-        {
+        self.payload_kind.validate()?;
+        if !self.payload.is_object() {
             return Err(CheckpointRepositoryError::InvalidEnvelope);
         }
-        let total_units = self
-            .completed_units
-            .len()
-            .checked_add(self.pending_units.len())
-            .and_then(|count| count.checked_add(self.failed_units.len()))
-            .ok_or(CheckpointRepositoryError::InvalidEnvelope)?;
-        if total_units > MAX_CHECKPOINT_UNITS {
-            return Err(CheckpointRepositoryError::PayloadTooLarge);
-        }
-        let mut identities = BTreeSet::new();
-        for unit in self
-            .completed_units
-            .iter()
-            .chain(&self.pending_units)
-            .chain(&self.failed_units)
-        {
-            bounded_non_empty(unit.as_str(), MAX_UNIT_ID_BYTES)?;
-            if !identities.insert(unit.as_str()) {
-                return Err(CheckpointRepositoryError::InvalidEnvelope);
-            }
-        }
-        if let Some(position) = &self.discovery_position {
-            position.validate()?;
-        }
-        if self.artifact_references.len() > MAX_CHECKPOINT_ARTIFACTS {
-            return Err(CheckpointRepositoryError::PayloadTooLarge);
-        }
-        for artifact in &self.artifact_references {
-            artifact.validate()?;
-        }
-        self.extraction.validate()
+        Ok(())
     }
 
     fn decode(value: &str, encoded_length: usize) -> Result<Self, CheckpointRepositoryError> {
         if encoded_length > MAX_CHECKPOINT_BYTES {
             return Err(CheckpointRepositoryError::PayloadTooLarge);
         }
-        let checkpoint: Self =
+        let parsed: serde_json::Value =
             serde_json::from_str(value).map_err(|_| CheckpointRepositoryError::Malformed)?;
-        checkpoint
-            .validate()
-            .map_err(|_| CheckpointRepositoryError::Inconsistent)?;
+        let object = parsed
+            .as_object()
+            .ok_or(CheckpointRepositoryError::Malformed)?;
+        if object.contains_key("schema_version") {
+            return Err(CheckpointRepositoryError::UnsupportedFormatVersion);
+        }
+        if let Some(format_version) = object.get("format_version")
+            && format_version.is_number()
+            && format_version.as_u64() != Some(u64::from(CHECKPOINT_ENVELOPE_FORMAT_VERSION))
+        {
+            return Err(CheckpointRepositoryError::UnsupportedFormatVersion);
+        }
+        let checkpoint: Self =
+            serde_json::from_value(parsed).map_err(|_| CheckpointRepositoryError::Malformed)?;
+        checkpoint.validate()?;
+        if checkpoint.sequence == 0 {
+            return Err(CheckpointRepositoryError::InvalidEnvelope);
+        }
         Ok(checkpoint)
     }
 }
 
-/// Result of the deterministic immutable snapshot compatibility check.
+/// Generic stale-job assessment. A resume candidate has only passed the
+/// transport and immutable-identity checks; it has not passed crawler-specific
+/// recovery validation or durable traversal reconstruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CheckpointCompatibility {
-    Compatible,
-    Incompatible,
-}
-
-/// Startup classification for one stale active job's latest checkpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CheckpointRecoveryDisposition {
-    /// A valid checkpoint matches the current immutable run identity.
-    Recoverable,
-    /// The job may restart from the beginning, but no safe resume evidence is
-    /// available or the immutable identity does not match.
+pub(super) enum CheckpointEnvelopeDisposition {
+    ResumeCandidate,
     RestartRequired,
-    /// Durable evidence is malformed or internally inconsistent and needs
-    /// typed operator/recovery handling.
-    Unsafe,
-}
-
-/// Typed startup assessment without exposing checkpoint payloads.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointRecoveryAssessment {
-    pub job_id: JobId,
-    pub disposition: CheckpointRecoveryDisposition,
+    Invalid,
 }
 
 /// One append-only durable checkpoint record.
@@ -355,14 +208,14 @@ pub struct CheckpointRecord {
 pub enum CheckpointRepositoryError {
     #[error("the durable checkpoint database operation failed")]
     Database(#[source] DbError),
+    #[error("the checkpoint envelope format is unsupported")]
+    UnsupportedFormatVersion,
     #[error("the checkpoint envelope is invalid")]
     InvalidEnvelope,
     #[error("the checkpoint envelope exceeds the bounded storage limit")]
     PayloadTooLarge,
     #[error("the checkpoint evidence is malformed")]
     Malformed,
-    #[error("the checkpoint evidence is internally inconsistent")]
-    Inconsistent,
     #[error("checkpoint serialization failed")]
     Serialization,
     #[error("the requested job does not exist")]
@@ -444,7 +297,7 @@ impl<'database> CheckpointRepository<'database> {
     /// Returns all append-only checkpoint evidence in trusted-time order.
     ///
     /// # Errors
-    /// Returns a typed malformed/inconsistent result instead of treating bad
+    /// Returns a typed malformed/invalid result instead of treating bad
     /// evidence as resumable.
     pub async fn records(
         &self,
@@ -462,7 +315,7 @@ impl<'database> CheckpointRepository<'database> {
     /// structurally inconsistent earlier evidence.
     ///
     /// # Errors
-    /// Returns a typed error for malformed or inconsistent durable evidence.
+    /// Returns a typed error for malformed or invalid durable evidence.
     pub async fn latest(
         &self,
         job_id: &JobId,
@@ -474,58 +327,12 @@ impl<'database> CheckpointRepository<'database> {
             .map_err(CheckpointRepositoryError::from_db)?;
         Ok(records_from_connection(&connection, job_id).await?.pop())
     }
-
-    /// Classifies every expired active job using only durable checkpoint and
-    /// immutable run identity evidence. This does not mutate queue state.
-    ///
-    /// # Errors
-    /// Returns an error only when the database cannot be inspected. Malformed
-    /// checkpoint rows are returned as [`CheckpointRecoveryDisposition::Unsafe`].
-    pub async fn assess_stale_jobs(
-        &self,
-        now: i64,
-    ) -> Result<Vec<CheckpointRecoveryAssessment>, CheckpointRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CheckpointRepositoryError::from_db)?;
-        let mut rows = connection
-            .query(
-                "SELECT id, crawl_run_id FROM jobs WHERE state = 'RUNNING' AND lease_expires_at <= ?1 ORDER BY id",
-                [now],
-            )
-            .await
-            .map_err(CheckpointRepositoryError::database)?;
-        let mut jobs = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(CheckpointRepositoryError::database)?
-        {
-            let job_id =
-                JobId::from_stored(row.get(0).map_err(CheckpointRepositoryError::database)?);
-            let run_id: Option<String> = row.get(1).map_err(CheckpointRepositoryError::database)?;
-            jobs.push((job_id, run_id));
-        }
-        drop(rows);
-
-        let mut assessments = Vec::with_capacity(jobs.len());
-        for (job_id, run_id) in jobs {
-            let disposition = assess_one_stale_job(&connection, &job_id, run_id.as_deref()).await?;
-            assessments.push(CheckpointRecoveryAssessment {
-                job_id,
-                disposition,
-            });
-        }
-        Ok(assessments)
-    }
 }
 
 /// Appends generic checkpoint evidence inside a caller-owned immediate
-/// transaction. Task 9 uses this only to couple first durable crawl work with
-/// the compatible compact control checkpoint; ownership is still verified
-/// against the active attempt and lease before inserting anything.
+/// transaction. Callers may use this boundary to couple the checkpoint with
+/// other durable work; ownership is still verified against the active attempt
+/// and lease before inserting anything.
 pub(crate) async fn append_in_transaction(
     transaction: &Transaction<'_>,
     job_id: &JobId,
@@ -614,31 +421,32 @@ async fn ensure_owned_attempt(
     Ok(())
 }
 
-pub(crate) async fn assess_one_stale_job(
+pub(super) async fn assess_one_stale_job(
     connection: &Connection,
     job_id: &JobId,
     run_id: Option<&str>,
-) -> Result<CheckpointRecoveryDisposition, CheckpointRepositoryError> {
+) -> Result<CheckpointEnvelopeDisposition, CheckpointRepositoryError> {
     let records = match records_from_connection(connection, job_id).await {
         Ok(records) => records,
         Err(
-            CheckpointRepositoryError::Malformed
-            | CheckpointRepositoryError::Inconsistent
+            CheckpointRepositoryError::UnsupportedFormatVersion
+            | CheckpointRepositoryError::Malformed
+            | CheckpointRepositoryError::InvalidEnvelope
             | CheckpointRepositoryError::PayloadTooLarge,
-        ) => return Ok(CheckpointRecoveryDisposition::Unsafe),
+        ) => return Ok(CheckpointEnvelopeDisposition::Invalid),
         Err(error) => return Err(error),
     };
     let Some(latest) = records.last() else {
-        return Ok(CheckpointRecoveryDisposition::RestartRequired);
+        return Ok(CheckpointEnvelopeDisposition::RestartRequired);
     };
     let Some(attempt_id) = latest.attempt_id.as_deref() else {
-        return Ok(CheckpointRecoveryDisposition::Unsafe);
+        return Ok(CheckpointEnvelopeDisposition::Invalid);
     };
     if !active_checkpoint_lineage_is_valid(connection, job_id, attempt_id).await? {
-        return Ok(CheckpointRecoveryDisposition::Unsafe);
+        return Ok(CheckpointEnvelopeDisposition::Invalid);
     }
     let Some(run_id) = run_id else {
-        return Ok(CheckpointRecoveryDisposition::RestartRequired);
+        return Ok(CheckpointEnvelopeDisposition::RestartRequired);
     };
     let mut rows = connection
         .query(
@@ -652,16 +460,17 @@ pub(crate) async fn assess_one_stale_job(
         .await
         .map_err(CheckpointRepositoryError::database)?
     else {
-        return Ok(CheckpointRecoveryDisposition::Unsafe);
+        return Ok(CheckpointEnvelopeDisposition::Invalid);
     };
     let snapshot_hash: String = row.get(0).map_err(CheckpointRepositoryError::database)?;
     let compatibility_hash: String = row.get(1).map_err(CheckpointRepositoryError::database)?;
     let Ok(current) = CheckpointIdentity::new(run_id, snapshot_hash, compatibility_hash) else {
-        return Ok(CheckpointRecoveryDisposition::Unsafe);
+        return Ok(CheckpointEnvelopeDisposition::Invalid);
     };
-    Ok(match latest.checkpoint.compatibility_with(&current) {
-        CheckpointCompatibility::Compatible => CheckpointRecoveryDisposition::Recoverable,
-        CheckpointCompatibility::Incompatible => CheckpointRecoveryDisposition::RestartRequired,
+    Ok(if latest.checkpoint.identity == current {
+        CheckpointEnvelopeDisposition::ResumeCandidate
+    } else {
+        CheckpointEnvelopeDisposition::RestartRequired
     })
 }
 
@@ -735,16 +544,16 @@ async fn next_checkpoint_sequence(
         .map_err(CheckpointRepositoryError::database)?
     {
         let encoded: String = row.get(0).map_err(CheckpointRepositoryError::database)?;
-        let checkpoint: CheckpointEnvelope =
-            serde_json::from_str(&encoded).map_err(|_| CheckpointRepositoryError::Malformed)?;
+        let checkpoint = CheckpointEnvelope::decode(&encoded, encoded.len())?;
         maximum = Some(maximum.map_or(checkpoint.sequence, |value: u64| {
             value.max(checkpoint.sequence)
         }));
     }
-    maximum
-        .unwrap_or(0)
-        .checked_add(u64::from(maximum.is_some()))
-        .ok_or(CheckpointRepositoryError::InvalidEnvelope)
+    maximum.map_or(Ok(1), |value| {
+        value
+            .checked_add(1)
+            .ok_or(CheckpointRepositoryError::InvalidEnvelope)
+    })
 }
 
 fn record_from_row(row: &turso::Row) -> Result<CheckpointRecord, CheckpointRepositoryError> {
@@ -752,13 +561,13 @@ fn record_from_row(row: &turso::Row) -> Result<CheckpointRecord, CheckpointRepos
     let attempt_id: Option<String> = row.get(2).map_err(CheckpointRepositoryError::database)?;
     let attempt_job_id: Option<String> = row.get(6).map_err(CheckpointRepositoryError::database)?;
     if attempt_id.is_none() || attempt_job_id.as_deref() != Some(job_id.as_str()) {
-        return Err(CheckpointRepositoryError::Inconsistent);
+        return Err(CheckpointRepositoryError::InvalidEnvelope);
     }
     let encoded_length: i64 = row.get(5).map_err(CheckpointRepositoryError::database)?;
     let encoded_length =
-        usize::try_from(encoded_length).map_err(|_| CheckpointRepositoryError::Inconsistent)?;
+        usize::try_from(encoded_length).map_err(|_| CheckpointRepositoryError::InvalidEnvelope)?;
     let encoded: String = row.get(3).map_err(CheckpointRepositoryError::database)?;
-    let checkpoint = CheckpointEnvelope::decode(&encoded, encoded_length)?;
+    let checkpoint = CheckpointEnvelope::decode(&encoded, encoded_length.max(encoded.len()))?;
     Ok(CheckpointRecord {
         id: row.get(0).map_err(CheckpointRepositoryError::database)?,
         job_id: JobId::from_stored(job_id),
@@ -805,36 +614,175 @@ mod tests {
         )?)
     }
 
-    fn checkpoint(unit: &str) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
-        checkpoint_for("generic-job", unit)
+    fn checkpoint(marker: &str) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
+        checkpoint_for("generic-job", marker)
     }
 
     fn checkpoint_for(
         snapshot_id: &str,
-        unit: &str,
+        marker: &str,
     ) -> Result<CheckpointEnvelope, Box<dyn std::error::Error>> {
         let identity = CheckpointIdentity::new(snapshot_id, "a".repeat(64), "b".repeat(64))?;
-        let mut checkpoint = CheckpointEnvelope::new(identity);
-        checkpoint
-            .completed_units
-            .push(CheckpointUnitId::new(unit)?);
-        Ok(checkpoint)
+        Ok(CheckpointEnvelope::new(
+            identity,
+            CheckpointPayloadKind::new("TEST_PAYLOAD")?,
+            serde_json::json!({"marker": marker}),
+        )?)
     }
 
     #[test]
-    fn compatibility_rejects_snapshot_or_semantic_hash_mismatch()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn payload_kind_is_transparent_and_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let kind = CheckpointPayloadKind::new("CRAWL_RECOVERY")?;
+        assert_eq!(kind.as_str(), "CRAWL_RECOVERY");
+        assert_eq!(
+            serde_json::to_value(&kind)?,
+            serde_json::json!("CRAWL_RECOVERY")
+        );
+        assert!(matches!(
+            CheckpointPayloadKind::new(""),
+            Err(CheckpointRepositoryError::InvalidEnvelope)
+        ));
+        assert!(matches!(
+            CheckpointPayloadKind::new("A".repeat(MAX_CHECKPOINT_PAYLOAD_KIND_BYTES + 1)),
+            Err(CheckpointRepositoryError::InvalidEnvelope)
+        ));
+        for invalid in ["crawl_recovery", "Foo", "FOO-BAR", "FOO BAR"] {
+            assert!(matches!(
+                CheckpointPayloadKind::new(invalid),
+                Err(CheckpointRepositoryError::InvalidEnvelope)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_object_payloads_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let identity = CheckpointIdentity::new("run-1", "a".repeat(64), "b".repeat(64))?;
-        let checkpoint = CheckpointEnvelope::new(identity.clone());
-        let mismatch = CheckpointIdentity::new("run-1", "a".repeat(64), "c".repeat(64))?;
-        assert_eq!(
-            checkpoint.compatibility_with(&identity),
-            CheckpointCompatibility::Compatible
-        );
-        assert_eq!(
-            checkpoint.compatibility_with(&mismatch),
-            CheckpointCompatibility::Incompatible
-        );
+        for payload in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("payload"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            assert!(matches!(
+                CheckpointEnvelope::new(
+                    identity.clone(),
+                    CheckpointPayloadKind::new("TEST_PAYLOAD")?,
+                    payload,
+                ),
+                Err(CheckpointRepositoryError::InvalidEnvelope)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_format_is_distinct_from_malformed_json() {
+        assert!(matches!(
+            CheckpointEnvelope::decode(r#"{"schema_version":1}"#, 20),
+            Err(CheckpointRepositoryError::UnsupportedFormatVersion)
+        ));
+        assert!(matches!(
+            CheckpointEnvelope::decode(r#"{"format_version":2}"#, 20),
+            Err(CheckpointRepositoryError::UnsupportedFormatVersion)
+        ));
+        assert!(matches!(
+            CheckpointEnvelope::decode("{malformed", 10),
+            Err(CheckpointRepositoryError::Malformed)
+        ));
+        assert!(matches!(
+            CheckpointEnvelope::decode("[]", 2),
+            Err(CheckpointRepositoryError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn current_envelope_validates_identity_and_format_on_encode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_identity = CheckpointEnvelope {
+            format_version: CHECKPOINT_ENVELOPE_FORMAT_VERSION,
+            sequence: 0,
+            identity: CheckpointIdentity {
+                snapshot_id: "run-1".to_owned(),
+                snapshot_hash: "not-a-hash".to_owned(),
+                compatibility_hash: "b".repeat(64),
+            },
+            payload_kind: CheckpointPayloadKind::new("TEST_PAYLOAD")?,
+            payload: serde_json::json!({}),
+        };
+        assert!(matches!(
+            invalid_identity.encode(),
+            Err(CheckpointRepositoryError::InvalidEnvelope)
+        ));
+
+        let unsupported = CheckpointEnvelope {
+            format_version: CHECKPOINT_ENVELOPE_FORMAT_VERSION + 1,
+            sequence: 0,
+            identity: CheckpointIdentity::new("run-1", "a".repeat(64), "b".repeat(64))?,
+            payload_kind: CheckpointPayloadKind::new("TEST_PAYLOAD")?,
+            payload: serde_json::json!({}),
+        };
+        assert!(matches!(
+            unsupported.encode(),
+            Err(CheckpointRepositoryError::UnsupportedFormatVersion)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn encoded_checkpoint_size_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let identity = CheckpointIdentity::new("run-1", "a".repeat(64), "b".repeat(64))?;
+        let checkpoint = CheckpointEnvelope::new(
+            identity,
+            CheckpointPayloadKind::new("TEST_PAYLOAD")?,
+            serde_json::json!({"data": "x".repeat(MAX_CHECKPOINT_BYTES)}),
+        )?;
+        assert!(matches!(
+            checkpoint.encode(),
+            Err(CheckpointRepositoryError::PayloadTooLarge)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn current_envelope_round_trips_a_structured_payload() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut checkpoint = checkpoint("round-trip")?;
+        checkpoint.sequence = 1;
+        let encoded = checkpoint.encode()?;
+        let decoded = CheckpointEnvelope::decode(&encoded, encoded.len())?;
+        assert_eq!(decoded, checkpoint);
+        assert!(decoded.payload.is_object());
+        assert_eq!(decoded.payload["marker"], "round-trip");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_requires_the_current_attempt_and_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let jobs = JobRepository::new(&database);
+        let job = job(2)?;
+        jobs.enqueue(&job, 0).await?;
+        let acquired = jobs
+            .acquire_next("checkpoint-worker", 0, 10)
+            .await?
+            .ok_or("job was not acquired")?;
+        let lease = acquired.job.lease.ok_or("lease missing")?;
+        assert!(matches!(
+            jobs.append_checkpoint(
+                &job.id,
+                "not-the-current-attempt",
+                &lease,
+                &checkpoint("wrong-attempt")?,
+                1,
+            )
+            .await,
+            Err(crate::repositories::JobRepositoryError::Checkpoint(
+                CheckpointRepositoryError::LeaseLost
+            ))
+        ));
         Ok(())
     }
 
@@ -850,32 +798,31 @@ mod tests {
             .await?
             .ok_or("job was not acquired")?;
         let lease = acquired.job.lease.ok_or("lease missing")?;
-        jobs.append_checkpoint(
-            &job.id,
-            &acquired.attempt.id,
-            &lease,
-            &checkpoint("first")?,
-            1,
-        )
-        .await?;
-        jobs.append_checkpoint(
-            &job.id,
-            &acquired.attempt.id,
-            &lease,
-            &checkpoint("second")?,
-            2,
-        )
-        .await?;
+        let first_checkpoint = checkpoint("first")?;
+        let first_record = jobs
+            .append_checkpoint(&job.id, &acquired.attempt.id, &lease, &first_checkpoint, 1)
+            .await?;
+        let mut second_checkpoint = checkpoint("second")?;
+        second_checkpoint.sequence = 999;
+        let second_record = jobs
+            .append_checkpoint(&job.id, &acquired.attempt.id, &lease, &second_checkpoint, 2)
+            .await?;
 
         let records = jobs.checkpoints(&job.id).await?;
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].checkpoint.completed_units[0].as_str(), "first");
-        assert_eq!(records[1].checkpoint.completed_units[0].as_str(), "second");
+        assert_eq!(first_checkpoint.sequence, 0);
+        assert_eq!(second_checkpoint.sequence, 999);
+        assert_eq!(first_record.checkpoint.sequence, 1);
+        assert_eq!(second_record.checkpoint.sequence, 2);
+        assert_eq!(records[0].checkpoint.sequence, 1);
+        assert_eq!(records[1].checkpoint.sequence, 2);
+        assert_eq!(records[0].checkpoint.payload["marker"], "first");
+        assert_eq!(records[1].checkpoint.payload["marker"], "second");
         Ok(())
     }
 
     #[tokio::test]
-    async fn valid_checkpoint_is_classified_recoverable_after_simulated_restart()
+    async fn identity_compatible_checkpoint_is_only_a_resume_candidate()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let jobs = JobRepository::new(&database);
@@ -903,16 +850,10 @@ mod tests {
         )
         .await?;
 
-        let assessments = CheckpointRepository::new(&database)
-            .assess_stale_jobs(5)
-            .await?;
-        assert_eq!(assessments.len(), 1);
-        assert_eq!(
-            assessments[0].disposition,
-            CheckpointRecoveryDisposition::Recoverable
-        );
+        let disposition = assess_one_stale_job(&connection, &job.id, Some("run-1")).await?;
+        assert_eq!(disposition, CheckpointEnvelopeDisposition::ResumeCandidate);
         let recovery = jobs.recover_stale_jobs(5).await?;
-        assert_eq!(recovery.recoverable, 1);
+        assert_eq!(recovery.resume_candidates, 1);
         assert_eq!(recovery.restart_required, 0);
         assert_eq!(
             jobs.job(&job.id).await?.state,
@@ -949,14 +890,8 @@ mod tests {
             1,
         )
         .await?;
-        let assessments = CheckpointRepository::new(&database)
-            .assess_stale_jobs(5)
-            .await?;
-        assert_eq!(assessments.len(), 1);
-        assert_eq!(
-            assessments[0].disposition,
-            CheckpointRecoveryDisposition::RestartRequired
-        );
+        let disposition = assess_one_stale_job(&connection, &job.id, Some("run-mismatch")).await?;
+        assert_eq!(disposition, CheckpointEnvelopeDisposition::RestartRequired);
         Ok(())
     }
 
@@ -988,18 +923,20 @@ mod tests {
             .ok_or("missing-checkpoint job was not acquired")?;
         assert_eq!(second.job.id, without_checkpoint.id);
 
-        let assessments = CheckpointRepository::new(&database)
-            .assess_stale_jobs(5)
-            .await?;
-        assert_eq!(assessments.len(), 2);
-        assert!(assessments.iter().all(|assessment| {
-            assessment.disposition == CheckpointRecoveryDisposition::RestartRequired
-        }));
+        let connection = database.connection().await?;
+        assert_eq!(
+            assess_one_stale_job(&connection, &with_checkpoint.id, None).await?,
+            CheckpointEnvelopeDisposition::RestartRequired
+        );
+        assert_eq!(
+            assess_one_stale_job(&connection, &without_checkpoint.id, None).await?,
+            CheckpointEnvelopeDisposition::RestartRequired
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn invalid_checkpoint_attempt_lineage_is_unsafe_and_never_resumable()
+    async fn invalid_checkpoint_attempt_lineage_is_invalid_and_never_resumable()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let jobs = JobRepository::new(&database);
@@ -1076,28 +1013,72 @@ mod tests {
             CheckpointRepository::new(&database)
                 .latest(&first.job.id)
                 .await,
-            Err(CheckpointRepositoryError::Inconsistent)
+            Err(CheckpointRepositoryError::InvalidEnvelope)
         ));
         assert!(matches!(
             CheckpointRepository::new(&database)
                 .records(&second.job.id)
                 .await,
-            Err(CheckpointRepositoryError::Inconsistent)
+            Err(CheckpointRepositoryError::InvalidEnvelope)
         ));
-        let assessments = CheckpointRepository::new(&database)
-            .assess_stale_jobs(5)
+        let recovery = jobs.recover_stale_jobs(5).await?;
+        assert_eq!(recovery.resume_candidates, 0);
+        assert_eq!(recovery.invalid_checkpoints, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_checkpoint_is_invalid_and_never_a_resume_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database().await?;
+        let jobs = JobRepository::new(&database);
+        let job = job(2)?;
+        jobs.enqueue(&job, 0).await?;
+        let acquired = jobs
+            .acquire_next("checkpoint-worker", 0, 5)
+            .await?
+            .ok_or("job was not acquired")?;
+        let connection = database.connection().await?;
+        let historical = r#"{
+            "schema_version": 1,
+            "sequence": 1,
+            "identity": {
+                "snapshot_id": "generic-job",
+                "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "compatibility_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "completed_units": [],
+            "pending_units": [],
+            "failed_units": [],
+            "artifact_references": [],
+            "extraction": {"phase": "NOT_STARTED"}
+        }"#;
+        connection
+            .execute(
+                "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    Uuid::now_v7().to_string(),
+                    job.id.as_str(),
+                    acquired.attempt.id.as_str(),
+                    historical,
+                    1,
+                ),
+            )
             .await?;
-        assert_eq!(assessments.len(), 3);
-        assert!(
-            assessments.iter().all(|assessment| {
-                assessment.disposition == CheckpointRecoveryDisposition::Unsafe
-            })
+
+        assert!(matches!(
+            CheckpointRepository::new(&database).latest(&job.id).await,
+            Err(CheckpointRepositoryError::UnsupportedFormatVersion)
+        ));
+        assert_eq!(
+            assess_one_stale_job(&connection, &job.id, None).await?,
+            CheckpointEnvelopeDisposition::Invalid
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn malformed_checkpoint_is_typed_unsafe_and_never_resumable()
+    async fn malformed_checkpoint_is_invalid_and_never_resumable()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let jobs = JobRepository::new(&database);
@@ -1126,8 +1107,8 @@ mod tests {
             Err(CheckpointRepositoryError::Malformed)
         ));
         let recovery = jobs.recover_stale_jobs(5).await?;
-        assert_eq!(recovery.recoverable, 0);
-        assert_eq!(recovery.unsafe_checkpoints, 1);
+        assert_eq!(recovery.resume_candidates, 0);
+        assert_eq!(recovery.invalid_checkpoints, 1);
         Ok(())
     }
 }

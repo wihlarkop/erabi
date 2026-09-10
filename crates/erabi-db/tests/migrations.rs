@@ -80,7 +80,15 @@ fn migration_directory_contains_the_historical_chain_and_task_3_migration()
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations"),
     )?
     .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-    .collect::<Result<Vec<_>, _>>()?;
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .filter(|name| {
+        std::path::Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("sql")
+    })
+    .collect::<Vec<_>>();
     let mut migrations = migrations;
     migrations.sort_unstable();
     assert_eq!(

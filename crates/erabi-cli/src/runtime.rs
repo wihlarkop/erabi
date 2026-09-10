@@ -725,7 +725,7 @@ async fn run_plan_four_startup_hooks(
     let (recovery, concurrency_state) = recover_and_rebuild_at(database, startup_epoch_seconds())
         .await
         .map_err(RecoveryState::from)?;
-    if recovery.unsafe_checkpoints > 0 {
+    if recovery.invalid_checkpoints > 0 {
         return Err(RecoveryState::checkpoint_invariant_violation());
     }
     Ok(concurrency_state)

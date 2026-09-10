@@ -40,6 +40,7 @@ mod cancellation;
 mod production;
 mod progress;
 mod quick_scrape;
+mod recovery;
 mod storage_pressure;
 
 pub use actions::{
@@ -62,11 +63,9 @@ pub use erabi_db::repositories::{
     AcquiredJob, AttemptOutcome, JobAttempt, JobRecord, NewJob, QuickScrapeRunJob,
 };
 pub use erabi_db::repositories::{
-    CURRENT_CHECKPOINT_SCHEMA_VERSION, CheckpointArtifactReference, CheckpointCompatibility,
-    CheckpointEnvelope, CheckpointIdentity, CheckpointPosition, CheckpointRecord,
-    CheckpointRecoveryAssessment, CheckpointRecoveryDisposition, CheckpointRepository,
-    CheckpointRepositoryError, CheckpointUnitId, ExtractionResumePhase, ExtractionResumeState,
-    MAX_CHECKPOINT_ARTIFACTS, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_UNITS,
+    CHECKPOINT_ENVELOPE_FORMAT_VERSION, CheckpointEnvelope, CheckpointIdentity,
+    CheckpointPayloadKind, CheckpointRecord, CheckpointRepository, CheckpointRepositoryError,
+    MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_PAYLOAD_KIND_BYTES,
 };
 pub use erabi_db::repositories::{
     NewProgressEvent, ProgressAttemptId, ProgressEvent, ProgressEventId, ProgressKey,
@@ -937,10 +936,10 @@ impl JobRuntimeError {
                 | JobRepositoryError::RetryAlreadyContinued
                 | JobRepositoryError::QueueInvariant
                 | JobRepositoryError::Checkpoint(
-                    DbCheckpointRepositoryError::InvalidEnvelope
+                    DbCheckpointRepositoryError::UnsupportedFormatVersion
+                    | DbCheckpointRepositoryError::InvalidEnvelope
                     | DbCheckpointRepositoryError::PayloadTooLarge
                     | DbCheckpointRepositoryError::Malformed
-                    | DbCheckpointRepositoryError::Inconsistent
                     | DbCheckpointRepositoryError::Serialization
                     | DbCheckpointRepositoryError::NotFound,
                 ) => WorkerRuntimeDisposition::Fatal,
@@ -973,10 +972,10 @@ impl JobRuntimeError {
                     "LEASE_LOST"
                 }
                 JobRepositoryError::Checkpoint(
-                    DbCheckpointRepositoryError::InvalidEnvelope
+                    DbCheckpointRepositoryError::UnsupportedFormatVersion
+                    | DbCheckpointRepositoryError::InvalidEnvelope
                     | DbCheckpointRepositoryError::PayloadTooLarge
                     | DbCheckpointRepositoryError::Malformed
-                    | DbCheckpointRepositoryError::Inconsistent
                     | DbCheckpointRepositoryError::Serialization
                     | DbCheckpointRepositoryError::NotFound,
                 ) => "CHECKPOINT_RUNTIME_ERROR",
