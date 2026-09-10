@@ -18,6 +18,7 @@ The DX track is subordinate to the canonical product specifications. A DX packag
 - `CURRENT` — active package.
 - `NEXT` — recommended next package.
 - `OPEN` — accepted backlog, not yet started.
+- `PENDING` — future stage of a current staged effort, not yet started.
 - `MERGED` — completed and merged to `main`.
 
 ## Current DX sequence
@@ -32,6 +33,7 @@ The DX track is subordinate to the canonical product specifications. A DX packag
 | **DX-D03** | **MERGED** | **Establish the canonical pre-release checkpoint/recovery contract, naming, ownership, persistence format, and failure semantics before Plan 07.** |
 | **DX-D04** | **MERGED** | **Reconcile migration-number allocation drift before the next persistence-owning MVP plan.** |
 | DX-D05 | MERGED | Clarify Production orchestration ownership/extraction boundaries. |
+| Persistence simplification | CURRENT | Simplify internal embedded persistence and reduce developer/build footprint before resuming the next DX packages. |
 | DX-D06 | OPEN | Separate semantic traversal responsibilities from service orchestration where warranted. |
 | DX-D07 | OPEN | Improve crawler repository private module ownership without changing persistence semantics. |
 | DX-S01 | OPEN | Replace crawl-root string routing/classification with private typed routing. |
@@ -177,6 +179,47 @@ selector/normalization/validation work, database or API changes, and DX-D06 or
 DX-D07 cleanup. Exit evidence was focused and full verification plus
 independent review; the package is `MERGED` after accepted independent review
 and integration to `main`.
+
+---
+
+## Current engineering effort — Persistence simplification
+
+This current effort originated from dependency and build-footprint analysis:
+Turso provides substantially more capability and build weight than Erabi's
+current embedded local persistence needs require. The direction is to simplify
+the internal persistence dependency surface and reduce developer/build compile
+pressure while preserving existing persistence semantics:
+
+```text
+internal persistence: Turso → rusqlite → one Erabi-owned dedicated DB worker
+```
+
+This effort is sequenced before DX-D06, DX-D07, and the remaining Safe DX
+packages. Changing repository or service ownership while the persistence
+backend is also moving would make correctness review harder and create
+avoidable rework. It relates to the architecture-wave concerns around
+workspace dependency policy, compile/test performance, repository
+transaction boundaries, and crawler/database coupling.
+
+| Stage | Status | Scope and evidence |
+|---|---|---|
+| Stage 1 | MERGED | Bounded private `rusqlite` worker foundation in `erabi-db`; committed as [`843ffce1ef799518c884377ffbf1e20880045528`](https://github.com/wihlarkop/erabi/commit/843ffce1ef799518c884377ffbf1e20880045528). |
+| Stage 2 | PENDING | Production `erabi-db` persistence cutover. |
+| Stage 3 | PENDING | Test-support and fixture cutover. |
+| Stage 4 | PENDING | Runtime lifecycle and shutdown integration. |
+| Stage 5 | PENDING | Compatibility verification and canonical documentation reconciliation. |
+| Stage 6 | PENDING | Remove the obsolete internal Turso dependency where safe and perform final dependency/build-footprint A/B verification. |
+
+Stage 1 is only a private proof using an `Arc<tokio::sync::Semaphore>` for
+bounded admission, `std::sync::Mutex` plus `VecDeque`/`Condvar` coordination,
+one dedicated `std::thread`, and one worker-owned `rusqlite::Connection`. It is
+not wired into `ErabiDatabase`, repositories, migrations, or runtime shutdown;
+Turso still owns production persistence, and both dependencies intentionally
+coexist at this stage.
+
+No permanent DX package ID is introduced: the existing roadmap has no
+established ID for this staged persistence effort, so it is recorded as a
+descriptive current-work entry.
 
 ---
 
