@@ -214,7 +214,7 @@ Settings controls for inheritable values explicitly distinguish **Inherit**, **C
 ### Rust
 
 - domain unit tests;
-- persistence/integration tests against Turso;
+- persistence/integration tests against Erabi's SQLite persistence boundary;
 - migration tests;
 - API route/service tests;
 - durable job/recovery tests;

@@ -78,7 +78,7 @@ Queued runs do not adopt later setting changes.
 
 ## 3. Durable job orchestration
 
-The backend runs as a modular monolith with a durable Turso-backed job queue and Tokio workers.
+The backend runs as a modular monolith with a durable SQLite-backed job queue owned through `erabi-db` and Tokio workers.
 
 Initial job kinds include:
 

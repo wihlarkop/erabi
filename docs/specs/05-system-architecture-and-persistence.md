@@ -18,7 +18,7 @@ Rust / Axum modular monolith
 ├── export/backup/ops
 └── adapter interfaces
      │
-     ├── Turso persistence
+     ├── Erabi SQLite persistence adapter
      ├── local artifact filesystem
      └── Crawl4AI HTTP adapter
 ```
@@ -44,10 +44,10 @@ Rust / Axum modular monolith
 
 ### Database
 
-- official `turso` Rust crate;
-- local Turso database by default;
-- optional local-first Turso Cloud push/pull sync through the official `turso` sync capability;
-- direct remote-only application persistence is not required for 0.1 and remains adapter-compatible for a later official Turso remote SDK path;
+- Erabi-owned local SQLite database for internal application/domain persistence;
+- `rusqlite` as the Rust SQLite driver behind `erabi-db`;
+- one dedicated Erabi database worker owns the SQLite connection and database access remains behind `erabi-db` repository/transaction boundaries;
+- no direct raw database SDK usage outside `erabi-db`;
 - SQL migrations owned by Erabi.
 
 ### Crawler engine
@@ -69,7 +69,7 @@ Rules:
 - do not mix npm/pnpm/yarn lockfiles;
 - avoid alpha/beta/RC package versions and Git dependencies by default;
 - stable Rust, no nightly dependency unless a future spec explicitly permits it;
-- the official `turso` crate is an explicit product decision; backup, integrity-check, and recovery safeguards remain mandatory around persistence.
+- Erabi-owned local SQLite persistence through `rusqlite` is an explicit product decision; backup, integrity-check, and recovery safeguards remain mandatory around persistence.
 
 ## 4. Repository shape
 
@@ -191,11 +191,11 @@ Automatic backup before migration is configurable but OFF by default. Interactiv
 
 ### Secrets/bootstrap
 
-Secrets are read from OS environment variables and `.env` fallback. They are not stored in Turso.
+Secrets are read from OS environment variables and `.env` fallback. They are not stored in the internal application database.
 
 Examples:
 
-- Turso remote/sync token;
+- external Turso destination/export token;
 - external Crawl4AI API token;
 - non-loopback Erabi access token;
 - future provider secrets.
