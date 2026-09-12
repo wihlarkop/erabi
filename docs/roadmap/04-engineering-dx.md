@@ -204,18 +204,25 @@ transaction boundaries, and crawler/database coupling.
 | Stage | Status | Scope and evidence |
 |---|---|---|
 | Stage 1 | MERGED | Bounded private `rusqlite` worker foundation in `erabi-db`; committed as [`843ffce1ef799518c884377ffbf1e20880045528`](https://github.com/wihlarkop/erabi/commit/843ffce1ef799518c884377ffbf1e20880045528). |
-| Stage 2 | PENDING | Production `erabi-db` persistence cutover. |
-| Stage 3 | PENDING | Test-support and fixture cutover. |
+| Stage 2 | MERGED | Production `erabi-db` persistence cutover to the Erabi-owned `rusqlite` worker; committed as [`5cd5d002a48d366f13dfb80833246c94bfff7de9`](https://github.com/wihlarkop/erabi/commit/5cd5d002a48d366f13dfb80833246c94bfff7de9). |
+| Stage 3 | MERGED | Internal test-support and fixture cutover from Turso to `rusqlite`, preserving external Turso configuration vocabulary; committed as [`e2a05a48735032c6c0d03d4643fbe6a553616282`](https://github.com/wihlarkop/erabi/commit/e2a05a48735032c6c0d03d4643fbe6a553616282). |
 | Stage 4 | PENDING | Runtime lifecycle and shutdown integration. |
 | Stage 5 | PENDING | Compatibility verification and canonical documentation reconciliation. |
 | Stage 6 | PENDING | Remove the obsolete internal Turso dependency where safe and perform final dependency/build-footprint A/B verification. |
 
-Stage 1 is only a private proof using an `Arc<tokio::sync::Semaphore>` for
-bounded admission, `std::sync::Mutex` plus `VecDeque`/`Condvar` coordination,
-one dedicated `std::thread`, and one worker-owned `rusqlite::Connection`. It is
-not wired into `ErabiDatabase`, repositories, migrations, or runtime shutdown;
-Turso still owns production persistence, and both dependencies intentionally
-coexist at this stage.
+Stage 1 established the bounded private worker foundation using an
+`Arc<tokio::sync::Semaphore>` for bounded admission, `std::sync::Mutex` plus
+`VecDeque`/`Condvar` coordination, one dedicated `std::thread`, and one
+worker-owned `rusqlite::Connection`. Stage 2 wired production `erabi-db`,
+repositories, migrations, and integrity behavior to the Erabi-owned `rusqlite`
+worker. Stage 3 migrated transitional internal test fixtures and test
+dependencies from Turso to `rusqlite` while retaining external Turso
+configuration vocabulary as a distinct capability. Stage 4 owns runtime
+shutdown/join integration; Stage 5 owns broader compatibility and canonical
+documentation reconciliation; Stage 6 owns final dependency/build-footprint
+A/B verification. Stage 3 performed only persistence-required fixture and
+test-support migration; DX-S02 remains OPEN, and true private inline unit
+tests were not broadly reorganized.
 
 No permanent DX package ID is introduced: the existing roadmap has no
 established ID for this staged persistence effort, so it is recorded as a
