@@ -3,29 +3,29 @@ use std::{
     time::Duration,
 };
 
+use crate::{SqliteConnection as Connection, SqliteRow as Row, SqliteValue};
 use erabi_domain::{
     CanonicalizationPolicy, Crawler, CrawlerId, CrawlerVersion, CrawlerVersionGuardrails,
     CrawlerVersionId, CrawlerVersionState, DiscoveryTransition, DiscoveryTransitionId,
     DomainScopePolicy, OperationalOverrides, PageType, PageTypeId, UrlMatcher,
     VersionValidationContext, VersionValidationRegistry, VersionValidationReport, canonical_sha256,
 };
+use rusqlite::TransactionBehavior;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use turso::{Connection, Row, transaction::TransactionBehavior};
 use uuid::Uuid;
 
-use crate::{DbError, ErabiDatabase};
+use crate::{DatabaseFailure, DbError, ErabiDatabase};
 
 macro_rules! finish_transaction {
     ($transaction:expr, $result:expr) => {{
         match $result {
             Ok(value) => $transaction
                 .commit()
-                .await
                 .map_err(CrawlerRepositoryError::database)
                 .map(|()| value),
             Err(error) => {
-                let _ = $transaction.rollback().await;
+                let _ = $transaction.rollback();
                 Err(error)
             }
         }
@@ -105,6 +105,18 @@ pub enum CrawlerRepositoryError {
 impl CrawlerRepositoryError {
     fn database(error: impl Into<DbError>) -> Self {
         Self::Database(error.into())
+    }
+}
+
+impl From<DbError> for CrawlerRepositoryError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for CrawlerRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
     }
 }
 
@@ -200,81 +212,92 @@ impl<'database> CrawlerRepository<'database> {
 
     pub async fn create(&self, crawler: &Crawler) -> Result<(), DbError> {
         let defaults = serialize(crawler.operational_defaults())?;
-        let connection = self.database.connection().await?;
-        connection
-            .execute(
+        let id = crawler.id().to_string();
+        let name = crawler.name.clone();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                connection.execute(
                 "INSERT INTO crawlers (id, name, collection_id, operational_defaults_json, active_published_version_id, active_draft_version_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (
-                    crawler.id().to_string(),
-                    crawler.name.clone(),
-                    turso::Value::Null,
+                    id,
+                    name,
+                    SqliteValue::Null,
                     defaults,
-                    turso::Value::Null,
-                    turso::Value::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Null,
                 ),
-            )
-            .await?;
-        Ok(())
+                )
+                .map(|_| ())
+                .map_err(DbError::from)
+            })
+            .await
     }
 
     pub async fn list(&self) -> Result<Vec<Crawler>, CrawlerRepositoryError> {
-        let connection = self.database.connection().await.map_err(Self::database)?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
         let mut rows = connection
             .query(
                 "SELECT id, name, collection_id, operational_defaults_json, active_published_version_id, active_draft_version_id FROM crawlers ORDER BY name COLLATE BINARY, id",
                 (),
             )
-            .await
+
             .map_err(Self::database)?;
         let mut crawlers = Vec::new();
-        while let Some(row) = rows.next().await.map_err(Self::database)? {
-            let crawler = crawler_from_row(&row)?;
-            ensure_pointer_consistency(&connection, crawler.id()).await?;
+        while let Some(row) = rows.next().map_err(Self::database)? {
+            let crawler = crawler_from_row(row)?;
+            ensure_pointer_consistency(&connection, crawler.id())?;
             crawlers.push(crawler);
         }
         Ok(crawlers)
+        }).await
     }
 
     pub async fn get(&self, crawler_id: CrawlerId) -> Result<Crawler, CrawlerRepositoryError> {
-        let connection = self.database.connection().await.map_err(Self::database)?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
         let mut rows = connection
             .query(
                 "SELECT id, name, collection_id, operational_defaults_json, active_published_version_id, active_draft_version_id FROM crawlers WHERE id = ?1",
                 [crawler_id.to_string()],
             )
-            .await
+
             .map_err(Self::database)?;
-        let Some(row) = rows.next().await.map_err(Self::database)? else {
+        let Some(row) = rows.next().map_err(Self::database)? else {
             return Err(CrawlerRepositoryError::CrawlerNotFound);
         };
-        let crawler = crawler_from_row(&row)?;
-        ensure_pointer_consistency(&connection, crawler.id()).await?;
+        let crawler = crawler_from_row(row)?;
+        ensure_pointer_consistency(&connection, crawler.id())?;
         Ok(crawler)
+        }).await
     }
 
     pub async fn list_versions(
         &self,
         crawler_id: CrawlerId,
     ) -> Result<Vec<CrawlerVersionRecord>, CrawlerRepositoryError> {
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        ensure_crawler_exists(&connection, crawler_id).await?;
-        ensure_pointer_consistency(&connection, crawler_id).await?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
+        ensure_crawler_exists(&connection, crawler_id)?;
+        ensure_pointer_consistency(&connection, crawler_id)?;
         let mut rows = connection
             .query(
                 "SELECT id, crawler_id, state, semantic_configuration_json FROM crawler_versions WHERE crawler_id = ?1 ORDER BY id",
                 [crawler_id.to_string()],
             )
-            .await
+
             .map_err(Self::database)?;
         let mut versions = Vec::new();
-        while let Some(row) = rows.next().await.map_err(Self::database)? {
-            let version = version_from_row(&row)?;
-            validate_seed_projection(&connection, &version).await?;
-            load_transition_records(&connection, &version, true).await?;
-            let audit = audit_metadata(&connection, version.id()).await?;
+        while let Some(row) = rows.next().map_err(Self::database)? {
+            let version = version_from_row(row)?;
+            validate_seed_projection(&connection, &version)?;
+            load_transition_records(&connection, &version, true)?;
+            let audit = audit_metadata(&connection, version.id())?;
             versions.push(CrawlerVersionRecord { version, audit });
         }
         Ok(versions)
+        }).await
     }
 
     pub async fn version(
@@ -282,27 +305,29 @@ impl<'database> CrawlerRepository<'database> {
         crawler_id: CrawlerId,
         version_id: CrawlerVersionId,
     ) -> Result<CrawlerVersionRecord, CrawlerRepositoryError> {
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        ensure_crawler_exists(&connection, crawler_id).await?;
-        ensure_pointer_consistency(&connection, crawler_id).await?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
+        ensure_crawler_exists(&connection, crawler_id)?;
+        ensure_pointer_consistency(&connection, crawler_id)?;
         let mut rows = connection
             .query(
                 "SELECT id, crawler_id, state, semantic_configuration_json FROM crawler_versions WHERE id = ?1",
                 [version_id.to_string()],
             )
-            .await
+
             .map_err(Self::database)?;
-        let Some(row) = rows.next().await.map_err(Self::database)? else {
+        let Some(row) = rows.next().map_err(Self::database)? else {
             return Err(CrawlerRepositoryError::CrawlerVersionNotFound);
         };
-        let version = version_from_row(&row)?;
+        let version = version_from_row(row)?;
         if version.crawler_id() != crawler_id {
             return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
         }
-        validate_seed_projection(&connection, &version).await?;
-        load_transition_records(&connection, &version, true).await?;
-        let audit = audit_metadata(&connection, version.id()).await?;
+        validate_seed_projection(&connection, &version)?;
+        load_transition_records(&connection, &version, true)?;
+        let audit = audit_metadata(&connection, version.id())?;
         Ok(CrawlerVersionRecord { version, audit })
+        }).await
     }
 
     pub async fn create_draft(
@@ -313,30 +338,37 @@ impl<'database> CrawlerRepository<'database> {
     ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
         let version = CrawlerVersion::draft(crawler_id);
         for attempt in 0..LIFECYCLE_CONTENTION_ATTEMPTS {
-            let mut connection = self.database.connection().await.map_err(Self::database)?;
-            let result = match connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .await
-            {
-                Ok(transaction) => {
-                    let result = insert_draft_in_transaction(
-                        &transaction,
-                        &version,
-                        None,
-                        actor,
-                        occurred_at,
-                    )
-                    .await;
-                    finish_transaction!(transaction, result)
-                }
-                Err(error) => Err(CrawlerRepositoryError::database(error)),
-            };
+            let actor = actor.to_owned();
+            let occurred_at = occurred_at.to_owned();
+            let version_for_attempt = version.clone();
+            let result = self
+                .database
+                .call(move |raw| {
+                    let mut connection = Connection::new(raw);
+                    match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                        Ok(transaction) => {
+                            let result = insert_draft_in_transaction(
+                                &transaction,
+                                &version_for_attempt,
+                                None,
+                                &actor,
+                                &occurred_at,
+                            );
+                            finish_transaction!(transaction, result)
+                        }
+                        Err(error) => Err(CrawlerRepositoryError::database(error)),
+                    }
+                })
+                .await;
             match result {
                 Ok(()) => return Ok(version),
-                Err(CrawlerRepositoryError::Database(DbError::Turso(error)))
-                    if is_lifecycle_contention(&error) =>
+                Err(CrawlerRepositoryError::Database(DbError::Database(failure)))
+                    if matches!(
+                        failure,
+                        DatabaseFailure::Busy | DatabaseFailure::BusySnapshot
+                    ) =>
                 {
-                    self.retry_lifecycle_contention(crawler_id, attempt, error)
+                    self.retry_lifecycle_contention(crawler_id, attempt, failure)
                         .await?;
                 }
                 Err(error) => return Err(error),
@@ -353,30 +385,36 @@ impl<'database> CrawlerRepository<'database> {
         occurred_at: &str,
     ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
         for attempt in 0..LIFECYCLE_CONTENTION_ATTEMPTS {
-            let mut connection = self.database.connection().await.map_err(Self::database)?;
-            let result = match connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .await
-            {
-                Ok(transaction) => {
-                    let result = clone_draft_in_transaction(
-                        &transaction,
-                        crawler_id,
-                        source_version_id,
-                        actor,
-                        occurred_at,
-                    )
-                    .await;
-                    finish_transaction!(transaction, result)
-                }
-                Err(error) => Err(CrawlerRepositoryError::database(error)),
-            };
+            let actor = actor.to_owned();
+            let occurred_at = occurred_at.to_owned();
+            let result = self
+                .database
+                .call(move |raw| {
+                    let mut connection = Connection::new(raw);
+                    match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                        Ok(transaction) => {
+                            let result = clone_draft_in_transaction(
+                                &transaction,
+                                crawler_id,
+                                source_version_id,
+                                &actor,
+                                &occurred_at,
+                            );
+                            finish_transaction!(transaction, result)
+                        }
+                        Err(error) => Err(CrawlerRepositoryError::database(error)),
+                    }
+                })
+                .await;
             match result {
                 Ok(version) => return Ok(version),
-                Err(CrawlerRepositoryError::Database(DbError::Turso(error)))
-                    if is_lifecycle_contention(&error) =>
+                Err(CrawlerRepositoryError::Database(DbError::Database(failure)))
+                    if matches!(
+                        failure,
+                        DatabaseFailure::Busy | DatabaseFailure::BusySnapshot
+                    ) =>
                 {
-                    self.retry_lifecycle_contention(crawler_id, attempt, error)
+                    self.retry_lifecycle_contention(crawler_id, attempt, failure)
                         .await?;
                 }
                 Err(error) => return Err(error),
@@ -397,15 +435,20 @@ impl<'database> CrawlerRepository<'database> {
                 // callers that use `save_draft` directly. The typed authoring
                 // APIs above reject this case before attempting a write.
                 let configuration = serialize(version)?;
-                let connection = self.database.connection().await?;
-                connection
-                    .execute(
+                let id = version.id().to_string();
+                let crawler_id = version.crawler_id().to_string();
+                self.database
+                    .call(move |raw| {
+                    let connection = Connection::new(raw);
+                    connection.execute(
                         "INSERT INTO crawler_versions (id, crawler_id, state, semantic_configuration_json) VALUES (?1, ?2, 'DRAFT', ?3)",
-                        (version.id().to_string(), version.crawler_id().to_string(), configuration),
+                        (id, crawler_id, configuration),
                     )
-                    .await
+
                     .map(|_| ())
                     .map_err(DbError::from)
+                    })
+                    .await
             }
             result => result.map_err(repository_error_as_db),
         }
@@ -424,20 +467,25 @@ impl<'database> CrawlerRepository<'database> {
             .validate_semantic_contract()
             .map_err(|error| map_semantic_error(error.code))?;
         let configuration = serialize(version).map_err(CrawlerRepositoryError::database)?;
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let version = version.clone();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = save_draft_in_transaction(
+                    &transaction,
+                    &version,
+                    configuration.as_str(),
+                    &actor,
+                    &occurred_at,
+                );
+                finish_transaction!(transaction, result)
+            })
             .await
-            .map_err(Self::database)?;
-        let result = save_draft_in_transaction(
-            &transaction,
-            version,
-            configuration.as_str(),
-            actor,
-            occurred_at,
-        )
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     pub async fn publish(
@@ -447,21 +495,26 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<CrawlerVersionRecord, CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        let registry = self.database.version_validation_registry().clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = publish_in_transaction(
+                    &transaction,
+                    crawler_id,
+                    version_id,
+                    &actor,
+                    &occurred_at,
+                    &registry,
+                );
+                finish_transaction!(transaction, result)
+            })
             .await
-            .map_err(Self::database)?;
-        let result = publish_in_transaction(
-            &transaction,
-            crawler_id,
-            version_id,
-            actor,
-            occurred_at,
-            self.database.version_validation_registry(),
-        )
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     /// Runs the configured publication registry against one immutable Draft
@@ -472,29 +525,31 @@ impl<'database> CrawlerRepository<'database> {
         crawler_id: CrawlerId,
         version_id: CrawlerVersionId,
     ) -> Result<VersionValidationReport, CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
+        let registry = self.database.version_validation_registry().clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(Self::database)?;
+                let result = publication_validation_in_transaction(
+                    &transaction,
+                    crawler_id,
+                    version_id,
+                    &registry,
+                );
+                match result {
+                    Ok(report) => transaction
+                        .commit()
+                        .map_err(Self::database)
+                        .map(|()| report),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(Self::database)?;
-        let result = publication_validation_in_transaction(
-            &transaction,
-            crawler_id,
-            version_id,
-            self.database.version_validation_registry(),
-        )
-        .await;
-        match result {
-            Ok(report) => transaction
-                .commit()
-                .await
-                .map_err(Self::database)
-                .map(|()| report),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     pub async fn publish_and_activate(
@@ -523,15 +578,24 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<(), CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = reactivate_in_transaction(
+                    &transaction,
+                    crawler_id,
+                    version_id,
+                    &actor,
+                    &occurred_at,
+                );
+                finish_transaction!(transaction, result)
+            })
             .await
-            .map_err(Self::database)?;
-        let result =
-            reactivate_in_transaction(&transaction, crawler_id, version_id, actor, occurred_at)
-                .await;
-        finish_transaction!(transaction, result)
     }
 
     pub async fn reactivate_published(
@@ -553,28 +617,34 @@ impl<'database> CrawlerRepository<'database> {
     }
 
     pub async fn pointers(&self, crawler: &Crawler) -> Result<CrawlerPointers, DbError> {
-        let connection = self.database.connection().await?;
+        let crawler_id = crawler.id().to_string();
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
         let row = connection
             .prepare(
                 "SELECT active_published_version_id, active_draft_version_id FROM crawlers WHERE id = ?1",
             )
-            .await?
-            .query_row([crawler.id().to_string()])
-            .await?;
+            ?
+            .query_row([crawler_id])
+            ?;
         Ok(CrawlerPointers {
             active_published_version_id: row.get(0)?,
             active_draft_version_id: row.get(1)?,
         })
+        }).await
     }
 
     pub async fn audit_event_count(&self, entity_id: &str) -> Result<i64, DbError> {
-        let connection = self.database.connection().await?;
-        let row = connection
-            .prepare("SELECT COUNT(*) FROM audit_events WHERE entity_id = ?1")
-            .await?
-            .query_row([entity_id])
-            .await?;
-        Ok(row.get(0)?)
+        let entity_id = entity_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let row = connection
+                    .prepare("SELECT COUNT(*) FROM audit_events WHERE entity_id = ?1")?
+                    .query_row([entity_id])?;
+                Ok(row.get(0)?)
+            })
+            .await
     }
 
     pub async fn configuration_hash(
@@ -582,9 +652,20 @@ impl<'database> CrawlerRepository<'database> {
         crawler_id: CrawlerId,
         version_id: CrawlerVersionId,
     ) -> Result<String, CrawlerRepositoryError> {
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        let record = self.version(crawler_id, version_id).await?;
-        semantic_hash(&connection, &record.version).await
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                ensure_crawler_exists(&connection, crawler_id)?;
+                ensure_pointer_consistency(&connection, crawler_id)?;
+                let version = load_version(&connection, version_id)?;
+                if version.crawler_id() != crawler_id {
+                    return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
+                }
+                validate_seed_projection(&connection, &version)?;
+                load_transition_records(&connection, &version, true)?;
+                semantic_hash(&connection, &version)
+            })
+            .await
     }
 
     /// Captures all mutable semantic inputs needed by Test Lab from one
@@ -596,29 +677,30 @@ impl<'database> CrawlerRepository<'database> {
         draft_version_id: CrawlerVersionId,
         include_published: bool,
     ) -> Result<CrawlerEvaluationSnapshot, CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(Self::database)?;
+                let result = evaluation_snapshot_in_transaction(
+                    &transaction,
+                    crawler_id,
+                    draft_version_id,
+                    include_published,
+                );
+                match result {
+                    Ok(snapshot) => transaction
+                        .commit()
+                        .map_err(Self::database)
+                        .map(|()| snapshot),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(Self::database)?;
-        let result = evaluation_snapshot_in_transaction(
-            &transaction,
-            crawler_id,
-            draft_version_id,
-            include_published,
-        )
-        .await;
-        match result {
-            Ok(snapshot) => transaction
-                .commit()
-                .await
-                .map_err(Self::database)
-                .map(|()| snapshot),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Captures one exact Published `CrawlerVersion` and all of its semantic
@@ -634,22 +716,24 @@ impl<'database> CrawlerRepository<'database> {
         crawler_id: CrawlerId,
         version_id: CrawlerVersionId,
     ) -> Result<CrawlerSemanticSnapshot, CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    ensure_crawler_exists(&transaction, crawler_id)?;
+                    ensure_pointer_consistency(&transaction, crawler_id)?;
+                    let snapshot = load_semantic_snapshot(&transaction, crawler_id, version_id)?;
+                    if snapshot.version.state() != CrawlerVersionState::Published {
+                        return Err(CrawlerRepositoryError::VersionNotPublished);
+                    }
+                    Ok(snapshot)
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await
-            .map_err(Self::database)?;
-        let result = async {
-            ensure_crawler_exists(&transaction, crawler_id).await?;
-            ensure_pointer_consistency(&transaction, crawler_id).await?;
-            let snapshot = load_semantic_snapshot(&transaction, crawler_id, version_id).await?;
-            if snapshot.version.state() != CrawlerVersionState::Published {
-                return Err(CrawlerRepositoryError::VersionNotPublished);
-            }
-            Ok(snapshot)
-        }
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     /// Reads the selected version's typed canonicalization policy.
@@ -678,6 +762,7 @@ impl<'database> CrawlerRepository<'database> {
         policy
             .validate()
             .map_err(|_| CrawlerRepositoryError::InvalidCanonicalizationPolicy)?;
+        let policy = policy.clone();
         let updated = self
             .update_semantic_version(
                 crawler_id,
@@ -688,7 +773,7 @@ impl<'database> CrawlerRepository<'database> {
                 "canonicalization",
                 |version| {
                     version
-                        .set_canonicalization_policy(policy.clone())
+                        .set_canonicalization_policy(policy)
                         .map_err(|error| map_semantic_error(error.code))
                 },
             )
@@ -722,6 +807,7 @@ impl<'database> CrawlerRepository<'database> {
         policy
             .validate()
             .map_err(|_| CrawlerRepositoryError::InvalidDomainScope)?;
+        let policy = policy.clone();
         let updated = self
             .update_semantic_version(
                 crawler_id,
@@ -732,7 +818,7 @@ impl<'database> CrawlerRepository<'database> {
                 "domain_scope",
                 |version| {
                     version
-                        .set_domain_scope(policy.clone())
+                        .set_domain_scope(policy)
                         .map_err(|error| map_semantic_error(error.code))
                 },
             )
@@ -766,6 +852,7 @@ impl<'database> CrawlerRepository<'database> {
         guardrails
             .validate()
             .map_err(|error| map_semantic_error(error.code))?;
+        let guardrails = guardrails.clone();
         let updated = self
             .update_semantic_version(
                 crawler_id,
@@ -776,7 +863,7 @@ impl<'database> CrawlerRepository<'database> {
                 "guardrails",
                 |version| {
                     version
-                        .set_guardrails(guardrails.clone())
+                        .set_guardrails(guardrails)
                         .map_err(|error| map_semantic_error(error.code))
                 },
             )
@@ -796,36 +883,42 @@ impl<'database> CrawlerRepository<'database> {
         update: F,
     ) -> Result<CrawlerVersion, CrawlerRepositoryError>
     where
-        F: FnOnce(&mut CrawlerVersion) -> Result<(), CrawlerRepositoryError>,
+        F: FnOnce(&mut CrawlerVersion) -> Result<(), CrawlerRepositoryError> + Send + 'static,
     {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        let event_type = event_type.to_owned();
+        let entity_id = entity_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let mut version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    update(&mut version)?;
+                    version
+                        .validate_semantic_contract()
+                        .map_err(|error| map_semantic_error(error.code))?;
+                    let configuration =
+                        serialize(&version).map_err(CrawlerRepositoryError::database)?;
+                    update_version_configuration(&transaction, &version, &configuration)?;
+                    let hash = semantic_hash(&transaction, &version)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        event_type.as_str(),
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        entity_id.as_str(),
+                        hash.as_str(),
+                    )?;
+                    Ok::<CrawlerVersion, CrawlerRepositoryError>(version)
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await
-            .map_err(Self::database)?;
-        let result = async {
-            let mut version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            update(&mut version)?;
-            version
-                .validate_semantic_contract()
-                .map_err(|error| map_semantic_error(error.code))?;
-            let configuration = serialize(&version).map_err(CrawlerRepositoryError::database)?;
-            update_version_configuration(&transaction, &version, &configuration).await?;
-            let hash = semantic_hash(&transaction, &version).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                event_type,
-                actor,
-                occurred_at,
-                version_id,
-                entity_id,
-                hash.as_str(),
-            )
-            .await?;
-            Ok::<CrawlerVersion, CrawlerRepositoryError>(version)
-        }
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     /// Lists typed transitions in deterministic presentation order.
@@ -835,8 +928,12 @@ impl<'database> CrawlerRepository<'database> {
         version_id: CrawlerVersionId,
     ) -> Result<Vec<DiscoveryTransitionRecord>, CrawlerRepositoryError> {
         let version = self.version(crawler_id, version_id).await?;
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        load_transition_records(&connection, &version.version, true).await
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                load_transition_records(&connection, &version.version, true)
+            })
+            .await
     }
 
     /// Reads one typed transition while validating version ownership.
@@ -855,8 +952,12 @@ impl<'database> CrawlerRepository<'database> {
         {
             return Ok(record);
         }
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        ensure_transition_belongs_to_version(&connection, version_id, transition_id).await?;
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                ensure_transition_belongs_to_version(&connection, version_id, transition_id)
+            })
+            .await?;
         Err(CrawlerRepositoryError::CorruptState)
     }
 
@@ -872,71 +973,73 @@ impl<'database> CrawlerRepository<'database> {
         transition
             .validate()
             .map_err(|_| CrawlerRepositoryError::InvalidDiscoveryTransition)?;
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_transition_page_type(
-                &transaction,
-                version_id,
-                transition.source_page_type_id,
-                true,
-            )
+        let transition_id = transition.id;
+        let transition = transition.clone();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_transition_page_type(
+                        &transaction,
+                        version_id,
+                        transition.source_page_type_id,
+                        true,
+                    )?;
+                    ensure_transition_page_type(
+                        &transaction,
+                        version_id,
+                        transition.target_page_type_id,
+                        false,
+                    )?;
+                    if transition_row_exists(&transaction, transition.id)? {
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    let mut updated = version.clone();
+                    let mut ids = updated.transition_ids().to_vec();
+                    if ids.contains(&transition.id) {
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    ids.push(transition.id);
+                    updated
+                        .set_transition_ids(ids)
+                        .map_err(|error| map_semantic_error(error.code))?;
+                    let version_configuration =
+                        serialize(&updated).map_err(CrawlerRepositoryError::database)?;
+                    let transition_configuration =
+                        serialize(&transition).map_err(CrawlerRepositoryError::database)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                            (
+                                transition.id.to_string(),
+                                version_id.to_string(),
+                                transition_configuration,
+                            ),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    update_version_configuration(&transaction, &updated, &version_configuration)?;
+                    let hash = semantic_hash(&transaction, &updated)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "DISCOVERY_TRANSITION_CREATED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        transition.id.to_string().as_str(),
+                        hash.as_str(),
+                    )?;
+                    Ok::<(), CrawlerRepositoryError>(())
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await?;
-            ensure_transition_page_type(
-                &transaction,
-                version_id,
-                transition.target_page_type_id,
-                false,
-            )
-            .await?;
-            if transition_row_exists(&transaction, transition.id).await? {
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            let mut updated = version.clone();
-            let mut ids = updated.transition_ids().to_vec();
-            if ids.contains(&transition.id) {
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            ids.push(transition.id);
-            updated
-                .set_transition_ids(ids)
-                .map_err(|error| map_semantic_error(error.code))?;
-            let version_configuration =
-                serialize(&updated).map_err(CrawlerRepositoryError::database)?;
-            let transition_configuration = serialize(transition)
-                .map_err(CrawlerRepositoryError::database)?;
-            transaction
-                .execute(
-                    "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
-                    (
-                        transition.id.to_string(),
-                        version_id.to_string(),
-                        transition_configuration,
-                    ),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            update_version_configuration(&transaction, &updated, &version_configuration).await?;
-            let hash = semantic_hash(&transaction, &updated).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "DISCOVERY_TRANSITION_CREATED",
-                actor,
-                occurred_at,
-                version_id,
-                transition.id.to_string().as_str(),
-                hash.as_str(),
-            )
-            .await?;
-            Ok::<(), CrawlerRepositoryError>(())
-        }
-        .await;
-        finish_transaction!(transaction, result)?;
-        self.discovery_transition(crawler_id, version_id, transition.id)
+        self.discovery_transition(crawler_id, version_id, transition_id)
             .await
     }
 
@@ -958,56 +1061,58 @@ impl<'database> CrawlerRepository<'database> {
             .map_err(|_| CrawlerRepositoryError::InvalidDiscoveryTransition)?;
         let transition_configuration =
             serialize(transition).map_err(CrawlerRepositoryError::database)?;
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_transition_belongs_to_version(&transaction, version_id, transition_id).await?;
-            ensure_transition_page_type(
-                &transaction,
-                version_id,
-                transition.source_page_type_id,
-                true,
-            )
+        let source_page_type_id = transition.source_page_type_id;
+        let target_page_type_id = transition.target_page_type_id;
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_transition_belongs_to_version(&transaction, version_id, transition_id)?;
+                    ensure_transition_page_type(
+                        &transaction,
+                        version_id,
+                        source_page_type_id,
+                        true,
+                    )?;
+                    ensure_transition_page_type(
+                        &transaction,
+                        version_id,
+                        target_page_type_id,
+                        false,
+                    )?;
+                    let updated = transaction
+                        .execute(
+                            "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2 AND crawler_version_id = ?3",
+                            (
+                                transition_configuration.as_str(),
+                                transition_id.to_string(),
+                                version_id.to_string(),
+                            ),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    if updated != 1 {
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    let hash = semantic_hash(&transaction, &version)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "DISCOVERY_TRANSITION_UPDATED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        transition_id.to_string().as_str(),
+                        hash.as_str(),
+                    )
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await?;
-            ensure_transition_page_type(
-                &transaction,
-                version_id,
-                transition.target_page_type_id,
-                false,
-            )
-            .await?;
-            let updated = transaction
-                .execute(
-                    "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2 AND crawler_version_id = ?3",
-                    (
-                        transition_configuration.as_str(),
-                        transition_id.to_string(),
-                        version_id.to_string(),
-                    ),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            if updated != 1 {
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            let hash = semantic_hash(&transaction, &version).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "DISCOVERY_TRANSITION_UPDATED",
-                actor,
-                occurred_at,
-                version_id,
-                transition_id.to_string().as_str(),
-                hash.as_str(),
-            )
-            .await
-        }
-        .await;
-        finish_transaction!(transaction, result)?;
         self.discovery_transition(crawler_id, version_id, transition_id)
             .await
     }
@@ -1021,52 +1126,54 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<(), CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_transition_belongs_to_version(&transaction, version_id, transition_id).await?;
-            let mut updated = version.clone();
-            updated
-                .set_transition_ids(
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_transition_belongs_to_version(&transaction, version_id, transition_id)?;
+                    let mut updated = version.clone();
                     updated
-                        .transition_ids()
-                        .iter()
-                        .copied()
-                        .filter(|id| *id != transition_id)
-                        .collect(),
-                )
-                .map_err(|error| map_semantic_error(error.code))?;
-            let version_configuration =
-                serialize(&updated).map_err(CrawlerRepositoryError::database)?;
-            let deleted = transaction
-                .execute(
-                    "DELETE FROM discovery_transitions WHERE id = ?1 AND crawler_version_id = ?2",
-                    (transition_id.to_string(), version_id.to_string()),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            if deleted != 1 {
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            update_version_configuration(&transaction, &updated, &version_configuration).await?;
-            let hash = semantic_hash(&transaction, &updated).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "DISCOVERY_TRANSITION_DELETED",
-                actor,
-                occurred_at,
-                version_id,
-                transition_id.to_string().as_str(),
-                hash.as_str(),
-            )
+                        .set_transition_ids(
+                            updated
+                                .transition_ids()
+                                .iter()
+                                .copied()
+                                .filter(|id| *id != transition_id)
+                                .collect(),
+                        )
+                        .map_err(|error| map_semantic_error(error.code))?;
+                    let version_configuration =
+                        serialize(&updated).map_err(CrawlerRepositoryError::database)?;
+                    let deleted = transaction
+                        .execute(
+                            "DELETE FROM discovery_transitions WHERE id = ?1 AND crawler_version_id = ?2",
+                            (transition_id.to_string(), version_id.to_string()),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    if deleted != 1 {
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    update_version_configuration(&transaction, &updated, &version_configuration)?;
+                    let hash = semantic_hash(&transaction, &updated)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "DISCOVERY_TRANSITION_DELETED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        transition_id.to_string().as_str(),
+                        hash.as_str(),
+                    )
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await
-        }
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     /// Lists Page Types in deterministic presentation order for a selected
@@ -1078,8 +1185,12 @@ impl<'database> CrawlerRepository<'database> {
         version_id: CrawlerVersionId,
     ) -> Result<Vec<PageTypeRecord>, CrawlerRepositoryError> {
         let version = self.version(crawler_id, version_id).await?;
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        load_page_type_records(&connection, &version.version).await
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                load_page_type_records(&connection, &version.version)
+            })
+            .await
     }
 
     /// Reads one Page Type while validating its version ownership.
@@ -1090,13 +1201,16 @@ impl<'database> CrawlerRepository<'database> {
         page_type_id: PageTypeId,
     ) -> Result<PageTypeRecord, CrawlerRepositoryError> {
         let version = self.version(crawler_id, version_id).await?;
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        ensure_page_type_belongs_to_version(&connection, version_id, page_type_id).await?;
-        load_page_type_records(&connection, &version.version)
-            .await?
-            .into_iter()
-            .find(|page_type| page_type.id == page_type_id)
-            .ok_or(CrawlerRepositoryError::CorruptState)
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                ensure_page_type_belongs_to_version(&connection, version_id, page_type_id)?;
+                load_page_type_records(&connection, &version.version)?
+                    .into_iter()
+                    .find(|page_type| page_type.id == page_type_id)
+                    .ok_or(CrawlerRepositoryError::CorruptState)
+            })
+            .await
     }
 
     /// Creates a Page Type and updates the version's declared Page Type IDs
@@ -1111,50 +1225,53 @@ impl<'database> CrawlerRepository<'database> {
         occurred_at: &str,
     ) -> Result<PageTypeRecord, CrawlerRepositoryError> {
         let page_type_id = PageTypeId::new();
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            let mut updated = version.clone();
-            let mut ids = updated.page_type_ids().to_vec();
-            ids.push(page_type_id);
-            updated
-                .set_page_type_ids(ids)
-                .map_err(|error| map_semantic_error(error.code))?;
-            let configuration =
-                serialize(&updated).map_err(CrawlerRepositoryError::database)?;
-            transaction
-                .execute(
-                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (
-                        page_type_id.to_string(),
-                        version_id.to_string(),
-                        name,
-                        i64::from(priority),
-                        "{}",
-                    ),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            update_version_configuration(&transaction, &updated, &configuration).await?;
-            let hash = semantic_hash(&transaction, &updated).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "PAGE_TYPE_CREATED",
-                actor,
-                occurred_at,
-                version_id,
-                page_type_id.to_string().as_str(),
-                hash.as_str(),
-            )
+        let name = name.to_owned();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    let mut updated = version.clone();
+                    let mut ids = updated.page_type_ids().to_vec();
+                    ids.push(page_type_id);
+                    updated
+                        .set_page_type_ids(ids)
+                        .map_err(|error| map_semantic_error(error.code))?;
+                    let configuration =
+                        serialize(&updated).map_err(CrawlerRepositoryError::database)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            (
+                                page_type_id.to_string(),
+                                version_id.to_string(),
+                                name.as_str(),
+                                i64::from(priority),
+                                "{}",
+                            ),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    update_version_configuration(&transaction, &updated, &configuration)?;
+                    let hash = semantic_hash(&transaction, &updated)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "PAGE_TYPE_CREATED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        page_type_id.to_string().as_str(),
+                        hash.as_str(),
+                    )?;
+                    Ok::<(), CrawlerRepositoryError>(())
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await?;
-            Ok::<(), CrawlerRepositoryError>(())
-        }
-        .await;
-        finish_transaction!(transaction, result)?;
         self.page_type(crawler_id, version_id, page_type_id).await
     }
 
@@ -1171,38 +1288,41 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<PageTypeRecord, CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id).await?;
-            let updated = transaction
-                .execute(
-                    "UPDATE page_types SET name = ?1, priority = ?2 WHERE id = ?3 AND crawler_version_id = ?4",
-                    (name, i64::from(priority), page_type_id.to_string(), version_id.to_string()),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            if updated != 1 {
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            let hash = semantic_hash(&transaction, &version).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "PAGE_TYPE_UPDATED",
-                actor,
-                occurred_at,
-                version_id,
-                page_type_id.to_string().as_str(),
-                hash.as_str(),
-            )
-            .await
-        }
-        .await;
-        finish_transaction!(transaction, result)?;
+        let name = name.to_owned();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id)?;
+                    let updated = transaction
+                        .execute(
+                            "UPDATE page_types SET name = ?1, priority = ?2 WHERE id = ?3 AND crawler_version_id = ?4",
+                            (name.as_str(), i64::from(priority), page_type_id.to_string(), version_id.to_string()),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    if updated != 1 {
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    let hash = semantic_hash(&transaction, &version)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "PAGE_TYPE_UPDATED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        page_type_id.to_string().as_str(),
+                        hash.as_str(),
+                    )
+                })();
+                finish_transaction!(transaction, result)
+            })
+            .await?;
         self.page_type(crawler_id, version_id, page_type_id).await
     }
 
@@ -1216,67 +1336,69 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<(), CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id).await?;
-            if page_type_is_in_use(&transaction, &version, page_type_id).await? {
-                return Err(CrawlerRepositoryError::PageTypeInUse);
-            }
-            let mut updated = version.clone();
-            updated
-                .set_page_type_ids(
-                    updated
-                        .page_type_ids()
-                        .iter()
-                        .copied()
-                        .filter(|id| *id != page_type_id)
-                        .collect(),
-                )
-                .map_err(|error| {
-                    if error.code == erabi_domain::ErrorCode::InvalidPageTypeBudget {
-                        CrawlerRepositoryError::PageTypeInUse
-                    } else {
-                        map_semantic_error(error.code)
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id)?;
+                    if page_type_is_in_use(&transaction, &version, page_type_id)? {
+                        return Err(CrawlerRepositoryError::PageTypeInUse);
                     }
-                })?;
-            let configuration = serialize(&updated).map_err(CrawlerRepositoryError::database)?;
-            transaction
-                .execute(
-                    "DELETE FROM url_matchers WHERE page_type_id = ?1",
-                    [page_type_id.to_string()],
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            let deleted = transaction
-                .execute(
-                    "DELETE FROM page_types WHERE id = ?1 AND crawler_version_id = ?2",
-                    (page_type_id.to_string(), version_id.to_string()),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            if deleted != 1 {
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            update_version_configuration(&transaction, &updated, &configuration).await?;
-            let hash = semantic_hash(&transaction, &updated).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "PAGE_TYPE_DELETED",
-                actor,
-                occurred_at,
-                version_id,
-                page_type_id.to_string().as_str(),
-                hash.as_str(),
-            )
+                    let mut updated = version.clone();
+                    updated
+                        .set_page_type_ids(
+                            updated
+                                .page_type_ids()
+                                .iter()
+                                .copied()
+                                .filter(|id| *id != page_type_id)
+                                .collect(),
+                        )
+                        .map_err(|error| {
+                            if error.code == erabi_domain::ErrorCode::InvalidPageTypeBudget {
+                                CrawlerRepositoryError::PageTypeInUse
+                            } else {
+                                map_semantic_error(error.code)
+                            }
+                        })?;
+                    let configuration =
+                        serialize(&updated).map_err(CrawlerRepositoryError::database)?;
+                    transaction
+                        .execute(
+                            "DELETE FROM url_matchers WHERE page_type_id = ?1",
+                            [page_type_id.to_string()],
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    let deleted = transaction
+                        .execute(
+                            "DELETE FROM page_types WHERE id = ?1 AND crawler_version_id = ?2",
+                            (page_type_id.to_string(), version_id.to_string()),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    if deleted != 1 {
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    update_version_configuration(&transaction, &updated, &configuration)?;
+                    let hash = semantic_hash(&transaction, &updated)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "PAGE_TYPE_DELETED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        page_type_id.to_string().as_str(),
+                        hash.as_str(),
+                    )
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await
-        }
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     /// Lists URL matchers in deterministic authoring order.
@@ -1308,18 +1430,24 @@ impl<'database> CrawlerRepository<'database> {
         {
             return Ok(matcher);
         }
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        let mut rows = connection
-            .query(
-                "SELECT page_type_id FROM url_matchers WHERE id = ?1",
-                [matcher_id],
-            )
-            .await
-            .map_err(Self::database)?;
-        let Some(row) = rows.next().await.map_err(Self::database)? else {
-            return Err(CrawlerRepositoryError::UrlMatcherNotFound);
-        };
-        let owner: String = row.get(0).map_err(Self::database)?;
+        let matcher_id = matcher_id.to_owned();
+        let owner = self
+            .database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut rows = connection
+                    .query(
+                        "SELECT page_type_id FROM url_matchers WHERE id = ?1",
+                        [matcher_id.as_str()],
+                    )
+                    .map_err(Self::database)?;
+                let Some(row) = rows.next().map_err(Self::database)? else {
+                    return Err(CrawlerRepositoryError::UrlMatcherNotFound);
+                };
+                let owner: String = row.get(0).map_err(Self::database)?;
+                Ok(owner)
+            })
+            .await?;
         if owner != page_type_id.to_string() {
             return Err(CrawlerRepositoryError::UrlMatcherNotOwnedByPageType);
         }
@@ -1344,53 +1472,59 @@ impl<'database> CrawlerRepository<'database> {
         let matcher_json = serde_json::to_string(matcher).map_err(|error| {
             CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
         })?;
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id).await?;
-            let row = transaction
-                .prepare(
-                    "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM url_matchers WHERE page_type_id = ?1",
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?
-                .query_row([page_type_id.to_string()])
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            let ordinal: i64 = row.get(0).map_err(CrawlerRepositoryError::database)?;
-            transaction
-                .execute(
-                    "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
-                    (
+        let result_matcher_id = matcher_id.clone();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id)?;
+                    let row = transaction
+                        .prepare(
+                            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM url_matchers WHERE page_type_id = ?1",
+                        )
+                        .map_err(CrawlerRepositoryError::database)?
+                        .query_row([page_type_id.to_string()])
+                        .map_err(CrawlerRepositoryError::database)?;
+                    let ordinal: i64 = row.get(0).map_err(CrawlerRepositoryError::database)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
+                            (
+                                matcher_id.as_str(),
+                                page_type_id.to_string(),
+                                ordinal,
+                                matcher_json.as_str(),
+                            ),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    let hash = semantic_hash(&transaction, &version)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "URL_MATCHER_CREATED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
                         matcher_id.as_str(),
-                        page_type_id.to_string(),
-                        ordinal,
-                        matcher_json.as_str(),
-                    ),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            let hash = semantic_hash(&transaction, &version).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "URL_MATCHER_CREATED",
-                actor,
-                occurred_at,
-                version_id,
-                matcher_id.as_str(),
-                hash.as_str(),
-            )
+                        hash.as_str(),
+                    )?;
+                    Ok::<i64, CrawlerRepositoryError>(ordinal)
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await?;
-            Ok::<i64, CrawlerRepositoryError>(ordinal)
-        }
-        .await;
-        finish_transaction!(transaction, result)?;
-        self.url_matcher(crawler_id, version_id, page_type_id, matcher_id.as_str())
-            .await
+        self.url_matcher(
+            crawler_id,
+            version_id,
+            page_type_id,
+            result_matcher_id.as_str(),
+        )
+        .await
     }
 
     /// Replaces a URL matcher definition without changing its presentation
@@ -1412,41 +1546,54 @@ impl<'database> CrawlerRepository<'database> {
         let matcher_json = serde_json::to_string(matcher).map_err(|error| {
             CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
         })?;
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id).await?;
-            let existing = transaction
-                .execute(
-                    "UPDATE url_matchers SET matcher_json = ?1 WHERE id = ?2 AND page_type_id = ?3",
-                    (matcher_json.as_str(), matcher_id, page_type_id.to_string()),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            if existing != 1 {
-                ensure_matcher_belongs_to_page_type(&transaction, matcher_id, page_type_id).await?;
-                return Err(CrawlerRepositoryError::CorruptState);
-            }
-            let hash = semantic_hash(&transaction, &version).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "URL_MATCHER_UPDATED",
-                actor,
-                occurred_at,
-                version_id,
-                matcher_id,
-                hash.as_str(),
-            )
-            .await
-        }
-        .await;
-        finish_transaction!(transaction, result)?;
-        self.url_matcher(crawler_id, version_id, page_type_id, matcher_id)
-            .await
+        let matcher_id = matcher_id.to_owned();
+        let result_matcher_id = matcher_id.clone();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id)?;
+                    let existing = transaction
+                        .execute(
+                            "UPDATE url_matchers SET matcher_json = ?1 WHERE id = ?2 AND page_type_id = ?3",
+                            (matcher_json.as_str(), matcher_id.as_str(), page_type_id.to_string()),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    if existing != 1 {
+                        ensure_matcher_belongs_to_page_type(
+                            &transaction,
+                            matcher_id.as_str(),
+                            page_type_id,
+                        )?;
+                        return Err(CrawlerRepositoryError::CorruptState);
+                    }
+                    let hash = semantic_hash(&transaction, &version)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "URL_MATCHER_UPDATED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        matcher_id.as_str(),
+                        hash.as_str(),
+                    )
+                })();
+                finish_transaction!(transaction, result)
+            })
+            .await?;
+        self.url_matcher(
+            crawler_id,
+            version_id,
+            page_type_id,
+            result_matcher_id.as_str(),
+        )
+        .await
     }
 
     /// Deletes a URL matcher from an active Draft.
@@ -1459,61 +1606,71 @@ impl<'database> CrawlerRepository<'database> {
         actor: &str,
         occurred_at: &str,
     ) -> Result<(), CrawlerRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(Self::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let matcher_id = matcher_id.to_owned();
+        let actor = actor.to_owned();
+        let occurred_at = occurred_at.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Self::database)?;
+                let result = (|| {
+                    let version = load_mutation_version(&transaction, crawler_id, version_id)?;
+                    ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id)?;
+                    let deleted = transaction
+                        .execute(
+                            "DELETE FROM url_matchers WHERE id = ?1 AND page_type_id = ?2",
+                            (matcher_id.as_str(), page_type_id.to_string()),
+                        )
+                        .map_err(CrawlerRepositoryError::database)?;
+                    if deleted != 1 {
+                        ensure_matcher_belongs_to_page_type(
+                            &transaction,
+                            matcher_id.as_str(),
+                            page_type_id,
+                        )?;
+                        return Err(CrawlerRepositoryError::UrlMatcherNotFound);
+                    }
+                    let hash = semantic_hash(&transaction, &version)?;
+                    insert_semantic_mutation_audit(
+                        &transaction,
+                        "URL_MATCHER_DELETED",
+                        actor.as_str(),
+                        occurred_at.as_str(),
+                        version_id,
+                        matcher_id.as_str(),
+                        hash.as_str(),
+                    )
+                })();
+                finish_transaction!(transaction, result)
+            })
             .await
-            .map_err(Self::database)?;
-        let result = async {
-            let version = load_mutation_version(&transaction, crawler_id, version_id).await?;
-            ensure_page_type_belongs_to_version(&transaction, version_id, page_type_id).await?;
-            let deleted = transaction
-                .execute(
-                    "DELETE FROM url_matchers WHERE id = ?1 AND page_type_id = ?2",
-                    (matcher_id, page_type_id.to_string()),
-                )
-                .await
-                .map_err(CrawlerRepositoryError::database)?;
-            if deleted != 1 {
-                ensure_matcher_belongs_to_page_type(&transaction, matcher_id, page_type_id).await?;
-                return Err(CrawlerRepositoryError::UrlMatcherNotFound);
-            }
-            let hash = semantic_hash(&transaction, &version).await?;
-            insert_semantic_mutation_audit(
-                &transaction,
-                "URL_MATCHER_DELETED",
-                actor,
-                occurred_at,
-                version_id,
-                matcher_id,
-                hash.as_str(),
-            )
-            .await
-        }
-        .await;
-        finish_transaction!(transaction, result)
     }
 
     async fn retry_lifecycle_contention(
         &self,
         crawler_id: CrawlerId,
         attempt: usize,
-        original_error: turso::Error,
+        original_failure: DatabaseFailure,
     ) -> Result<(), CrawlerRepositoryError> {
         tokio::time::sleep(LIFECYCLE_CONTENTION_BACKOFFS[attempt]).await;
-        let connection = self.database.connection().await.map_err(Self::database)?;
-        match active_draft_for(&connection, crawler_id).await {
+        let result = self
+            .database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                active_draft_for(&connection, crawler_id)
+            })
+            .await;
+        match result {
             Ok(Some(_)) => Err(CrawlerRepositoryError::ActiveDraftExists),
-            Ok(None) if attempt + 1 < LIFECYCLE_CONTENTION_ATTEMPTS => Ok(()),
-            Err(CrawlerRepositoryError::Database(DbError::Turso(error)))
-                if is_lifecycle_contention(&error)
-                    && attempt + 1 < LIFECYCLE_CONTENTION_ATTEMPTS =>
-            {
-                Ok(())
-            }
-            Ok(None) | Err(CrawlerRepositoryError::Database(DbError::Turso(_))) => {
-                Err(CrawlerRepositoryError::database(original_error))
-            }
+            Ok(None)
+            | Err(CrawlerRepositoryError::Database(DbError::Database(
+                DatabaseFailure::Busy | DatabaseFailure::BusySnapshot,
+            ))) if attempt + 1 < LIFECYCLE_CONTENTION_ATTEMPTS => Ok(()),
+            Ok(None) | Err(CrawlerRepositoryError::Database(DbError::Database(_))) => Err(
+                CrawlerRepositoryError::database(DbError::Database(original_failure)),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -1528,12 +1685,8 @@ const LIFECYCLE_CONTENTION_BACKOFFS: [Duration; LIFECYCLE_CONTENTION_ATTEMPTS] =
     Duration::from_millis(16),
 ];
 
-fn is_lifecycle_contention(error: &turso::Error) -> bool {
-    matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
-}
-
-async fn insert_draft_in_transaction(
-    connection: &Connection,
+fn insert_draft_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     base_version_id: Option<CrawlerVersionId>,
     actor: &str,
@@ -1548,13 +1701,8 @@ async fn insert_draft_in_transaction(
             "SELECT active_draft_version_id FROM crawlers WHERE id = ?1",
             [crawler_id.as_str()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(pointer_row) = pointers
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(pointer_row) = pointers.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::CrawlerNotFound);
     };
     let active_draft: Option<String> = pointer_row
@@ -1570,15 +1718,15 @@ async fn insert_draft_in_transaction(
             "INSERT INTO crawler_versions (id, crawler_id, state, semantic_configuration_json) VALUES (?1, ?2, 'DRAFT', ?3)",
             (version.id().to_string(), crawler_id.as_str(), configuration),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
-    sync_seed_rows(connection, version).await?;
+    sync_seed_rows(connection, version)?;
     let activated = connection
         .execute(
             "UPDATE crawlers SET active_draft_version_id = ?1 WHERE id = ?2 AND active_draft_version_id IS NULL",
             (version.id().to_string(), crawler_id.as_str()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if activated != 1 {
         return Err(CrawlerRepositoryError::ConcurrentVersionTransition);
@@ -1592,11 +1740,10 @@ async fn insert_draft_in_transaction(
         &version.id().to_string(),
         audit_payload(version.id(), base_version_id, None, &[]),
     )
-    .await
 }
 
-async fn save_draft_in_transaction(
-    connection: &Connection,
+fn save_draft_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     configuration: &str,
     actor: &str,
@@ -1607,12 +1754,8 @@ async fn save_draft_in_transaction(
             "SELECT crawler_id, state FROM crawler_versions WHERE id = ?1",
             [version.id().to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    let existing = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?;
+    let existing = rows.next().map_err(CrawlerRepositoryError::database)?;
     if let Some(row) = existing {
         let owner: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         let state: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
@@ -1625,7 +1768,7 @@ async fn save_draft_in_transaction(
         if state != "DRAFT" {
             return Err(CrawlerRepositoryError::InvalidLifecycleTransition);
         }
-        let pointer = active_draft_for(connection, version.crawler_id()).await?;
+        let pointer = active_draft_for(connection, version.crawler_id())?;
         if pointer.as_deref() != Some(version.id().to_string().as_str()) {
             return Err(CrawlerRepositoryError::InvalidLifecycleTransition);
         }
@@ -1634,18 +1777,18 @@ async fn save_draft_in_transaction(
                 "UPDATE crawler_versions SET semantic_configuration_json = ?1 WHERE id = ?2 AND state = 'DRAFT'",
                 (configuration, version.id().to_string()),
             )
-            .await
+
             .map_err(CrawlerRepositoryError::database)?;
-        sync_seed_rows(connection, version).await?;
+        sync_seed_rows(connection, version)?;
         return Ok(());
     }
 
-    insert_draft_in_transaction(connection, version, None, actor, occurred_at).await
+    insert_draft_in_transaction(connection, version, None, actor, occurred_at)
 }
 
 #[allow(clippy::too_many_lines)]
-async fn clone_draft_in_transaction(
-    connection: &Connection,
+fn clone_draft_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     source_version_id: CrawlerVersionId,
     actor: &str,
@@ -1656,11 +1799,9 @@ async fn clone_draft_in_transaction(
             "SELECT active_draft_version_id FROM crawlers WHERE id = ?1",
             [crawler_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
     let Some(crawler_row) = crawler_rows
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
     else {
         return Err(CrawlerRepositoryError::CrawlerNotFound);
@@ -1672,7 +1813,7 @@ async fn clone_draft_in_transaction(
         return Err(CrawlerRepositoryError::ActiveDraftExists);
     }
 
-    let source = load_version(connection, source_version_id).await?;
+    let source = load_version(connection, source_version_id)?;
     if source.crawler_id() != crawler_id {
         return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
     }
@@ -1702,15 +1843,13 @@ async fn clone_draft_in_transaction(
         source_version_id,
         &mut page_map,
         "SELECT id FROM page_types WHERE crawler_version_id = ?1",
-    )
-    .await?;
+    )?;
     augment_child_id_map(
         connection,
         source_version_id,
         &mut transition_map,
         "SELECT id FROM discovery_transitions WHERE crawler_version_id = ?1",
-    )
-    .await?;
+    )?;
     let seed_map = source
         .seeds()
         .iter()
@@ -1724,7 +1863,7 @@ async fn clone_draft_in_transaction(
             "INSERT INTO crawler_versions (id, crawler_id, state, semantic_configuration_json) VALUES (?1, ?2, 'DRAFT', ?3)",
             (clone.id().to_string(), crawler_id.to_string(), configuration),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     clone_child_rows(
         connection,
@@ -1733,19 +1872,18 @@ async fn clone_draft_in_transaction(
         &seed_map,
         &page_map,
         &transition_map,
-    )
-    .await?;
+    )?;
     let activated = connection
         .execute(
             "UPDATE crawlers SET active_draft_version_id = ?1 WHERE id = ?2 AND active_draft_version_id IS NULL",
             (clone.id().to_string(), crawler_id.to_string()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if activated != 1 {
         return Err(CrawlerRepositoryError::ConcurrentVersionTransition);
     }
-    let hash = semantic_hash(connection, &clone).await?;
+    let hash = semantic_hash(connection, &clone)?;
     insert_audit_event(
         connection,
         format!("draft:{}:{}", clone.id(), occurred_at),
@@ -1759,20 +1897,19 @@ async fn clone_draft_in_transaction(
             Some(hash.as_str()),
             &[],
         ),
-    )
-    .await?;
+    )?;
     Ok(clone)
 }
 
-async fn publish_in_transaction(
-    connection: &Connection,
+fn publish_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
     actor: &str,
     occurred_at: &str,
     registry: &VersionValidationRegistry,
 ) -> Result<CrawlerVersionRecord, CrawlerRepositoryError> {
-    let context = publication_validation_context(connection, crawler_id, version_id).await?;
+    let context = publication_validation_context(connection, crawler_id, version_id)?;
     let report = registry
         .validate(&context)
         .map_err(|_| CrawlerRepositoryError::PublicationValidationInfrastructure)?;
@@ -1792,7 +1929,7 @@ async fn publish_in_transaction(
             "UPDATE crawler_versions SET state = 'PUBLISHED', semantic_configuration_json = ?1 WHERE id = ?2 AND crawler_id = ?3 AND state = 'DRAFT'",
             (configuration, version_id.to_string(), crawler_id.to_string()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if updated != 1 {
         return Err(CrawlerRepositoryError::ConcurrentVersionTransition);
@@ -1802,12 +1939,12 @@ async fn publish_in_transaction(
             "UPDATE crawlers SET active_published_version_id = ?1, active_draft_version_id = NULL WHERE id = ?2 AND active_draft_version_id = ?1",
             (version_id.to_string(), crawler_id.to_string()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if pointers != 1 {
         return Err(CrawlerRepositoryError::ConcurrentVersionTransition);
     }
-    let base_version_id = base_version_from_audit(connection, version_id).await?;
+    let base_version_id = base_version_from_audit(connection, version_id)?;
     insert_audit_event(
         connection,
         format!("publish:{version_id}:{occurred_at}"),
@@ -1821,8 +1958,7 @@ async fn publish_in_transaction(
             Some(hash.as_str()),
             &warning_summary,
         ),
-    )
-    .await?;
+    )?;
     Ok(CrawlerVersionRecord {
         version: published,
         audit: CrawlerAuditMetadata {
@@ -1835,33 +1971,33 @@ async fn publish_in_transaction(
     })
 }
 
-async fn publication_validation_in_transaction(
-    connection: &Connection,
+fn publication_validation_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
     registry: &VersionValidationRegistry,
 ) -> Result<VersionValidationReport, CrawlerRepositoryError> {
-    let context = publication_validation_context(connection, crawler_id, version_id).await?;
+    let context = publication_validation_context(connection, crawler_id, version_id)?;
     registry
         .validate(&context)
         .map_err(|_| CrawlerRepositoryError::PublicationValidationInfrastructure)
 }
 
-async fn publication_validation_context(
-    connection: &Connection,
+fn publication_validation_context(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
 ) -> Result<VersionValidationContext, CrawlerRepositoryError> {
-    ensure_crawler_exists(connection, crawler_id).await?;
-    ensure_pointer_consistency(connection, crawler_id).await?;
-    let version = load_publication_version(connection, version_id).await?;
+    ensure_crawler_exists(connection, crawler_id)?;
+    ensure_pointer_consistency(connection, crawler_id)?;
+    let version = load_publication_version(connection, version_id)?;
     if version.crawler_id() != crawler_id {
         return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
     }
     if version.state() != CrawlerVersionState::Draft {
         return Err(CrawlerRepositoryError::VersionNotDraft);
     }
-    let active_draft = active_draft_for(connection, crawler_id).await?;
+    let active_draft = active_draft_for(connection, crawler_id)?;
     if active_draft.as_deref() != Some(version_id.to_string().as_str()) {
         return Err(if active_draft.is_some() {
             CrawlerRepositoryError::InvalidLifecycleTransition
@@ -1869,15 +2005,14 @@ async fn publication_validation_context(
             CrawlerRepositoryError::VersionNotDraft
         });
     }
-    let page_types = load_page_type_records(connection, &version).await?;
-    let transitions = load_transition_records(connection, &version, false).await?;
-    let config_hash = semantic_hash_with_semantic_validation(connection, &version, false).await?;
+    let page_types = load_page_type_records(connection, &version)?;
+    let transitions = load_transition_records(connection, &version, false)?;
+    let config_hash = semantic_hash_with_semantic_validation(connection, &version, false)?;
     let evidence = super::test_evidence::load_for_version_in_transaction(
         connection,
         version_id,
         config_hash.as_str(),
     )
-    .await
     .map_err(|error| match error {
         super::test_evidence::TestEvidenceRepositoryError::Database(error) => {
             CrawlerRepositoryError::Database(error)
@@ -1899,14 +2034,14 @@ async fn publication_validation_context(
     ))
 }
 
-async fn reactivate_in_transaction(
-    connection: &Connection,
+fn reactivate_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
     actor: &str,
     occurred_at: &str,
 ) -> Result<(), CrawlerRepositoryError> {
-    let version = load_version(connection, version_id).await?;
+    let version = load_version(connection, version_id)?;
     if version.crawler_id() != crawler_id {
         return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
     }
@@ -1918,7 +2053,7 @@ async fn reactivate_in_transaction(
             "UPDATE crawlers SET active_published_version_id = ?1 WHERE id = ?2 AND EXISTS (SELECT 1 FROM crawler_versions WHERE id = ?1 AND crawler_id = ?2 AND state = 'PUBLISHED')",
             (version_id.to_string(), crawler_id.to_string()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if changed != 1 {
         return Err(CrawlerRepositoryError::ConcurrentVersionTransition);
@@ -1932,11 +2067,10 @@ async fn reactivate_in_transaction(
         &version_id.to_string(),
         audit_payload(version_id, None, None, &[]),
     )
-    .await
 }
 
-async fn ensure_crawler_exists(
-    connection: &Connection,
+fn ensure_crawler_exists(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
 ) -> Result<(), CrawlerRepositoryError> {
     let mut rows = connection
@@ -1944,11 +2078,9 @@ async fn ensure_crawler_exists(
             "SELECT 1 FROM crawlers WHERE id = ?1",
             [crawler_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
     if rows
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
         .is_none()
     {
@@ -1957,8 +2089,8 @@ async fn ensure_crawler_exists(
     Ok(())
 }
 
-async fn ensure_pointer_consistency(
-    connection: &Connection,
+fn ensure_pointer_consistency(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
 ) -> Result<(), CrawlerRepositoryError> {
     let mut rows = connection
@@ -1966,11 +2098,10 @@ async fn ensure_pointer_consistency(
             "SELECT 1 FROM crawlers AS crawler WHERE crawler.id = ?1 AND ((crawler.active_draft_version_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM crawler_versions AS version WHERE version.id = crawler.active_draft_version_id AND version.crawler_id = crawler.id AND version.state = 'DRAFT')) OR (crawler.active_published_version_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM crawler_versions AS version WHERE version.id = crawler.active_published_version_id AND version.crawler_id = crawler.id AND version.state = 'PUBLISHED'))) LIMIT 1",
             [crawler_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if rows
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
         .is_some()
     {
@@ -1979,8 +2110,8 @@ async fn ensure_pointer_consistency(
     Ok(())
 }
 
-async fn active_draft_for(
-    connection: &Connection,
+fn active_draft_for(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
 ) -> Result<Option<String>, CrawlerRepositoryError> {
     let mut rows = connection
@@ -1988,42 +2119,37 @@ async fn active_draft_for(
             "SELECT active_draft_version_id FROM crawlers WHERE id = ?1",
             [crawler_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::CrawlerNotFound);
     };
     row.get(0).map_err(CrawlerRepositoryError::database)
 }
 
-async fn evaluation_snapshot_in_transaction(
-    connection: &Connection,
+fn evaluation_snapshot_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     draft_version_id: CrawlerVersionId,
     include_published: bool,
 ) -> Result<CrawlerEvaluationSnapshot, CrawlerRepositoryError> {
-    ensure_crawler_exists(connection, crawler_id).await?;
-    ensure_pointer_consistency(connection, crawler_id).await?;
+    ensure_crawler_exists(connection, crawler_id)?;
+    ensure_pointer_consistency(connection, crawler_id)?;
 
     let pointers = connection
         .prepare(
             "SELECT active_published_version_id, active_draft_version_id FROM crawlers WHERE id = ?1",
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?
         .query_row([crawler_id.to_string()])
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let active_published_version_id = pointers
         .get::<Option<String>>(0)
         .map_err(CrawlerRepositoryError::database)?
         .map(|value| parse_version_id(&value))
         .transpose()?;
-    let draft = load_semantic_snapshot(connection, crawler_id, draft_version_id).await?;
+    let draft = load_semantic_snapshot(connection, crawler_id, draft_version_id)?;
     if draft.version.state() != CrawlerVersionState::Draft {
         return Err(CrawlerRepositoryError::VersionNotDraft);
     }
@@ -2036,7 +2162,7 @@ async fn evaluation_snapshot_in_transaction(
 
     let published = if include_published {
         if let Some(version_id) = active_published_version_id {
-            Some(load_semantic_snapshot(connection, crawler_id, version_id).await?)
+            Some(load_semantic_snapshot(connection, crawler_id, version_id)?)
         } else {
             None
         }
@@ -2050,19 +2176,19 @@ async fn evaluation_snapshot_in_transaction(
     })
 }
 
-async fn load_semantic_snapshot(
-    connection: &Connection,
+fn load_semantic_snapshot(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
 ) -> Result<CrawlerSemanticSnapshot, CrawlerRepositoryError> {
-    let version = load_version(connection, version_id).await?;
+    let version = load_version(connection, version_id)?;
     if version.crawler_id() != crawler_id {
         return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
     }
-    validate_seed_projection(connection, &version).await?;
-    let page_types = load_page_type_records(connection, &version).await?;
-    let transitions = load_transition_records(connection, &version, true).await?;
-    let config_hash = semantic_hash_with_semantic_validation(connection, &version, true).await?;
+    validate_seed_projection(connection, &version)?;
+    let page_types = load_page_type_records(connection, &version)?;
+    let transitions = load_transition_records(connection, &version, true)?;
+    let config_hash = semantic_hash_with_semantic_validation(connection, &version, true)?;
     Ok(CrawlerSemanticSnapshot {
         version,
         page_types,
@@ -2071,28 +2197,27 @@ async fn load_semantic_snapshot(
     })
 }
 
-async fn load_mutation_version(
-    connection: &Connection,
+fn load_mutation_version(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
 ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
-    ensure_crawler_exists(connection, crawler_id).await?;
-    let version = load_version(connection, version_id).await?;
+    ensure_crawler_exists(connection, crawler_id)?;
+    let version = load_version(connection, version_id)?;
     if version.crawler_id() != crawler_id {
         return Err(CrawlerRepositoryError::VersionNotOwnedByCrawler);
     }
     if version.state() != CrawlerVersionState::Draft {
         return Err(CrawlerRepositoryError::PublishedVersionImmutable);
     }
-    if active_draft_for(connection, crawler_id).await?.as_deref()
-        != Some(version_id.to_string().as_str())
+    if active_draft_for(connection, crawler_id)?.as_deref() != Some(version_id.to_string().as_str())
     {
         return Err(CrawlerRepositoryError::VersionNotActiveDraft);
     }
     // A mutation must not compound an existing mismatch between the declared
     // version projection and typed child rows.
-    load_page_type_records(connection, &version).await?;
-    load_transition_records(connection, &version, true).await?;
+    load_page_type_records(connection, &version)?;
+    load_transition_records(connection, &version, true)?;
     Ok(version)
 }
 
@@ -2105,8 +2230,8 @@ struct SeedProjection {
     entry_page_type_hint: Option<String>,
 }
 
-async fn validate_seed_projection(
-    connection: &Connection,
+fn validate_seed_projection(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
 ) -> Result<(), CrawlerRepositoryError> {
     let expected = version
@@ -2139,14 +2264,10 @@ async fn validate_seed_projection(
             "SELECT id, original_url, canonical_url, enabled, label, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1",
             [version.id().to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let mut actual = BTreeMap::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
         let id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         let original_url: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
         let canonical_url: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
@@ -2190,8 +2311,8 @@ async fn validate_seed_projection(
     Ok(())
 }
 
-async fn load_page_type_records(
-    connection: &Connection,
+fn load_page_type_records(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
 ) -> Result<Vec<PageTypeRecord>, CrawlerRepositoryError> {
     let declared = version
@@ -2208,14 +2329,10 @@ async fn load_page_type_records(
             "SELECT id, crawler_version_id, name, priority, configuration_json FROM page_types WHERE crawler_version_id = ?1 ORDER BY name COLLATE BINARY, id",
             [version.id().to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let mut records = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
         let id: PageTypeId = parse_page_type_id(
             &row.get::<String>(0)
                 .map_err(CrawlerRepositoryError::database)?,
@@ -2240,7 +2357,7 @@ async fn load_page_type_records(
             crawler_version_id,
             name: row.get(2).map_err(CrawlerRepositoryError::database)?,
             priority,
-            matchers: load_matchers_for_page_type(connection, id).await?,
+            matchers: load_matchers_for_page_type(connection, id)?,
         });
     }
     if records
@@ -2254,8 +2371,8 @@ async fn load_page_type_records(
     Ok(records)
 }
 
-async fn load_transition_records(
-    connection: &Connection,
+fn load_transition_records(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     validate_semantics: bool,
 ) -> Result<Vec<DiscoveryTransitionRecord>, CrawlerRepositoryError> {
@@ -2273,14 +2390,10 @@ async fn load_transition_records(
             "SELECT id, crawler_version_id, configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1 ORDER BY id",
             [version.id().to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let mut records = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
         let id = parse_transition_id(
             &row.get::<String>(0)
                 .map_err(CrawlerRepositoryError::database)?,
@@ -2313,14 +2426,12 @@ async fn load_transition_records(
                 version.id(),
                 transition.source_page_type_id,
             )
-            .await
             .map_err(|_| CrawlerRepositoryError::CorruptState)?;
             ensure_page_type_belongs_to_version(
                 connection,
                 version.id(),
                 transition.target_page_type_id,
             )
-            .await
             .map_err(|_| CrawlerRepositoryError::CorruptState)?;
             transition
                 .validate()
@@ -2331,7 +2442,7 @@ async fn load_transition_records(
                 transition.target_page_type_id,
             ] {
                 if !version.page_type_ids().contains(&page_type_id) {
-                    ensure_missing_transition_page_type_is_absent(connection, page_type_id).await?;
+                    ensure_missing_transition_page_type_is_absent(connection, page_type_id)?;
                 }
             }
         }
@@ -2351,8 +2462,8 @@ async fn load_transition_records(
     Ok(records)
 }
 
-async fn ensure_missing_transition_page_type_is_absent(
-    connection: &Connection,
+fn ensure_missing_transition_page_type_is_absent(
+    connection: &impl crate::SqliteExecutor,
     page_type_id: PageTypeId,
 ) -> Result<(), CrawlerRepositoryError> {
     let mut rows = connection
@@ -2360,11 +2471,9 @@ async fn ensure_missing_transition_page_type_is_absent(
             "SELECT crawler_version_id FROM page_types WHERE id = ?1",
             [page_type_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
     if rows
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
         .is_some()
     {
@@ -2373,8 +2482,8 @@ async fn ensure_missing_transition_page_type_is_absent(
     Ok(())
 }
 
-async fn load_matchers_for_page_type(
-    connection: &Connection,
+fn load_matchers_for_page_type(
+    connection: &impl crate::SqliteExecutor,
     page_type_id: PageTypeId,
 ) -> Result<Vec<UrlMatcherRecord>, CrawlerRepositoryError> {
     let mut rows = connection
@@ -2382,14 +2491,10 @@ async fn load_matchers_for_page_type(
             "SELECT id, page_type_id, ordinal, matcher_json FROM url_matchers WHERE page_type_id = ?1 ORDER BY ordinal, id",
             [page_type_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let mut matchers = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
         let id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         if Uuid::parse_str(&id).map_or(true, |value| value.get_version_num() != 7) {
             return Err(CrawlerRepositoryError::CorruptState);
@@ -2414,8 +2519,8 @@ async fn load_matchers_for_page_type(
     Ok(matchers)
 }
 
-async fn ensure_page_type_belongs_to_version(
-    connection: &Connection,
+fn ensure_page_type_belongs_to_version(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     page_type_id: PageTypeId,
 ) -> Result<(), CrawlerRepositoryError> {
@@ -2424,13 +2529,8 @@ async fn ensure_page_type_belongs_to_version(
             "SELECT crawler_version_id FROM page_types WHERE id = ?1",
             [page_type_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::PageTypeNotFound);
     };
     let owner = parse_version_id(
@@ -2443,8 +2543,8 @@ async fn ensure_page_type_belongs_to_version(
     Ok(())
 }
 
-async fn ensure_transition_belongs_to_version(
-    connection: &Connection,
+fn ensure_transition_belongs_to_version(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     transition_id: DiscoveryTransitionId,
 ) -> Result<(), CrawlerRepositoryError> {
@@ -2453,13 +2553,8 @@ async fn ensure_transition_belongs_to_version(
             "SELECT crawler_version_id FROM discovery_transitions WHERE id = ?1",
             [transition_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::DiscoveryTransitionNotFound);
     };
     let owner = parse_version_id(
@@ -2472,15 +2567,14 @@ async fn ensure_transition_belongs_to_version(
     Ok(())
 }
 
-async fn ensure_transition_page_type(
-    connection: &Connection,
+fn ensure_transition_page_type(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     page_type_id: PageTypeId,
     source: bool,
 ) -> Result<(), CrawlerRepositoryError> {
-    ensure_page_type_belongs_to_version(connection, version_id, page_type_id)
-        .await
-        .map_err(|error| match error {
+    ensure_page_type_belongs_to_version(connection, version_id, page_type_id).map_err(|error| {
+        match error {
             CrawlerRepositoryError::PageTypeNotFound => {
                 if source {
                     CrawlerRepositoryError::TransitionSourcePageTypeNotFound
@@ -2492,11 +2586,12 @@ async fn ensure_transition_page_type(
                 CrawlerRepositoryError::TransitionNotOwnedByVersion
             }
             other => other,
-        })
+        }
+    })
 }
 
-async fn transition_row_exists(
-    connection: &Connection,
+fn transition_row_exists(
+    connection: &impl crate::SqliteExecutor,
     transition_id: DiscoveryTransitionId,
 ) -> Result<bool, CrawlerRepositoryError> {
     let mut rows = connection
@@ -2504,17 +2599,15 @@ async fn transition_row_exists(
             "SELECT 1 FROM discovery_transitions WHERE id = ?1",
             [transition_id.to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
     Ok(rows
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
         .is_some())
 }
 
-async fn ensure_matcher_belongs_to_page_type(
-    connection: &Connection,
+fn ensure_matcher_belongs_to_page_type(
+    connection: &impl crate::SqliteExecutor,
     matcher_id: &str,
     page_type_id: PageTypeId,
 ) -> Result<(), CrawlerRepositoryError> {
@@ -2523,13 +2616,8 @@ async fn ensure_matcher_belongs_to_page_type(
             "SELECT page_type_id FROM url_matchers WHERE id = ?1",
             [matcher_id],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::UrlMatcherNotFound);
     };
     let owner = parse_page_type_id(
@@ -2542,8 +2630,8 @@ async fn ensure_matcher_belongs_to_page_type(
     Ok(())
 }
 
-async fn page_type_is_in_use(
-    connection: &Connection,
+fn page_type_is_in_use(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     page_type_id: PageTypeId,
 ) -> Result<bool, CrawlerRepositoryError> {
@@ -2561,11 +2649,10 @@ async fn page_type_is_in_use(
             "SELECT 1 FROM seeds WHERE crawler_version_id = ?1 AND entry_page_type_hint_id = ?2 LIMIT 1",
             (version.id().to_string(), page_type_id.as_str()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if seeds
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
         .is_some()
     {
@@ -2577,11 +2664,10 @@ async fn page_type_is_in_use(
             "SELECT configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1 UNION ALL SELECT configuration_json FROM page_types WHERE crawler_version_id = ?1 AND id <> ?2",
             (version.id().to_string(), page_type_id.as_str()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     while let Some(row) = opaque_rows
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
     {
         let configuration: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
@@ -2607,8 +2693,8 @@ fn json_contains_string(value: &Value, needle: &str) -> bool {
     }
 }
 
-async fn update_version_configuration(
-    connection: &Connection,
+fn update_version_configuration(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     configuration: &str,
 ) -> Result<(), CrawlerRepositoryError> {
@@ -2617,7 +2703,7 @@ async fn update_version_configuration(
             "UPDATE crawler_versions SET semantic_configuration_json = ?1 WHERE id = ?2 AND state = 'DRAFT'",
             (configuration, version.id().to_string()),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     if updated != 1 {
         return Err(CrawlerRepositoryError::ConcurrentVersionTransition);
@@ -2625,8 +2711,8 @@ async fn update_version_configuration(
     Ok(())
 }
 
-async fn insert_semantic_mutation_audit(
-    connection: &Connection,
+fn insert_semantic_mutation_audit(
+    connection: &impl crate::SqliteExecutor,
     event_type: &str,
     actor: &str,
     occurred_at: &str,
@@ -2648,11 +2734,10 @@ async fn insert_semantic_mutation_audit(
         })
         .to_string(),
     )
-    .await
 }
 
-async fn load_version(
-    connection: &Connection,
+fn load_version(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
 ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
     let mut rows = connection
@@ -2660,22 +2745,18 @@ async fn load_version(
             "SELECT id, crawler_id, state, semantic_configuration_json FROM crawler_versions WHERE id = ?1",
             [version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::CrawlerVersionNotFound);
     };
-    let version = version_from_row(&row)?;
-    validate_seed_projection(connection, &version).await?;
+    let version = version_from_row(row)?;
+    validate_seed_projection(connection, &version)?;
     Ok(version)
 }
 
-async fn load_publication_version(
-    connection: &Connection,
+fn load_publication_version(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
 ) -> Result<CrawlerVersion, CrawlerRepositoryError> {
     let mut rows = connection
@@ -2683,17 +2764,13 @@ async fn load_publication_version(
             "SELECT id, crawler_id, state, semantic_configuration_json FROM crawler_versions WHERE id = ?1",
             [version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? else {
         return Err(CrawlerRepositoryError::CrawlerVersionNotFound);
     };
-    let version = version_from_row_with_semantic_validation(&row, false)?;
-    validate_seed_projection(connection, &version).await?;
+    let version = version_from_row_with_semantic_validation(row, false)?;
+    validate_seed_projection(connection, &version)?;
     Ok(version)
 }
 
@@ -2755,8 +2832,8 @@ fn version_from_row_with_semantic_validation(
     Ok(version)
 }
 
-async fn audit_metadata(
-    connection: &Connection,
+fn audit_metadata(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
 ) -> Result<CrawlerAuditMetadata, CrawlerRepositoryError> {
     let mut rows = connection
@@ -2764,14 +2841,10 @@ async fn audit_metadata(
             "SELECT event_type, actor, occurred_at, payload_json FROM audit_events WHERE entity_type = 'CRAWLER_VERSION' AND entity_id = ?1 ORDER BY occurred_at, id",
             [version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let mut metadata = CrawlerAuditMetadata::default();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
         let event_type: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         let actor: String = row.get(1).map_err(CrawlerRepositoryError::database)?;
         let occurred_at: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
@@ -2829,13 +2902,11 @@ fn audit_warning_summary(value: Option<&Value>) -> Result<Vec<String>, CrawlerRe
     Ok(summary)
 }
 
-async fn base_version_from_audit(
-    connection: &Connection,
+fn base_version_from_audit(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
 ) -> Result<Option<CrawlerVersionId>, CrawlerRepositoryError> {
-    Ok(audit_metadata(connection, version_id)
-        .await?
-        .base_version_id)
+    Ok(audit_metadata(connection, version_id)?.base_version_id)
 }
 
 fn audit_payload(
@@ -2853,8 +2924,8 @@ fn audit_payload(
     .to_string()
 }
 
-async fn insert_audit_event(
-    connection: &Connection,
+fn insert_audit_event(
+    connection: &impl crate::SqliteExecutor,
     id: String,
     event_type: &str,
     actor: &str,
@@ -2867,13 +2938,13 @@ async fn insert_audit_event(
             "INSERT INTO audit_events (id, event_type, actor, occurred_at, entity_type, entity_id, payload_json) VALUES (?1, ?2, ?3, ?4, 'CRAWLER_VERSION', ?5, ?6)",
             (id, event_type, actor, occurred_at, entity_id, payload_json),
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)
         .map(|_| ())
 }
 
-async fn sync_seed_rows(
-    connection: &Connection,
+fn sync_seed_rows(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
 ) -> Result<(), CrawlerRepositoryError> {
     connection
@@ -2881,7 +2952,6 @@ async fn sync_seed_rows(
             "DELETE FROM seeds WHERE crawler_version_id = ?1",
             [version.id().to_string()],
         )
-        .await
         .map_err(CrawlerRepositoryError::database)?;
     for seed in version.seeds() {
         connection
@@ -2897,7 +2967,7 @@ async fn sync_seed_rows(
                     seed.entry_page_type_hint.map(|id| id.to_string()),
                 ),
             )
-            .await
+
             .map_err(CrawlerRepositoryError::database)?;
     }
     Ok(())
@@ -2909,21 +2979,16 @@ fn declared_child_id_map(
     pairs.collect()
 }
 
-async fn augment_child_id_map(
-    connection: &Connection,
+fn augment_child_id_map(
+    connection: &impl crate::SqliteExecutor,
     source_version_id: CrawlerVersionId,
     map: &mut BTreeMap<String, String>,
     sql: &str,
 ) -> Result<(), CrawlerRepositoryError> {
     let mut rows = connection
         .query(sql, [source_version_id.to_string()])
-        .await
         .map_err(CrawlerRepositoryError::database)?;
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
         let id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         map.entry(id).or_insert_with(new_opaque_id);
     }
@@ -2931,8 +2996,8 @@ async fn augment_child_id_map(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn clone_child_rows(
-    connection: &Connection,
+fn clone_child_rows(
+    connection: &impl crate::SqliteExecutor,
     source_version_id: CrawlerVersionId,
     target_version_id: CrawlerVersionId,
     seed_map: &BTreeMap<String, String>,
@@ -2944,14 +3009,10 @@ async fn clone_child_rows(
             "SELECT id, original_url, canonical_url, enabled, label, entry_page_type_hint_id FROM seeds WHERE crawler_version_id = ?1 ORDER BY id",
             [source_version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     let mut seed_rows = Vec::new();
-    while let Some(row) = seeds
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = seeds.next().map_err(CrawlerRepositoryError::database)? {
         let old_id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         let hint: Option<String> = row.get(5).map_err(CrawlerRepositoryError::database)?;
         let hint = hint
@@ -2981,7 +3042,7 @@ async fn clone_child_rows(
                 "INSERT INTO seeds (id, crawler_version_id, original_url, canonical_url, enabled, label, entry_page_type_hint_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 (id, target_version_id.to_string(), original_url, canonical_url, enabled, label, hint),
             )
-            .await
+
             .map_err(CrawlerRepositoryError::database)?;
     }
 
@@ -2990,13 +3051,9 @@ async fn clone_child_rows(
             "SELECT id, name, priority, configuration_json FROM page_types WHERE crawler_version_id = ?1 ORDER BY id",
             [source_version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
-    while let Some(row) = pages
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = pages.next().map_err(CrawlerRepositoryError::database)? {
         let old_id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         let configuration: String = row.get(3).map_err(CrawlerRepositoryError::database)?;
         let configuration =
@@ -3013,7 +3070,7 @@ async fn clone_child_rows(
                     configuration,
                 ),
             )
-            .await
+
             .map_err(CrawlerRepositoryError::database)?;
     }
 
@@ -3022,13 +3079,9 @@ async fn clone_child_rows(
             "SELECT url_matchers.page_type_id, url_matchers.ordinal, url_matchers.matcher_json FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1 ORDER BY url_matchers.page_type_id, url_matchers.ordinal, url_matchers.id",
             [source_version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
-    while let Some(row) = matchers
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
+    while let Some(row) = matchers.next().map_err(CrawlerRepositoryError::database)? {
         let page_id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
         let matcher_json: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
         let matcher_json =
@@ -3047,7 +3100,7 @@ async fn clone_child_rows(
                     matcher_json,
                 ),
             )
-            .await
+
             .map_err(CrawlerRepositoryError::database)?;
     }
 
@@ -3056,11 +3109,10 @@ async fn clone_child_rows(
             "SELECT id, configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1 ORDER BY id",
             [source_version_id.to_string()],
         )
-        .await
+
         .map_err(CrawlerRepositoryError::database)?;
     while let Some(row) = transitions
         .next()
-        .await
         .map_err(CrawlerRepositoryError::database)?
     {
         let old_id: String = row.get(0).map_err(CrawlerRepositoryError::database)?;
@@ -3080,7 +3132,7 @@ async fn clone_child_rows(
                 "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
                 (new_id, target_version_id.to_string(), configuration),
             )
-            .await
+
             .map_err(CrawlerRepositoryError::database)?;
     }
     Ok(())
@@ -3089,48 +3141,45 @@ async fn clone_child_rows(
 /// Revalidates the active Draft's complete semantic projection using the
 /// caller's transaction. This is intentionally crate-visible so evidence
 /// persistence can close its hash-check/insert TOCTOU window.
-pub(crate) async fn current_draft_semantic_hash_in_transaction(
-    connection: &Connection,
+pub(crate) fn current_draft_semantic_hash_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
 ) -> Result<String, CrawlerRepositoryError> {
-    ensure_crawler_exists(connection, crawler_id).await?;
-    ensure_pointer_consistency(connection, crawler_id).await?;
-    if active_draft_for(connection, crawler_id).await?.as_deref()
-        != Some(version_id.to_string().as_str())
+    ensure_crawler_exists(connection, crawler_id)?;
+    ensure_pointer_consistency(connection, crawler_id)?;
+    if active_draft_for(connection, crawler_id)?.as_deref() != Some(version_id.to_string().as_str())
     {
         return Err(CrawlerRepositoryError::VersionNotActiveDraft);
     }
-    let snapshot = load_semantic_snapshot(connection, crawler_id, version_id).await?;
+    let snapshot = load_semantic_snapshot(connection, crawler_id, version_id)?;
     if snapshot.version.state() != CrawlerVersionState::Draft {
         return Err(CrawlerRepositoryError::VersionNotDraft);
     }
     Ok(snapshot.config_hash)
 }
 
-pub(crate) async fn semantic_hash_for_version_in_connection(
-    connection: &Connection,
+pub(crate) fn semantic_hash_for_version_in_connection(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: CrawlerId,
     version_id: CrawlerVersionId,
 ) -> Result<String, CrawlerRepositoryError> {
-    ensure_crawler_exists(connection, crawler_id).await?;
-    ensure_pointer_consistency(connection, crawler_id).await?;
-    Ok(load_semantic_snapshot(connection, crawler_id, version_id)
-        .await?
-        .config_hash)
+    ensure_crawler_exists(connection, crawler_id)?;
+    ensure_pointer_consistency(connection, crawler_id)?;
+    Ok(load_semantic_snapshot(connection, crawler_id, version_id)?.config_hash)
 }
 
 #[allow(clippy::too_many_lines)]
-async fn semantic_hash(
-    connection: &Connection,
+fn semantic_hash(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
 ) -> Result<String, CrawlerRepositoryError> {
-    semantic_hash_with_semantic_validation(connection, version, true).await
+    semantic_hash_with_semantic_validation(connection, version, true)
 }
 
 #[allow(clippy::too_many_lines)]
-async fn semantic_hash_with_semantic_validation(
-    connection: &Connection,
+fn semantic_hash_with_semantic_validation(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     validate_semantics: bool,
 ) -> Result<String, CrawlerRepositoryError> {
@@ -3139,7 +3188,7 @@ async fn semantic_hash_with_semantic_validation(
             .validate_semantic_contract()
             .map_err(|_| CrawlerRepositoryError::CorruptState)?;
     }
-    load_transition_records(connection, version, validate_semantics).await?;
+    load_transition_records(connection, version, validate_semantics)?;
     let mut version_json = serde_json::to_value(version).map_err(|error| {
         CrawlerRepositoryError::database(DbError::Serialization(error.to_string()))
     })?;
@@ -3169,7 +3218,10 @@ async fn semantic_hash_with_semantic_validation(
             );
             object.insert(
                 "enabled".into(),
-                Value::from(row.get::<i64>(3).map_err(CrawlerRepositoryError::database)?),
+                Value::from(
+                    row.get::<i64>(3)
+                        .map_err(CrawlerRepositoryError::database)?,
+                ),
             );
             object.insert(
                 "label".into(),
@@ -3185,8 +3237,7 @@ async fn semantic_hash_with_semantic_validation(
             );
             Ok(Value::Object(object))
         },
-    )
-    .await?;
+    )?;
     let pages = child_values(
         connection,
         "SELECT id, name, priority, configuration_json FROM page_types WHERE crawler_version_id = ?1",
@@ -3206,21 +3257,21 @@ async fn semantic_hash_with_semantic_validation(
             );
             object.insert(
                 "priority".into(),
-                Value::from(row.get::<i64>(2).map_err(CrawlerRepositoryError::database)?),
+                Value::from(
+                    row.get::<i64>(2)
+                        .map_err(CrawlerRepositoryError::database)?,
+                ),
             );
             object.insert("configuration".into(), configuration);
             Ok(Value::Object(object))
         },
-    )
-    .await?;
+    )?;
     let matchers = child_values(
         connection,
         "SELECT url_matchers.id, url_matchers.page_type_id, url_matchers.matcher_json FROM url_matchers JOIN page_types ON page_types.id = url_matchers.page_type_id WHERE page_types.crawler_version_id = ?1",
         version.id(),
         |row| {
-            let matcher_json: String = row
-                .get(2)
-                .map_err(CrawlerRepositoryError::database)?;
+            let matcher_json: String = row.get(2).map_err(CrawlerRepositoryError::database)?;
             let matcher = serde_json::from_str::<UrlMatcher>(&matcher_json)
                 .map_err(|_| CrawlerRepositoryError::CorruptState)?;
             let mut object = Map::new();
@@ -3240,8 +3291,7 @@ async fn semantic_hash_with_semantic_validation(
             );
             Ok(Value::Object(object))
         },
-    )
-    .await?;
+    )?;
     let transitions = child_values(
         connection,
         "SELECT id, configuration_json FROM discovery_transitions WHERE crawler_version_id = ?1",
@@ -3262,8 +3312,7 @@ async fn semantic_hash_with_semantic_validation(
                 "configuration": transition_semantic_value(&transition)?,
             }))
         },
-    )
-    .await?;
+    )?;
 
     let template = SemanticHashTemplate {
         version: version_json,
@@ -3679,8 +3728,8 @@ fn sort_version_collections(value: &mut Value) {
     }
 }
 
-async fn child_values<F>(
-    connection: &Connection,
+fn child_values<F>(
+    connection: &impl crate::SqliteExecutor,
     sql: &str,
     version_id: CrawlerVersionId,
     mut map: F,
@@ -3690,15 +3739,10 @@ where
 {
     let mut rows = connection
         .query(sql, [version_id.to_string()])
-        .await
         .map_err(CrawlerRepositoryError::database)?;
     let mut values = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CrawlerRepositoryError::database)?
-    {
-        values.push(map(&row)?);
+    while let Some(row) = rows.next().map_err(CrawlerRepositoryError::database)? {
+        values.push(map(row)?);
     }
     Ok(values)
 }
@@ -3915,40 +3959,66 @@ mod tests {
         Ok(database)
     }
 
+    fn is_lifecycle_contention(error: &rusqlite::Error) -> bool {
+        matches!(
+            crate::classify_rusqlite_error(error),
+            DatabaseFailure::Busy | DatabaseFailure::BusySnapshot
+        )
+    }
+
     #[test]
-    fn lifecycle_contention_recognizes_only_turso_write_contention() {
-        assert!(is_lifecycle_contention(&turso::Error::Busy(
-            "locked".into()
+    fn lifecycle_contention_recognizes_only_sqlite_write_contention() {
+        assert!(is_lifecycle_contention(&rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
         )));
-        assert!(is_lifecycle_contention(&turso::Error::BusySnapshot(
-            "snapshot".into()
+        assert!(is_lifecycle_contention(&rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(517),
+            None,
         )));
-        assert!(!is_lifecycle_contention(&turso::Error::Constraint(
-            "constraint".into()
+        assert!(!is_lifecycle_contention(&rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
         )));
-        assert!(!is_lifecycle_contention(&turso::Error::Corrupt(
-            "corrupt".into()
+        assert!(!is_lifecycle_contention(&rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
         )));
+    }
+
+    async fn execute_sql<T, F>(
+        database: &ErabiDatabase,
+        operation: F,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+    {
+        Ok(crate::test_call(database, operation).await?)
     }
 
     async fn count_by_crawler(
-        connection: &Connection,
+        database: &ErabiDatabase,
         sql: &str,
         crawler_id: CrawlerId,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        Ok(connection
-            .prepare(sql)
-            .await?
-            .query_row([crawler_id.to_string()])
-            .await?
-            .get(0)?)
+        let sql = sql.to_owned();
+        let crawler_id = crawler_id.to_string();
+        execute_sql(database, move |connection| {
+            connection.query_row(&sql, [crawler_id], |row| row.get(0))
+        })
+        .await
     }
 
     async fn count_all(
-        connection: &Connection,
+        database: &ErabiDatabase,
         sql: &str,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        Ok(connection.prepare(sql).await?.query_row(()).await?.get(0)?)
+        let sql = sql.to_owned();
+        execute_sql(database, move |connection| {
+            connection.query_row(&sql, [], |row| row.get(0))
+        })
+        .await
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4040,7 +4110,6 @@ mod tests {
             .save_draft(&version, "operator", "2026-08-25T00:00:00Z")
             .await?;
 
-        let connection = database.connection().await?;
         let page_rows = if shape.child_insertion == ChildInsertionOrder::Reverse {
             [(target_page, "Target"), (source_page, "Source")]
         } else {
@@ -4051,38 +4120,43 @@ mod tests {
         } else {
             source_page
         };
-        for (id, page_name) in page_rows {
-            connection
-                .execute(
-                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, 10, ?4)",
-                    (
-                        id.to_string(),
-                        version.id().to_string(),
-                        page_name,
-                        serde_json::json!({"related_page_type_id": configuration_target.to_string()}).to_string(),
-                    ),
-                )
-                .await?;
-        }
-        connection
-            .execute(
-                "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+        let version_id = version.id().to_string();
+        let transition_id = transition.to_string();
+        let configuration_target = configuration_target.to_string();
+        let transition_json = serde_json::to_string(&persisted_transition(
+            transition,
+            source_page,
+            if shape.transition_target == TransitionTarget::Source {
+                source_page
+            } else {
+                target_page
+            },
+            "graph transition",
+        ))?;
+        let page_inserts = page_rows
+            .into_iter()
+            .map(|(id, page_name)| {
                 (
-                    transition.to_string(),
-                    version.id().to_string(),
-                    serde_json::to_string(&persisted_transition(
-                        transition,
-                        source_page,
-                        if shape.transition_target == TransitionTarget::Source {
-                            source_page
-                        } else {
-                            target_page
-                        },
-                        "graph transition",
-                    ))?,
-                ),
-            )
-            .await?;
+                    id.to_string(),
+                    page_name.to_owned(),
+                    serde_json::json!({"related_page_type_id": configuration_target.clone()})
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        execute_sql(database, move |connection| {
+            for (id, page_name, configuration_json) in page_inserts {
+                connection.execute(
+                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, 10, ?4)",
+                    (id, version_id.as_str(), page_name, configuration_json),
+                )?;
+            }
+            connection.execute(
+                "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                (transition_id, version_id, transition_json),
+            )?;
+            Ok(())
+        }).await?;
         Ok((crawler, version))
     }
 
@@ -4094,6 +4168,7 @@ mod tests {
         MatchersSplitOwners,
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn symmetric_graph_version(
         database: &ErabiDatabase,
         name: &str,
@@ -4130,20 +4205,17 @@ mod tests {
             .save_draft(&version, "operator", "2026-08-25T00:00:00Z")
             .await?;
 
-        let connection = database.connection().await?;
         let mut page_rows = vec![first_page, second_page];
         if reverse_insertion {
             page_rows.reverse();
         }
-        for page_id in page_rows {
-            connection
-                .execute(
-                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'Symmetric', 10, '{}')",
-                    (page_id.to_string(), version.id().to_string()),
-                )
-                .await?;
-        }
-
+        let version_id = version.id().to_string();
+        let page_inserts = page_rows
+            .into_iter()
+            .map(|page_id| (page_id.to_string(), version_id.clone()))
+            .collect::<Vec<_>>();
+        let mut transition_insert = None;
+        let mut matcher_inserts = Vec::new();
         match shape {
             SymmetricGraphShape::SelfTransition | SymmetricGraphShape::DistinctTransition => {
                 let target = if matches!(shape, SymmetricGraphShape::SelfTransition) {
@@ -4151,21 +4223,16 @@ mod tests {
                 } else {
                     target_page
                 };
-                connection
-                    .execute(
-                        "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
-                        (
-                            transition_id.to_string(),
-                            version.id().to_string(),
-                            serde_json::to_string(&persisted_transition(
-                                transition_id,
-                                source_page,
-                                target,
-                                "symmetric transition",
-                            ))?,
-                        ),
-                    )
-                    .await?;
+                transition_insert = Some((
+                    transition_id.to_string(),
+                    version_id.clone(),
+                    serde_json::to_string(&persisted_transition(
+                        transition_id,
+                        source_page,
+                        target,
+                        "symmetric transition",
+                    ))?,
+                ));
             }
             SymmetricGraphShape::MatchersShareOwner | SymmetricGraphShape::MatchersSplitOwners => {
                 let second_owner = if matches!(shape, SymmetricGraphShape::MatchersShareOwner) {
@@ -4182,20 +4249,36 @@ mod tests {
                 }
                 for (page_type_id, ordinal, pattern) in matchers {
                     let matcher = UrlMatcher::exact_url(pattern.parse()?);
-                    connection
-                        .execute(
-                            "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
-                            (
-                                new_opaque_id(),
-                                page_type_id.to_string(),
-                                ordinal,
-                                serde_json::to_string(&matcher)?,
-                            ),
-                        )
-                        .await?;
+                    matcher_inserts.push((
+                        new_opaque_id(),
+                        page_type_id.to_string(),
+                        ordinal,
+                        serde_json::to_string(&matcher)?,
+                    ));
                 }
             }
         }
+        execute_sql(database, move |connection| {
+            for (page_id, version_id) in page_inserts {
+                connection.execute(
+                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'Symmetric', 10, '{}')",
+                    (page_id, version_id),
+                )?;
+            }
+            if let Some((transition_id, version_id, configuration_json)) = transition_insert {
+                connection.execute(
+                    "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                    (transition_id, version_id, configuration_json),
+                )?;
+            }
+            for (matcher_id, page_type_id, ordinal, matcher_json) in matcher_inserts {
+                connection.execute(
+                    "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
+                    (matcher_id, page_type_id, ordinal, matcher_json),
+                )?;
+            }
+            Ok(())
+        }).await?;
         Ok((crawler, version))
     }
 
@@ -4509,47 +4592,40 @@ mod tests {
         repository
             .save_draft(&initial, "operator", "2026-08-25T00:00:00Z")
             .await?;
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        let page_type_id_string = page_type_id.to_string();
+        let initial_id = initial.id().to_string();
+        let configuration_json = serde_json::json!({
+            "extract": "links",
+            "page_type_id": page_type_id_string.clone(),
+        })
+        .to_string();
+        let matcher_json = serde_json::to_string(&UrlMatcher::path_prefix(None, "/catalog"))?;
+        let transition_json = serde_json::to_string(&persisted_transition(
+            transition_id,
+            page_type_id,
+            page_type_id,
+            "catalog links",
+        ))?;
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'catalog', 10, '{\"extract\":\"links\"}')",
-                (page_type_id.to_string(), initial.id().to_string()),
-            )
-            .await?;
-        connection
-            .execute(
+                (page_type_id_string.as_str(), initial_id.as_str()),
+            )?;
+            connection.execute(
                 "UPDATE page_types SET configuration_json = ?1 WHERE id = ?2",
-                (
-                    serde_json::json!({"extract":"links", "page_type_id": page_type_id.to_string()}).to_string(),
-                    page_type_id.to_string(),
-                ),
-            )
-            .await?;
-        connection
-            .execute(
+                (configuration_json, page_type_id_string.as_str()),
+            )?;
+            connection.execute(
                 "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 0, ?3)",
-                (
-                    new_opaque_id(),
-                    page_type_id.to_string(),
-                    serde_json::to_string(&UrlMatcher::path_prefix(None, "/catalog"))?,
-                ),
-            )
-            .await?;
-        connection
-            .execute(
+                (new_opaque_id(), page_type_id_string.as_str(), matcher_json),
+            )?;
+            connection.execute(
                 "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
-                (
-                    transition_id.to_string(),
-                    initial.id().to_string(),
-                    serde_json::to_string(&persisted_transition(
-                        transition_id,
-                        page_type_id,
-                        page_type_id,
-                        "catalog links",
-                    ))?,
-                ),
-            )
-            .await?;
+                (transition_id.to_string(), initial_id.as_str(), transition_json),
+            )?;
+            Ok(())
+        })
+        .await?;
 
         initial.publish()?;
         repository
@@ -4579,39 +4655,43 @@ mod tests {
                 .await?
         );
 
-        let child_counts: (i64, i64, i64, i64) = (
-            connection
-                .prepare("SELECT COUNT(*) FROM seeds WHERE crawler_version_id = ?1")
-                .await?
-                .query_row([cloned.id().to_string()])
-                .await?
-                .get(0)?,
-            connection
-                .prepare("SELECT COUNT(*) FROM page_types WHERE crawler_version_id = ?1")
-                .await?
-                .query_row([cloned.id().to_string()])
-                .await?
-                .get(0)?,
-            connection
-                .prepare("SELECT COUNT(*) FROM url_matchers WHERE page_type_id = ?1")
-                .await?
-                .query_row([cloned.page_type_ids()[0].to_string()])
-                .await?
-                .get(0)?,
-            connection
-                .prepare("SELECT COUNT(*) FROM discovery_transitions WHERE crawler_version_id = ?1")
-                .await?
-                .query_row([cloned.id().to_string()])
-                .await?
-                .get(0)?,
-        );
+        let cloned_id = cloned.id().to_string();
+        let cloned_page_type_id = cloned.page_type_ids()[0].to_string();
+        let child_counts: (i64, i64, i64, i64) = execute_sql(&database, move |connection| {
+            Ok((
+                connection.query_row(
+                    "SELECT COUNT(*) FROM seeds WHERE crawler_version_id = ?1",
+                    [&cloned_id],
+                    |row| row.get(0),
+                )?,
+                connection.query_row(
+                    "SELECT COUNT(*) FROM page_types WHERE crawler_version_id = ?1",
+                    [&cloned_id],
+                    |row| row.get(0),
+                )?,
+                connection.query_row(
+                    "SELECT COUNT(*) FROM url_matchers WHERE page_type_id = ?1",
+                    [&cloned_page_type_id],
+                    |row| row.get(0),
+                )?,
+                connection.query_row(
+                    "SELECT COUNT(*) FROM discovery_transitions WHERE crawler_version_id = ?1",
+                    [&cloned_id],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await?;
         assert_eq!(child_counts, (1, 1, 1, 1));
-        let cloned_page_configuration: String = connection
-            .prepare("SELECT configuration_json FROM page_types WHERE crawler_version_id = ?1")
-            .await?
-            .query_row([cloned.id().to_string()])
-            .await?
-            .get(0)?;
+        let cloned_id = cloned.id().to_string();
+        let cloned_page_configuration: String = execute_sql(&database, move |connection| {
+            connection.query_row(
+                "SELECT configuration_json FROM page_types WHERE crawler_version_id = ?1",
+                [cloned_id],
+                |row| row.get(0),
+            )
+        })
+        .await?;
         assert!(cloned_page_configuration.contains(&cloned.page_type_ids()[0].to_string()));
         assert!(!cloned_page_configuration.contains(&page_type_id.to_string()));
 
@@ -4623,12 +4703,15 @@ mod tests {
         repository
             .save_draft(&edited, "operator", "2026-08-25T00:03:00Z")
             .await?;
-        let source_seed_count: i64 = connection
-            .prepare("SELECT COUNT(*) FROM seeds WHERE crawler_version_id = ?1")
-            .await?
-            .query_row([initial.id().to_string()])
-            .await?
-            .get(0)?;
+        let initial_id = initial.id().to_string();
+        let source_seed_count: i64 = execute_sql(&database, move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM seeds WHERE crawler_version_id = ?1",
+                [initial_id],
+                |row| row.get(0),
+            )
+        })
+        .await?;
         assert_eq!(source_seed_count, 1);
 
         let published_clone = repository
@@ -4675,14 +4758,15 @@ mod tests {
             pointers.active_draft_version_id,
             Some(older_draft.id().to_string())
         );
+        let initial_id = initial.id().to_string();
         assert!(
-            connection
+            execute_sql(&database, move |connection| Ok(connection
                 .execute(
                     "UPDATE seeds SET label = 'published-edit' WHERE crawler_version_id = ?1",
-                    [initial.id().to_string()],
+                    [initial_id],
                 )
-                .await
-                .is_err()
+                .is_err()))
+            .await?
         );
         Ok(())
     }
@@ -4749,21 +4833,20 @@ mod tests {
         );
         assert_eq!(read.audit.base_version_id, Some(initial.id()));
 
-        let connection = database.connection().await?;
-        let reactivation = connection
-            .prepare(
+        let (reactivation_actor, reactivation_at) = execute_sql(&database, move |connection| {
+            connection.query_row(
                 "SELECT actor, occurred_at FROM audit_events WHERE entity_id = ?1 AND event_type = 'CRAWLER_VERSION_REACTIVATED'",
+                [published.id().to_string()],
+                |row| Ok::<(String, String), rusqlite::Error>((row.get(0)?, row.get(1)?)),
             )
-            .await?
-            .query_row([published.id().to_string()])
-            .await?;
-        let reactivation_actor: String = reactivation.get(0)?;
-        let reactivation_at: String = reactivation.get(1)?;
+        })
+        .await?;
         assert_eq!(reactivation_actor, "operator-b");
         assert_eq!(reactivation_at, "2026-08-25T00:04:00Z");
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn semantic_hash_refinement_scales_with_realistic_child_counts()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4788,65 +4871,76 @@ mod tests {
             .save_draft(&version, "operator", "2026-08-25T00:00:00Z")
             .await?;
 
-        let connection = database.connection().await?;
+        let version_id = version.id().to_string();
+        let mut page_inserts = Vec::new();
+        let mut matcher_inserts = Vec::new();
         for index in (0..page_ids.len()).rev() {
             let page_id = page_ids[index];
             let next_page_id = page_ids[(index + 1) % page_ids.len()];
-            connection
-                .execute(
-                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (
-                        page_id.to_string(),
-                        version.id().to_string(),
-                        format!("Page {index}"),
-                        i64::try_from(index)?,
-                        serde_json::json!({"next_page_type_id": next_page_id.to_string()}).to_string(),
-                    ),
-                )
-                .await?;
+            page_inserts.push((
+                page_id.to_string(),
+                version_id.clone(),
+                format!("Page {index}"),
+                i64::try_from(index)?,
+                serde_json::json!({"next_page_type_id": next_page_id.to_string()}).to_string(),
+            ));
             for ordinal in 0..2_i64 {
                 let matcher = UrlMatcher::path_prefix(None, format!("/page-{index}/{ordinal}"));
-                connection
-                    .execute(
-                        "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
-                        (
-                            new_opaque_id(),
-                            page_id.to_string(),
-                            ordinal,
-                            serde_json::to_string(&matcher)?,
-                        ),
-                    )
-                    .await?;
+                matcher_inserts.push((
+                    new_opaque_id(),
+                    page_id.to_string(),
+                    ordinal,
+                    serde_json::to_string(&matcher)?,
+                ));
             }
         }
+        let mut transition_inserts = Vec::new();
         for (index, transition_id) in transition_ids.iter().enumerate() {
-            connection
-                .execute(
-                    "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
-                    (
-                        transition_id.to_string(),
-                        version.id().to_string(),
-                        serde_json::json!({
-                            "id": transition_id.to_string(),
-                            "source_page_type_id": page_ids[index].to_string(),
-                            "target_page_type_id": page_ids[(index + 1) % page_ids.len()].to_string(),
-                            "name": format!("transition {index}"),
-                            "enabled": true,
-                            "link_selector": "a[href]",
-                            "url_constraints": null,
-                            "priority": 10,
-                            "budget": {
-                                "max_links_per_source_page": 10,
-                                "total_budget": 100,
-                                "depth_contribution": 1
-                            },
-                            "deduplicate": true,
-                            "latest_test_evidence_id": null
-                        }).to_string(),
-                    ),
-                )
-                .await?;
+            transition_inserts.push((
+                transition_id.to_string(),
+                version_id.clone(),
+                serde_json::json!({
+                    "id": transition_id.to_string(),
+                    "source_page_type_id": page_ids[index].to_string(),
+                    "target_page_type_id": page_ids[(index + 1) % page_ids.len()].to_string(),
+                    "name": format!("transition {index}"),
+                    "enabled": true,
+                    "link_selector": "a[href]",
+                    "url_constraints": null,
+                    "priority": 10,
+                    "budget": {
+                        "max_links_per_source_page": 10,
+                        "total_budget": 100,
+                        "depth_contribution": 1
+                    },
+                    "deduplicate": true,
+                    "latest_test_evidence_id": null
+                })
+                .to_string(),
+            ));
         }
+        execute_sql(&database, move |connection| {
+            for (page_id, version_id, name, priority, configuration_json) in page_inserts {
+                connection.execute(
+                    "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (page_id, version_id, name, priority, configuration_json),
+                )?;
+            }
+            for (matcher_id, page_id, ordinal, matcher_json) in matcher_inserts {
+                connection.execute(
+                    "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, ?3, ?4)",
+                    (matcher_id, page_id, ordinal, matcher_json),
+                )?;
+            }
+            for (transition_id, version_id, configuration_json) in transition_inserts {
+                connection.execute(
+                    "INSERT INTO discovery_transitions (id, crawler_version_id, configuration_json) VALUES (?1, ?2, ?3)",
+                    (transition_id, version_id, configuration_json),
+                )?;
+            }
+            Ok(())
+        })
+        .await?;
 
         let first = repository
             .configuration_hash(crawler.id(), version.id())
@@ -4856,100 +4950,68 @@ mod tests {
             .await?;
         assert_eq!(first, second);
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            count_all(&database, "SELECT COUNT(*) FROM page_types").await?,
             12
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
+            count_all(&database, "SELECT COUNT(*) FROM url_matchers").await?,
             24
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            count_all(&database, "SELECT COUNT(*) FROM discovery_transitions").await?,
             6
         );
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn delayed_initial_draft_winner_is_classified_after_bounded_retry()
+    #[tokio::test]
+    async fn serialized_initial_draft_winner_is_classified_without_external_transaction()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
-        let crawler = Crawler::new("Delayed initial contention");
-        CrawlerRepository::new(&database).create(&crawler).await?;
-        let winner = CrawlerVersion::draft(crawler.id());
-        let mut connection = database.connection().await?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let crawler = Crawler::new("Serialized initial contention");
+        let repository = CrawlerRepository::new(&database);
+        repository.create(&crawler).await?;
+        let winner = repository
+            .create_draft(crawler.id(), "winner", "2026-08-25T00:00:00Z")
             .await?;
-        insert_draft_in_transaction(
-            &transaction,
-            &winner,
-            None,
-            "winner",
-            "2026-08-25T00:00:00Z",
-        )
-        .await?;
-
-        let loser_database = database.clone();
-        let crawler_id = crawler.id();
-        let loser = tokio::spawn(async move {
-            CrawlerRepository::new(&loser_database)
-                .create_draft(crawler_id, "loser", "2026-08-25T00:00:01Z")
-                .await
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        for delay in [
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-            Duration::from_millis(4),
-        ] {
-            tokio::time::advance(delay).await;
-            tokio::task::yield_now().await;
-        }
-        transaction.commit().await?;
-        tokio::time::advance(Duration::from_millis(16)).await;
+        let loser = repository
+            .create_draft(crawler.id(), "loser", "2026-08-25T00:00:01Z")
+            .await;
         assert!(matches!(
-            loser.await?,
+            loser,
             Err(CrawlerRepositoryError::ActiveDraftExists
                 | CrawlerRepositoryError::ConcurrentVersionTransition)
         ));
 
-        let repository = CrawlerRepository::new(&database);
         assert_eq!(
             repository.pointers(&crawler).await?.active_draft_version_id,
             Some(winner.id().to_string())
         );
-        let connection = database.connection().await?;
         assert_eq!(
             count_by_crawler(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1",
                 crawler.id()
             )
             .await?,
             1
         );
+        assert_eq!(count_all(&database, "SELECT COUNT(*) FROM seeds").await?, 0);
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
+            count_all(&database, "SELECT COUNT(*) FROM page_types").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            count_all(&database, "SELECT COUNT(*) FROM url_matchers").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
-            0
-        );
-        assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            count_all(&database, "SELECT COUNT(*) FROM discovery_transitions").await?,
             0
         );
         assert_eq!(
             count_all(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION'"
             )
             .await?,
@@ -4958,9 +5020,9 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn delayed_published_clone_winner_is_classified_after_bounded_retry()
+    async fn serialized_published_clone_winner_is_classified_without_external_transaction()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let repository = CrawlerRepository::new(&database);
@@ -4985,46 +5047,24 @@ mod tests {
             )
             .await?;
 
-        let mut connection = database.connection().await?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let winner = repository
+            .create_draft_from_published(
+                crawler.id(),
+                published.id(),
+                "winner",
+                "2026-08-25T00:00:02Z",
+            )
             .await?;
-        let winner = clone_draft_in_transaction(
-            &transaction,
-            crawler.id(),
-            published.id(),
-            "winner",
-            "2026-08-25T00:00:02Z",
-        )
-        .await?;
-        let loser_database = database.clone();
-        let crawler_id = crawler.id();
-        let published_id = published.id();
-        let loser = tokio::spawn(async move {
-            CrawlerRepository::new(&loser_database)
-                .create_draft_from_published(
-                    crawler_id,
-                    published_id,
-                    "loser",
-                    "2026-08-25T00:00:03Z",
-                )
-                .await
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        for delay in [
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-            Duration::from_millis(4),
-        ] {
-            tokio::time::advance(delay).await;
-            tokio::task::yield_now().await;
-        }
-        transaction.commit().await?;
-        tokio::time::advance(Duration::from_millis(16)).await;
+        let loser = repository
+            .create_draft_from_published(
+                crawler.id(),
+                published.id(),
+                "loser",
+                "2026-08-25T00:00:03Z",
+            )
+            .await;
         assert!(matches!(
-            loser.await?,
+            loser,
             Err(CrawlerRepositoryError::ActiveDraftExists
                 | CrawlerRepositoryError::ConcurrentVersionTransition)
         ));
@@ -5032,35 +5072,31 @@ mod tests {
             repository.pointers(&crawler).await?.active_draft_version_id,
             Some(winner.id().to_string())
         );
-        let connection = database.connection().await?;
         assert_eq!(
             count_by_crawler(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1",
                 crawler.id()
             )
             .await?,
             2
         );
+        assert_eq!(count_all(&database, "SELECT COUNT(*) FROM seeds").await?, 2);
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
-            2
-        );
-        assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            count_all(&database, "SELECT COUNT(*) FROM page_types").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
+            count_all(&database, "SELECT COUNT(*) FROM url_matchers").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            count_all(&database, "SELECT COUNT(*) FROM discovery_transitions").await?,
             0
         );
         assert_eq!(
             count_all(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION'"
             )
             .await?,
@@ -5111,35 +5147,31 @@ mod tests {
                 .active_draft_version_id
                 .is_some()
         );
-        let connection = database.connection().await?;
         assert_eq!(
             count_by_crawler(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1",
                 crawler.id()
             )
             .await?,
             1
         );
+        assert_eq!(count_all(&database, "SELECT COUNT(*) FROM seeds").await?, 0);
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
+            count_all(&database, "SELECT COUNT(*) FROM page_types").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            count_all(&database, "SELECT COUNT(*) FROM url_matchers").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
-            0
-        );
-        assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            count_all(&database, "SELECT COUNT(*) FROM discovery_transitions").await?,
             0
         );
         assert_eq!(
             count_all(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION'"
             )
             .await?,
@@ -5215,35 +5247,31 @@ mod tests {
 
         let pointers = repository.pointers(&crawler).await?;
         assert!(pointers.active_draft_version_id.is_some());
-        let connection = database.connection().await?;
         assert_eq!(
             count_by_crawler(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM crawler_versions WHERE crawler_id = ?1",
                 crawler.id()
             )
             .await?,
             2
         );
+        assert_eq!(count_all(&database, "SELECT COUNT(*) FROM seeds").await?, 2);
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM seeds").await?,
-            2
-        );
-        assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM page_types").await?,
+            count_all(&database, "SELECT COUNT(*) FROM page_types").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM url_matchers").await?,
+            count_all(&database, "SELECT COUNT(*) FROM url_matchers").await?,
             0
         );
         assert_eq!(
-            count_all(&connection, "SELECT COUNT(*) FROM discovery_transitions").await?,
+            count_all(&database, "SELECT COUNT(*) FROM discovery_transitions").await?,
             0
         );
         assert_eq!(
             count_all(
-                &connection,
+                &database,
                 "SELECT COUNT(*) FROM audit_events WHERE entity_type = 'CRAWLER_VERSION'"
             )
             .await?,
@@ -5262,13 +5290,14 @@ mod tests {
         let draft = repository
             .create_draft(crawler.id(), "operator", "2026-08-25T00:00:00Z")
             .await?;
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        let draft_id = draft.id().to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE crawler_versions SET semantic_configuration_json = '{bad-json}' WHERE id = ?1",
-                [draft.id().to_string()],
+                [draft_id],
             )
-            .await?;
+        })
+        .await?;
         assert!(matches!(
             repository.version(crawler.id(), draft.id()).await,
             Err(CrawlerRepositoryError::CorruptState)
@@ -5310,13 +5339,14 @@ mod tests {
             .configuration_hash(crawler.id(), draft.id())
             .await?;
 
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        let page_id = page.id.to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE page_types SET configuration_json = ?1 WHERE id = ?2",
-                (r#"{"future":{"flag":true}}"#, page.id.to_string()),
+                (r#"{"future":{"flag":true}}"#, page_id),
             )
-            .await?;
+        })
+        .await?;
         let matcher = repository
             .create_url_matcher(
                 crawler.id(),
@@ -5346,12 +5376,15 @@ mod tests {
             .await?;
         assert_eq!(updated.name, "Products v2");
         assert_eq!(updated.priority, 9);
-        let preserved_configuration: String = connection
-            .prepare("SELECT configuration_json FROM page_types WHERE id = ?1")
-            .await?
-            .query_row([page.id.to_string()])
-            .await?
-            .get(0)?;
+        let page_id = page.id.to_string();
+        let preserved_configuration: String = execute_sql(&database, move |connection| {
+            connection.query_row(
+                "SELECT configuration_json FROM page_types WHERE id = ?1",
+                [page_id],
+                |row| row.get(0),
+            )
+        })
+        .await?;
         assert_eq!(preserved_configuration, r#"{"future":{"flag":true}}"#);
         let third_hash = repository
             .configuration_hash(crawler.id(), draft.id())
@@ -5467,63 +5500,53 @@ mod tests {
             .publish(crawler.id(), draft.id(), "operator", "2026-08-25T02:04:00Z")
             .await?
             .version;
-        let connection = database.connection().await?;
-        assert!(connection
-            .execute(
-                "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'blocked', 0, '{}')",
-                (new_opaque_id(), published.id().to_string()),
-            )
-            .await
-            .is_err());
+        let page_id = page.id.to_string();
+        let published_id = published.id().to_string();
+        let matcher_id = matcher.id.as_str().to_owned();
+        let matcher_json = serde_json::to_string(&matcher.matcher)?;
+        let (insert_page, update_page, delete_page, insert_matcher, update_matcher, delete_matcher) =
+            execute_sql(&database, move |connection| {
+                Ok((
+                    connection
+                        .execute(
+                            "INSERT INTO page_types (id, crawler_version_id, name, priority, configuration_json) VALUES (?1, ?2, 'blocked', 0, '{}')",
+                            (new_opaque_id(), published_id),
+                        )
+                        .is_err(),
+                    connection
+                        .execute(
+                            "UPDATE page_types SET name = 'blocked' WHERE id = ?1",
+                            [page_id.as_str()],
+                        )
+                        .is_err(),
+                    connection
+                        .execute("DELETE FROM page_types WHERE id = ?1", [page_id.as_str()])
+                        .is_err(),
+                    connection
+                        .execute(
+                            "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 1, ?3)",
+                            (new_opaque_id(), page_id.as_str(), matcher_json.as_str()),
+                        )
+                        .is_err(),
+                    connection
+                        .execute(
+                            "UPDATE url_matchers SET matcher_json = ?1 WHERE id = ?2",
+                            (matcher_json.as_str(), matcher_id.as_str()),
+                        )
+                        .is_err(),
+                    connection
+                        .execute("DELETE FROM url_matchers WHERE id = ?1", [matcher_id.as_str()])
+                        .is_err(),
+                ))
+            })
+            .await?;
         assert!(
-            connection
-                .execute(
-                    "UPDATE page_types SET name = 'blocked' WHERE id = ?1",
-                    [page.id.to_string()],
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute(
-                    "DELETE FROM page_types WHERE id = ?1",
-                    [page.id.to_string()],
-                )
-                .await
-                .is_err()
-        );
-        assert!(connection
-            .execute(
-                "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 1, ?3)",
-                (
-                    new_opaque_id(),
-                    page.id.to_string(),
-                    serde_json::to_string(&matcher.matcher)?,
-                ),
-            )
-            .await
-            .is_err());
-        assert!(
-            connection
-                .execute(
-                    "UPDATE url_matchers SET matcher_json = ?1 WHERE id = ?2",
-                    (
-                        serde_json::to_string(&matcher.matcher)?,
-                        matcher.id.as_str(),
-                    ),
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute(
-                    "DELETE FROM url_matchers WHERE id = ?1",
-                    [matcher.id.as_str()],
-                )
-                .await
-                .is_err()
+            insert_page
+                && update_page
+                && delete_page
+                && insert_matcher
+                && update_matcher
+                && delete_matcher
         );
         Ok(())
     }
@@ -5555,13 +5578,15 @@ mod tests {
                     "2026-08-25T03:01:00Z",
                 )
                 .await?;
-            let connection = database.connection().await?;
-            connection
-                .execute(
+            let page_id = page.id.to_string();
+            let matcher_json = matcher_json.to_owned();
+            execute_sql(&database, move |connection| {
+                connection.execute(
                     "INSERT INTO url_matchers (id, page_type_id, ordinal, matcher_json) VALUES (?1, ?2, 0, ?3)",
-                    (new_opaque_id(), page.id.to_string(), matcher_json),
+                    (new_opaque_id(), page_id, matcher_json),
                 )
-                .await?;
+            })
+            .await?;
             assert!(matches!(
                 repository.list_page_types(crawler.id(), draft.id()).await,
                 Err(CrawlerRepositoryError::CorruptState)
@@ -5674,13 +5699,15 @@ mod tests {
             .configuration_hash(crawler.id(), draft.id())
             .await?;
 
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        let prefix_id = prefix.id.as_str().to_owned();
+        let exact_id = exact.id.as_str().to_owned();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE url_matchers SET ordinal = CASE id WHEN ?1 THEN 10 WHEN ?2 THEN 0 END WHERE id IN (?1, ?2)",
-                (prefix.id.as_str(), exact.id.as_str()),
+                (prefix_id, exact_id),
             )
-            .await?;
+        })
+        .await?;
         let after_hash = repository
             .configuration_hash(crawler.id(), draft.id())
             .await?;
@@ -5706,28 +5733,27 @@ mod tests {
         );
         assert_eq!(before_decision, after_decision);
 
-        connection
-            .execute(
+        let changed_matcher_json = serde_json::to_string(&UrlMatcher::exact_url(
+            "https://example.test/products/99".parse()?,
+        ))?;
+        let exact_id = exact.id.as_str().to_owned();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE url_matchers SET matcher_json = ?1 WHERE id = ?2",
-                (
-                    serde_json::to_string(&UrlMatcher::exact_url(
-                        "https://example.test/products/99".parse()?,
-                    ))?,
-                    exact.id.as_str(),
-                ),
+                (changed_matcher_json, exact_id),
             )
-            .await?;
+        })
+        .await?;
         let definition_hash = repository
             .configuration_hash(crawler.id(), draft.id())
             .await?;
         assert_ne!(after_hash, definition_hash);
 
-        connection
-            .execute(
-                "DELETE FROM url_matchers WHERE id = ?1",
-                [exact.id.as_str()],
-            )
-            .await?;
+        let exact_id = exact.id.as_str().to_owned();
+        execute_sql(&database, move |connection| {
+            connection.execute("DELETE FROM url_matchers WHERE id = ?1", [exact_id])
+        })
+        .await?;
         assert_ne!(
             definition_hash,
             repository
@@ -5769,23 +5795,21 @@ mod tests {
         let _published = repository
             .publish(crawler.id(), draft.id(), "operator", "now")
             .await?;
-        let connection = database.connection().await?;
+        let immutable_transition_json = serde_json::to_string(&persisted_transition(
+            transition_id,
+            page.id,
+            page.id,
+            "changed",
+        ))?;
+        let transition_id_string = transition_id.to_string();
         assert!(
-            connection
+            execute_sql(&database, move |connection| Ok(connection
                 .execute(
                     "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2",
-                    (
-                        serde_json::to_string(&persisted_transition(
-                            transition_id,
-                            page.id,
-                            page.id,
-                            "changed"
-                        ))?,
-                        transition_id.to_string(),
-                    ),
+                    (immutable_transition_json, transition_id_string),
                 )
-                .await
-                .is_err()
+                .is_err()))
+            .await?
         );
 
         let corrupted_draft = repository
@@ -5817,27 +5841,29 @@ mod tests {
                 "now",
             )
             .await?;
-        connection
-            .execute(
+        let corrupt_transition_id_string = corrupt_transition_id.to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE discovery_transitions SET configuration_json = '{}' WHERE id = ?1",
-                [corrupt_transition_id.to_string()],
+                [corrupt_transition_id_string],
             )
-            .await?;
+        })
+        .await?;
         assert!(matches!(
             repository
                 .list_discovery_transitions(crawler.id(), corrupted_draft.id())
                 .await,
             Err(CrawlerRepositoryError::CorruptState)
         ));
-        connection
-            .execute(
+        let corrupt_transition_json = serde_json::to_string(&corrupt_transition)?;
+        let corrupt_transition_id_string = corrupt_transition_id.to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2",
-                (
-                    serde_json::to_string(&corrupt_transition)?,
-                    corrupt_transition_id.to_string(),
-                ),
+                (corrupt_transition_json, corrupt_transition_id_string),
             )
-            .await?;
+        })
+        .await?;
         let mut corrupted_configuration = serde_json::to_value(
             &repository
                 .version(crawler.id(), corrupted_draft.id())
@@ -5845,15 +5871,15 @@ mod tests {
                 .version,
         )?;
         corrupted_configuration["guardrails"]["version"] = serde_json::json!(999);
-        connection
-            .execute(
+        let corrupted_configuration_json = corrupted_configuration.to_string();
+        let corrupted_draft_id = corrupted_draft.id().to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE crawler_versions SET semantic_configuration_json = ?1 WHERE id = ?2",
-                (
-                    corrupted_configuration.to_string(),
-                    corrupted_draft.id().to_string(),
-                ),
+                (corrupted_configuration_json, corrupted_draft_id),
             )
-            .await?;
+        })
+        .await?;
         assert!(matches!(
             repository
                 .crawler_version_guardrails(crawler.id(), corrupted_draft.id())

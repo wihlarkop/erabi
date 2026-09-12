@@ -2,7 +2,9 @@
 
 use std::{fs, path::Path};
 
-use crate::{ErabiDatabase, MigrationRunner, repositories::ConfigurationRepository};
+use crate::{
+    ErabiDatabase, MigrationRunner, SqliteConnection, repositories::validate_all_with_connection,
+};
 
 const CRITICAL_TABLES: &[&str] = &[
     "schema_migrations",
@@ -176,41 +178,68 @@ impl<'database, 'path> LightweightIntegrityChecker<'database, 'path> {
     /// Returns a stable Recovery Mode condition. The error deliberately omits
     /// raw SQL, stored values, paths, and secrets.
     pub async fn check(&self) -> Result<(), LightweightIntegrityError> {
-        let connection = self
+        let migrations = self.migrations.clone();
+        let database_check = self
             .database
-            .connection()
-            .await
-            .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
-        let mut readable = connection
-            .query("SELECT 1", ())
-            .await
-            .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
-        readable
-            .next()
-            .await
-            .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
+            .call(move |raw| -> Result<(), IntegrityDbError> {
+                let connection = SqliteConnection::new(raw);
+                let mut readable = connection
+                    .query("SELECT 1", ())
+                    .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
+                readable
+                    .next()
+                    .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
 
-        self.migrations
-            .verify(self.database)
-            .await
-            .map_err(|_| LightweightIntegrityError::MigrationStateIncompatible)?;
-
-        ensure_schema_objects(&connection, "table", CRITICAL_TABLES).await?;
-        ensure_schema_objects(&connection, "index", CRITICAL_INDEXES).await?;
-        ensure_schema_objects(&connection, "trigger", CRITICAL_TRIGGERS).await?;
-        ensure_active_version_pointers(&connection).await?;
-        ensure_job_queue_invariants(&connection).await?;
-        ConfigurationRepository::new(self.database)
-            .validate_all()
-            .await
-            .map_err(|_| LightweightIntegrityError::PersistedConfigurationInvalid)?;
+                migrations
+                    .verify_with_connection(&connection)
+                    .map_err(|_| LightweightIntegrityError::MigrationStateIncompatible)?;
+                ensure_schema_objects(&connection, "table", CRITICAL_TABLES)?;
+                ensure_schema_objects(&connection, "index", CRITICAL_INDEXES)?;
+                ensure_schema_objects(&connection, "trigger", CRITICAL_TRIGGERS)?;
+                ensure_active_version_pointers(&connection)?;
+                ensure_job_queue_invariants(&connection)?;
+                validate_all_with_connection(&connection)
+                    .map_err(|_| LightweightIntegrityError::PersistedConfigurationInvalid)?;
+                Ok(())
+            })
+            .await;
+        match database_check {
+            Ok(()) => {}
+            Err(IntegrityDbError::Check(error)) => return Err(error),
+            Err(IntegrityDbError::Database) => {
+                return Err(LightweightIntegrityError::DatabaseUnreadable);
+            }
+        }
         ensure_artifact_root(self.canonical_data_dir)?;
         Ok(())
     }
 }
 
-async fn ensure_job_queue_invariants(
-    connection: &turso::Connection,
+enum IntegrityDbError {
+    Check(LightweightIntegrityError),
+    Database,
+}
+
+impl From<crate::DbError> for IntegrityDbError {
+    fn from(_: crate::DbError) -> Self {
+        Self::Database
+    }
+}
+
+impl From<LightweightIntegrityError> for IntegrityDbError {
+    fn from(error: LightweightIntegrityError) -> Self {
+        Self::Check(error)
+    }
+}
+
+impl From<crate::DbError> for LightweightIntegrityError {
+    fn from(_: crate::DbError) -> Self {
+        Self::DatabaseUnreadable
+    }
+}
+
+fn ensure_job_queue_invariants(
+    connection: &SqliteConnection<'_>,
 ) -> Result<(), LightweightIntegrityError> {
     const INCONSISTENCIES: [&str; 5] = [
         "SELECT 1 FROM jobs AS job WHERE (job.state = 'RUNNING' AND (job.current_attempt = 0 OR job.lease_id IS NULL OR job.lease_owner IS NULL OR job.lease_generation = 0 OR job.lease_acquired_at IS NULL OR job.lease_expires_at IS NULL OR job.heartbeat_at IS NULL)) OR (job.state <> 'RUNNING' AND (job.lease_id IS NOT NULL OR job.lease_owner IS NOT NULL OR job.lease_acquired_at IS NOT NULL OR job.lease_expires_at IS NOT NULL OR job.heartbeat_at IS NOT NULL)) LIMIT 1",
@@ -222,11 +251,9 @@ async fn ensure_job_queue_invariants(
     for query in INCONSISTENCIES {
         let mut rows = connection
             .query(query, ())
-            .await
             .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
         if rows
             .next()
-            .await
             .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?
             .is_some()
         {
@@ -236,8 +263,8 @@ async fn ensure_job_queue_invariants(
     Ok(())
 }
 
-async fn ensure_schema_objects(
-    connection: &turso::Connection,
+fn ensure_schema_objects(
+    connection: &SqliteConnection<'_>,
     object_type: &str,
     expected_names: &[&str],
 ) -> Result<(), LightweightIntegrityError> {
@@ -247,11 +274,9 @@ async fn ensure_schema_objects(
                 "SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 LIMIT 1",
                 (object_type, *name),
             )
-            .await
             .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
         if rows
             .next()
-            .await
             .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?
             .is_none()
         {
@@ -261,8 +286,8 @@ async fn ensure_schema_objects(
     Ok(())
 }
 
-async fn ensure_active_version_pointers(
-    connection: &turso::Connection,
+fn ensure_active_version_pointers(
+    connection: &SqliteConnection<'_>,
 ) -> Result<(), LightweightIntegrityError> {
     for query in [
         "SELECT 1 FROM crawlers AS crawler LEFT JOIN crawler_versions AS version ON version.id = crawler.active_draft_version_id WHERE crawler.active_draft_version_id IS NOT NULL AND (version.id IS NULL OR version.crawler_id <> crawler.id OR version.state <> 'DRAFT') LIMIT 1",
@@ -270,11 +295,9 @@ async fn ensure_active_version_pointers(
     ] {
         let mut rows = connection
             .query(query, ())
-            .await
             .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?;
         if rows
             .next()
-            .await
             .map_err(|_| LightweightIntegrityError::DatabaseUnreadable)?
             .is_some()
         {

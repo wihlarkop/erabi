@@ -20,6 +20,8 @@ use tokio::{
 };
 
 const TOKEN: &str = "runtime-test-shared-bearer";
+const FIXTURE_MODE_ENV: &str = "ERABI_RUNTIME_SERVER_FIXTURE_MODE";
+const FIXTURE_DATA_DIR_ENV: &str = "ERABI_RUNTIME_SERVER_FIXTURE_DATA_DIR";
 
 fn temporary_data_dir(label: &str) -> std::path::PathBuf {
     let nonce = SystemTime::now()
@@ -44,6 +46,31 @@ fn config(
         values.insert("ERABI_ACCESS_TOKEN".to_owned(), TOKEN.to_owned());
     }
     BootstrapConfig::from_values(&values)
+}
+
+async fn run_fixture_process(
+    data_dir: &std::path::Path,
+    mode: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let executable = std::env::current_exe()?;
+    let data_dir = data_dir.to_path_buf();
+    let mode = mode.to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(executable)
+            .args(["--exact", "runtime_server_fixture_process", "--nocapture"])
+            .env(FIXTURE_MODE_ENV, mode)
+            .env(FIXTURE_DATA_DIR_ENV, data_dir)
+            .output()
+    })
+    .await??;
+    if !output.status.success() {
+        return Err(format!(
+            "fixture process failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 fn client_address(listener_address: SocketAddr) -> SocketAddr {
@@ -270,25 +297,13 @@ async fn runtime_process_lock_contention_is_a_fatal_startup_error()
 async fn recorded_migrations_with_a_missing_critical_index_enter_recovery_mode()
 -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = temporary_data_dir("corrupt-index");
-    let runtime = RunningRuntime::start_with_options(
-        config(&data_dir, None, false)?,
-        RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
-            message: "Crawl4AI intentionally unavailable for this runtime test.".to_owned(),
-        }),
-    )
-    .await?;
-    runtime.shutdown().await?;
+    run_fixture_process(&data_dir, "migrated").await?;
 
     let database_path = data_dir.join("database").join("erabi.db");
-    let database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    let connection = database.connect()?;
-    connection
-        .execute("DROP INDEX crawler_versions_by_crawler", ())
-        .await?;
-    drop(connection);
-    drop(database);
+    {
+        let connection = rusqlite::Connection::open(&database_path)?;
+        connection.execute("DROP INDEX crawler_versions_by_crawler", [])?;
+    }
 
     let recovery = RunningRuntime::start_with_options(
         config(&data_dir, None, false)?,
@@ -297,10 +312,14 @@ async fn recorded_migrations_with_a_missing_critical_index_enter_recovery_mode()
         }),
     )
     .await?;
-    assert!(matches!(
-        recovery.startup_outcome(),
-        StartupOutcome::Recovery(state) if state.code == "CRITICAL_SCHEMA_OBJECT_MISSING"
-    ));
+    assert!(
+        matches!(
+            recovery.startup_outcome(),
+            StartupOutcome::Recovery(state) if state.code == "CRITICAL_SCHEMA_OBJECT_MISSING"
+        ),
+        "unexpected startup outcome: {:#?}",
+        recovery.startup_outcome()
+    );
     let listener_address = recovery.local_address();
     let host = listener_address.to_string();
     let diagnostics = request(
@@ -424,34 +443,25 @@ async fn corrupt_queue_ownership_enters_recovery_mode_without_auto_repair()
     let options = RuntimeOptions::default().with_crawl4ai_health(Crawl4AiStartupHealth::Degraded {
         message: "Crawl4AI intentionally unavailable for this runtime test.".to_owned(),
     });
-    RunningRuntime::start_with_options(config(&data_dir, None, false)?, options.clone())
-        .await?
-        .shutdown()
-        .await?;
+    let fixture_output = run_fixture_process(&data_dir, "queue-corruption").await?;
+    let job_id = fixture_output
+        .lines()
+        .find_map(|line| line.strip_prefix("fixture-job-id="))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fixture process did not report a job id",
+            )
+        })?;
 
     let database_path = data_dir.join("database").join("erabi.db");
-    let job_id = {
-        let database = ErabiDatabase::open_local(&database_path).await?;
-        let jobs = JobRepository::new(&database);
-        let job = NewJob::new(JobKind::new("TEST_WORK")?, 1, 0, 2)?;
-        jobs.enqueue(&job, 0).await?;
-        jobs.acquire_next("worker-before-corruption", 0, 100)
-            .await?
-            .ok_or("job was not acquired")?;
-        job.id
-    };
-    let raw_database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    let raw_connection = raw_database.connect()?;
-    raw_connection
-        .execute(
+    {
+        let raw_connection = rusqlite::Connection::open(&database_path)?;
+        raw_connection.execute(
             "UPDATE jobs SET lease_id = 'tampered-lease' WHERE id = ?1",
-            [job_id.as_str()],
-        )
-        .await?;
-    drop(raw_connection);
-    drop(raw_database);
+            [job_id],
+        )?;
+    }
 
     let recovery =
         RunningRuntime::start_with_options(config(&data_dir, None, false)?, options).await?;
@@ -465,5 +475,39 @@ async fn corrupt_queue_ownership_enters_recovery_mode_without_auto_repair()
     );
     recovery.shutdown().await?;
     fs::remove_dir_all(&data_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_server_fixture_process() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mode) = std::env::var_os(FIXTURE_MODE_ENV) else {
+        return Ok(());
+    };
+    let Some(data_dir) = std::env::var_os(FIXTURE_DATA_DIR_ENV) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "fixture data directory is missing",
+        )
+        .into());
+    };
+    let data_dir = std::path::PathBuf::from(data_dir);
+    std::fs::create_dir_all(data_dir.join("database"))?;
+    let database_path = data_dir.join("database").join("erabi.db");
+    let database = ErabiDatabase::open_local(&database_path).await?;
+    MigrationRunner::default().apply(&database).await?;
+
+    if mode == "queue-corruption" {
+        let jobs = JobRepository::new(&database);
+        let job = NewJob::new(JobKind::new("TEST_WORK")?, 1, 0, 2)?;
+        jobs.enqueue(&job, 0).await?;
+        jobs.acquire_next("worker-before-corruption", 0, 100)
+            .await?
+            .ok_or("job was not acquired")?;
+        println!("fixture-job-id={}", job.id.as_str());
+    } else if mode != "migrated" {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown fixture mode").into(),
+        );
+    }
     Ok(())
 }

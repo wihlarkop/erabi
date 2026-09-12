@@ -12,9 +12,9 @@ use std::{
 
 use erabi_crawler::{CrawlRecoveryCheckpoint, CrawlRecoveryPhase};
 use erabi_db::repositories::{
-    CheckpointEnvelope, CrawlAdmissionState, CrawlRunRepository, CrawlTraversalControl,
-    CrawlTraversalRepository, CrawlUrlStateRecord, CrawlWorkState, JobFailureCode, JobKind,
-    JobRepository, JobRepositoryError, JobState, NewJob,
+    AttemptOutcome, CheckpointEnvelope, CrawlAdmissionState, CrawlRunRepository,
+    CrawlTraversalControl, CrawlTraversalRepository, CrawlUrlStateRecord, CrawlWorkState,
+    JobFailureCode, JobKind, JobRepository, JobRepositoryError, JobState, NewJob,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
@@ -791,6 +791,56 @@ async fn stale_lease_cannot_commit_a_pressure_transition_even_with_a_checkpoint(
         Err(JobRepositoryError::LeaseLost)
     ));
     assert_eq!(repository.job(&heavy.id).await?.state, JobState::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_run_pressure_reconciliation_commits_before_returning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let heavy = heavy_job(&database, 0, 2).await?;
+    let repository = JobRepository::new(&database);
+    let acquired = repository
+        .acquire_next("terminal-pressure-worker", 0, 30)
+        .await?
+        .ok_or("heavy job was not acquired")?;
+    let lease = acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("terminal pressure lease missing")?;
+    let run_id = heavy
+        .crawl_run_id
+        .as_deref()
+        .ok_or("heavy job is missing its run id")?
+        .parse::<uuid::Uuid>()
+        .map_err(|error| format!("invalid heavy job run id: {error}"))?;
+    let run_id = CrawlRunId::from_uuid(run_id).ok_or("heavy job run id is not UUIDv7")?;
+    erabi_db::repositories::CrawlExecutionRepository::new(&database)
+        .finalize(
+            &erabi_db::repositories::CrawlExecutionSummary {
+                crawl_run_id: run_id,
+                in_scope_pages_planned: 0,
+                in_scope_pages_completed: 0,
+                pagination_truncation_count: 0,
+                unresolved_partial_work_count: 0,
+                page_type_ambiguity_count: 0,
+            },
+            CrawlRunStatus::Succeeded,
+        )
+        .await?;
+
+    assert_eq!(
+        repository
+            .requeue_after_storage_pressure(&heavy.id, &lease, 1)
+            .await?,
+        JobState::Succeeded
+    );
+    assert_eq!(repository.job(&heavy.id).await?.state, JobState::Succeeded);
+    let attempts = repository.attempts(&heavy.id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(attempts[0].finished_at, Some(1));
     Ok(())
 }
 

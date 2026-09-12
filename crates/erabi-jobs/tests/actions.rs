@@ -5,11 +5,11 @@ use erabi_crawler::{
     ProductionRunSubmissionRequest, ProductionRunSubmissionService,
 };
 use erabi_db::repositories::{
-    CheckpointEnvelope, CrawlAdmissionState, CrawlExecutionRecord, CrawlExecutionRepository,
-    CrawlExecutionSummary, CrawlRunRepository, CrawlTraversalControl, CrawlTraversalRepository,
-    CrawlUrlStateRecord, CrawlWorkState, CrawlerRepository, JobFailureCode, JobId, JobKind,
-    JobRepository, JobState, NewJob, NewProgressEvent, ProgressMetadata, ProgressReplayRequest,
-    ProgressRepository, ProgressTerminalState,
+    AttemptOutcome, CheckpointEnvelope, CrawlAdmissionState, CrawlExecutionRecord,
+    CrawlExecutionRepository, CrawlExecutionSummary, CrawlRunRepository, CrawlTraversalControl,
+    CrawlTraversalRepository, CrawlUrlStateRecord, CrawlWorkState, CrawlerRepository,
+    JobFailureCode, JobId, JobKind, JobRepository, JobState, NewJob, NewProgressEvent,
+    ProgressMetadata, ProgressReplayRequest, ProgressRepository, ProgressTerminalState,
 };
 use erabi_db::{ErabiDatabase, MigrationRunner};
 use erabi_domain::{
@@ -599,6 +599,59 @@ async fn stale_running_job_reconciles_each_terminal_crawl_run_status_idempotentl
             1
         );
         let _ = acquired;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_terminal_crawl_run_commits_job_and_attempt_reconciliation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            CrawlRunStatus::Succeeded,
+            JobState::Succeeded,
+            AttemptOutcome::Succeeded,
+        ),
+        (
+            CrawlRunStatus::Failed,
+            JobState::Failed,
+            AttemptOutcome::Failed,
+        ),
+    ];
+    for (terminal_run_status, expected_job_state, expected_attempt_outcome) in cases {
+        let database = database().await?;
+        let (job, run_id, _) = run_backed_job(&database, 1).await?;
+        let repository = JobRepository::new(&database);
+        let acquired = repository
+            .acquire_next("terminal-cancel-worker", 0, 30)
+            .await?
+            .ok_or("terminal cancellation job was not acquired")?;
+        let lease = acquired
+            .job
+            .lease
+            .clone()
+            .ok_or("terminal cancellation lease missing")?;
+        CrawlExecutionRepository::new(&database)
+            .finalize(
+                &CrawlExecutionSummary {
+                    crawl_run_id: run_id,
+                    in_scope_pages_planned: 0,
+                    in_scope_pages_completed: 0,
+                    pagination_truncation_count: 0,
+                    unresolved_partial_work_count: 0,
+                    page_type_ambiguity_count: 0,
+                },
+                terminal_run_status,
+            )
+            .await?;
+
+        repository.cancel(&job.id, &lease, 1).await?;
+
+        assert_eq!(repository.job(&job.id).await?.state, expected_job_state);
+        let attempts = repository.attempts(&job.id).await?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, expected_attempt_outcome);
+        assert_eq!(attempts[0].finished_at, Some(1));
     }
     Ok(())
 }

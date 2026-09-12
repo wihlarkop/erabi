@@ -2,8 +2,9 @@
 
 use std::fmt;
 
+use crate::{SqliteConnection as Connection, SqliteRow as Row};
 use erabi_domain::{CrawlRunId, CrawlRunSnapshot, CrawlRunStatus, RunConfiguration};
-use turso::{Connection, transaction::TransactionBehavior};
+use rusqlite::TransactionBehavior;
 use uuid::Uuid;
 
 use crate::{DbError, ErabiDatabase};
@@ -378,7 +379,19 @@ pub enum JobRepositoryError {
 }
 
 impl JobRepositoryError {
-    fn database(error: turso::Error) -> Self {
+    fn database(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
+}
+
+impl From<DbError> for JobRepositoryError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for JobRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
         Self::Database(DbError::from(error))
     }
 }
@@ -422,57 +435,50 @@ impl<'database> JobRepository<'database> {
             JobRepositoryError::Database(DbError::Serialization(error.to_string()))
         })?;
         let run_id = CrawlRunId::new();
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            insert_run_in_transaction(
-                &transaction,
-                run_id,
-                CrawlRunStatus::Queued,
-                snapshot,
-                &serialized,
-            )
-            .await
-            .map_err(JobRepositoryError::Database)?;
-            transaction
-                .execute(
+        let snapshot = snapshot.clone();
+        let job_id = job.id.clone();
+        let job_kind = job.kind.as_str().to_owned();
+        let job_priority = job.priority;
+        let scheduled_at = job.scheduled_at;
+        let max_attempts = job.max_attempts;
+        self.database.call(move |raw| {
+            let mut connection = Connection::new(raw);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(JobRepositoryError::database)?;
+            let result = (|| {
+                insert_run_in_transaction(
+                    &transaction,
+                    run_id,
+                    CrawlRunStatus::Queued,
+                    &snapshot,
+                    &serialized,
+                )?;
+                transaction.execute(
                     "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', NULL, ?4, ?5, 0, ?6, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?7, ?7)",
                     (
-                        job.id.as_str(),
-                        job.kind.as_str(),
-                        job.priority,
+                        job_id.as_str(),
+                        job_kind.as_str(),
+                        job_priority,
                         run_id.to_string(),
-                        job.scheduled_at,
-                        i64::from(job.max_attempts),
+                        scheduled_at,
+                        i64::from(max_attempts),
                         now,
                     ),
-                )
-                .await
-                .map_err(JobRepositoryError::database)?;
-            Ok(QuickScrapeRunJob {
-                crawl_run_id: run_id,
-                job_id: job.id.clone(),
-            })
-        }
-        .await;
-        match result {
-            Ok(submission) => transaction
-                .commit()
-                .await
-                .map(|()| submission)
-                .map_err(JobRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
+                )?;
+                Ok(QuickScrapeRunJob { crawl_run_id: run_id, job_id })
+            })();
+            match result {
+                Ok(submission) => transaction
+                    .commit()
+                    .map(|()| submission)
+                    .map_err(JobRepositoryError::database),
+                Err(error) => {
+                    let _ = transaction.rollback();
+                    Err(error)
+                }
             }
-        }
+        }).await
     }
 
     /// Atomically creates the immutable Production Run and its root durable
@@ -502,57 +508,50 @@ impl<'database> JobRepository<'database> {
             JobRepositoryError::Database(DbError::Serialization(error.to_string()))
         })?;
         let run_id = CrawlRunId::new();
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            insert_run_in_transaction(
-                &transaction,
-                run_id,
-                CrawlRunStatus::Queued,
-                snapshot,
-                &serialized,
-            )
-            .await
-            .map_err(JobRepositoryError::Database)?;
-            transaction
-                .execute(
+        let snapshot = snapshot.clone();
+        let job_id = job.id.clone();
+        let job_kind = job.kind.as_str().to_owned();
+        let job_priority = job.priority;
+        let scheduled_at = job.scheduled_at;
+        let max_attempts = job.max_attempts;
+        self.database.call(move |raw| {
+            let mut connection = Connection::new(raw);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(JobRepositoryError::database)?;
+            let result = (|| {
+                insert_run_in_transaction(
+                    &transaction,
+                    run_id,
+                    CrawlRunStatus::Queued,
+                    &snapshot,
+                    &serialized,
+                )?;
+                transaction.execute(
                     "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', NULL, ?4, ?5, 0, ?6, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?7, ?7)",
                     (
-                        job.id.as_str(),
-                        job.kind.as_str(),
-                        job.priority,
+                        job_id.as_str(),
+                        job_kind.as_str(),
+                        job_priority,
                         run_id.to_string(),
-                        job.scheduled_at,
-                        i64::from(job.max_attempts),
+                        scheduled_at,
+                        i64::from(max_attempts),
                         now,
                     ),
-                )
-                .await
-                .map_err(JobRepositoryError::database)?;
-            Ok(ProductionRunJob {
-                crawl_run_id: run_id,
-                job_id: job.id.clone(),
-            })
-        }
-        .await;
-        match result {
-            Ok(submission) => transaction
-                .commit()
-                .await
-                .map(|()| submission)
-                .map_err(JobRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
+                )?;
+                Ok(ProductionRunJob { crawl_run_id: run_id, job_id })
+            })();
+            match result {
+                Ok(submission) => transaction
+                    .commit()
+                    .map(|()| submission)
+                    .map_err(JobRepositoryError::database),
+                Err(error) => {
+                    let _ = transaction.rollback();
+                    Err(error)
+                }
             }
-        }
+        }).await
     }
 
     /// Creates a job in its only valid initial state: `QUEUED`.
@@ -560,13 +559,10 @@ impl<'database> JobRepository<'database> {
     /// # Errors
     /// Returns an error when the durable insert cannot be completed.
     pub async fn enqueue(&self, job: &NewJob, now: i64) -> Result<(), JobRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        connection
-            .execute(
+        let job = job.clone();
+        self.database.call(move |raw| {
+            let connection = Connection::new(raw);
+            connection.execute(
                 "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', ?4, ?5, ?6, 0, ?7, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?8, ?8)",
                 (
                     job.id.as_str(),
@@ -579,9 +575,9 @@ impl<'database> JobRepository<'database> {
                     now,
                 ),
             )
-            .await
-            .map_err(JobRepositoryError::database)?;
-        Ok(())
+            .map(|_| ())
+            .map_err(JobRepositoryError::database)
+        }).await
     }
 
     /// Acquires one eligible job and creates its attempt in the same immediate
@@ -618,45 +614,42 @@ impl<'database> JobRepository<'database> {
         if !valid_worker_id(worker_id) || lease_duration_seconds <= 0 {
             return Err(JobRepositoryError::QueueInvariant);
         }
-        let mut connection = self
-            .database
-            .connection()
+        let worker_id = worker_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(JobRepositoryError::database)?;
+                let result = (|| {
+                    ensure_queue_invariants(&transaction)?;
+                    recover_expired_in_transaction(&transaction, now)?;
+                    let Some(id) = select_eligible_job(&transaction, now, allow_artifact_heavy)?
+                    else {
+                        return Ok(None);
+                    };
+                    let acquired = lease_queued_job(
+                        &transaction,
+                        &id,
+                        worker_id.as_str(),
+                        now,
+                        lease_duration_seconds,
+                        allow_artifact_heavy,
+                    )?;
+                    Ok(Some(acquired))
+                })();
+                match result {
+                    Ok(value) => transaction
+                        .commit()
+                        .map(|()| value)
+                        .map_err(JobRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            ensure_queue_invariants(&transaction).await?;
-            recover_expired_in_transaction(&transaction, now).await?;
-            let Some(id) = select_eligible_job(&transaction, now, allow_artifact_heavy).await?
-            else {
-                return Ok(None);
-            };
-            let acquired = lease_queued_job(
-                &transaction,
-                &id,
-                worker_id,
-                now,
-                lease_duration_seconds,
-                allow_artifact_heavy,
-            )
-            .await?;
-            Ok(Some(acquired))
-        }
-        .await;
-        match result {
-            Ok(value) => transaction
-                .commit()
-                .await
-                .map(|()| value)
-                .map_err(JobRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Renews a lease only when every durable ownership field still matches and
@@ -678,27 +671,25 @@ impl<'database> JobRepository<'database> {
         let expires_at = now
             .checked_add(lease_duration_seconds)
             .ok_or(JobRepositoryError::QueueInvariant)?;
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let changed = connection
-            .execute(
+        let job_id_owned = job_id.clone();
+        let lease_owned = lease.clone();
+        let changed = self.database.call(move |raw| {
+            let connection = Connection::new(raw);
+            connection.execute(
                 "UPDATE jobs SET heartbeat_at = ?1, lease_expires_at = ?2, updated_at = ?1 WHERE id = ?3 AND state = 'RUNNING' AND lease_id = ?4 AND lease_owner = ?5 AND lease_generation = ?6 AND lease_expires_at = ?7 AND heartbeat_at = ?8 AND lease_expires_at > ?1",
                 (
                     now,
                     expires_at,
-                    job_id.as_str(),
-                    lease.id.as_str(),
-                    lease.owner.as_str(),
-                    i64::try_from(lease.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
-                    lease.expires_at,
-                    lease.heartbeat_at,
+                    job_id_owned.as_str(),
+                    lease_owned.id.as_str(),
+                    lease_owned.owner.as_str(),
+                    i64::try_from(lease_owned.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
+                    lease_owned.expires_at,
+                    lease_owned.heartbeat_at,
                 ),
             )
-            .await
-            .map_err(JobRepositoryError::database)?;
+            .map_err(JobRepositoryError::database)
+        }).await?;
         if changed != 1 {
             return Err(self.ownership_error(job_id).await);
         }
@@ -782,17 +773,15 @@ impl<'database> JobRepository<'database> {
         now: i64,
         failure: JobFailureCode,
     ) -> Result<(), JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+        let job_id = job_id.clone();
+        let lease = lease.clone();
+        self.database.call(move |raw| {
+            let mut connection = Connection::new(raw);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(JobRepositoryError::database)?;
+            let result = (|| {
+            let job = select_owned_running_job(&transaction, &job_id, &lease, now)?;
             if job.kind.as_str() != "PRODUCTION_CRAWL" {
                 let run_id = job
                     .crawl_run_id
@@ -800,11 +789,11 @@ impl<'database> JobRepository<'database> {
                     .ok_or(JobRepositoryError::QueueInvariant)?;
                 let mut rows = transaction
                     .query("SELECT run_type FROM crawl_runs WHERE id = ?1", [run_id])
-                    .await
+
                     .map_err(JobRepositoryError::database)?;
                 let run_type = rows
                     .next()
-                    .await
+
                     .map_err(JobRepositoryError::database)?
                     .ok_or(JobRepositoryError::QueueInvariant)?
                     .get::<String>(0)
@@ -815,13 +804,13 @@ impl<'database> JobRepository<'database> {
             }
             finish_attempt_in_transaction(
                 &transaction,
-                job_id,
-                lease,
+                &job_id,
+                &lease,
                 now,
                 AttemptOutcome::Failed,
                 Some(failure),
             )
-            .await?;
+            ?;
             let changed = transaction
                 .execute(
                     "UPDATE jobs SET state = 'FAILED', scheduled_at = ?1, lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = ?2, updated_at = ?3 WHERE id = ?4 AND state = 'RUNNING' AND lease_id = ?5 AND lease_owner = ?6 AND lease_generation = ?7",
@@ -836,24 +825,24 @@ impl<'database> JobRepository<'database> {
                             .map_err(|_| JobRepositoryError::QueueInvariant)?,
                     ),
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             if changed != 1 {
                 return Err(JobRepositoryError::LeaseLost);
             }
-            finalize_crawl_failure_in_transaction(&transaction, &job, now).await
-        }
-        .await;
+            finalize_crawl_failure_in_transaction(&transaction, &job, now)
+        })();
         match result {
             Ok(()) => transaction
                 .commit()
-                .await
+
                 .map_err(JobRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+        }).await
     }
 
     async fn fail_with_disposition(
@@ -865,25 +854,30 @@ impl<'database> JobRepository<'database> {
         retry_at: i64,
         terminal: bool,
     ) -> Result<JobState, JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
-            let next_state = if !terminal && job.current_attempt < job.max_attempts {
-                JobState::Queued
-            } else {
-                JobState::Failed
-            };
-            finish_attempt_in_transaction(&transaction, job_id, lease, now, AttemptOutcome::Failed, Some(failure)).await?;
-            let changed = transaction
-                .execute(
+        let job_id = job_id.clone();
+        let lease = lease.clone();
+        self.database.call(move |raw| {
+            let mut connection = Connection::new(raw);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(JobRepositoryError::database)?;
+            let result = (|| {
+                let job = select_owned_running_job(&transaction, &job_id, &lease, now)?;
+                let next_state = if !terminal && job.current_attempt < job.max_attempts {
+                    JobState::Queued
+                } else {
+                    JobState::Failed
+                };
+                finish_attempt_in_transaction(
+                    &transaction,
+                    &job_id,
+                    &lease,
+                    now,
+                    AttemptOutcome::Failed,
+                    Some(failure),
+                )?;
+                let changed = transaction
+                    .execute(
                     "UPDATE jobs SET state = ?1, scheduled_at = ?2, lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = ?3, updated_at = ?4 WHERE id = ?5 AND state = 'RUNNING' AND lease_id = ?6 AND lease_owner = ?7 AND lease_generation = ?8",
                     (
                         next_state.as_sql(),
@@ -896,25 +890,24 @@ impl<'database> JobRepository<'database> {
                         i64::try_from(lease.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
                     ),
                 )
-                .await
-                .map_err(JobRepositoryError::database)?;
-            if changed != 1 {
-                return Err(JobRepositoryError::LeaseLost);
+
+                    .map_err(JobRepositoryError::database)?;
+                if changed != 1 {
+                    return Err(JobRepositoryError::LeaseLost);
+                }
+                Ok(next_state)
+            })();
+            match result {
+                Ok(state) => transaction
+                    .commit()
+                    .map(|()| state)
+                    .map_err(JobRepositoryError::database),
+                Err(error) => {
+                    let _ = transaction.rollback();
+                    Err(error)
+                }
             }
-            Ok(next_state)
-        }
-        .await;
-        match result {
-            Ok(state) => transaction
-                .commit()
-                .await
-                .map(|()| state)
-                .map_err(JobRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        }).await
     }
 
     /// Cancels an active attempt only for its current durable owner. Any
@@ -930,71 +923,69 @@ impl<'database> JobRepository<'database> {
         lease: &JobLease,
         now: i64,
     ) -> Result<(), JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
+        let job_id = job_id.clone();
+        let lease = lease.clone();
+        self.database.call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
+        let result = (|| {
+            let job = select_owned_running_job(&transaction, &job_id, &lease, now)?;
             if let Some(run_id) = job.crawl_run_id.as_deref() {
-                let run_status = select_crawl_run_status(&transaction, run_id).await?;
+                let run_status = select_crawl_run_status(&transaction, run_id)?;
                 if matches!(run_status.as_deref(), Some("SUCCEEDED" | "PARTIAL_RESULT")) {
                     finish_attempt_in_transaction(
                         &transaction,
-                        job_id,
-                        lease,
+                        &job_id,
+                        &lease,
                         now,
                         AttemptOutcome::Succeeded,
                         None,
                     )
-                    .await?;
+                    ?;
                     finish_job_after_terminal_run(
                         &transaction,
-                        job_id,
-                        lease,
+                        &job_id,
+                        &lease,
                         now,
                         JobState::Succeeded,
                         None,
                     )
-                    .await?;
+                    ?;
                     return Ok(());
                 }
                 if run_status.as_deref() == Some("FAILED") {
                     finish_attempt_in_transaction(
                         &transaction,
-                        job_id,
-                        lease,
+                        &job_id,
+                        &lease,
                         now,
                         AttemptOutcome::Failed,
                         Some(JobFailureCode::HandlerFailed),
                     )
-                    .await?;
+                    ?;
                     finish_job_after_terminal_run(
                         &transaction,
-                        job_id,
-                        lease,
+                        &job_id,
+                        &lease,
                         now,
                         JobState::Failed,
                         Some(JobFailureCode::HandlerFailed),
                     )
-                    .await?;
+                    ?;
                     return Ok(());
                 }
             }
             finish_attempt_in_transaction(
                 &transaction,
-                job_id,
-                lease,
+                &job_id,
+                &lease,
                 now,
                 AttemptOutcome::Failed,
                 Some(JobFailureCode::Cancelled),
             )
-            .await?;
+            ?;
             let changed = transaction
                 .execute(
                     "UPDATE jobs SET state = 'CANCELLED', lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = 'CANCELLED', updated_at = ?1 WHERE id = ?2 AND state = 'RUNNING' AND lease_id = ?3 AND lease_owner = ?4 AND lease_generation = ?5",
@@ -1007,25 +998,25 @@ impl<'database> JobRepository<'database> {
                             .map_err(|_| JobRepositoryError::QueueInvariant)?,
                     ),
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             if changed != 1 {
                 return Err(JobRepositoryError::LeaseLost);
             }
-            cancel_related_run(&transaction, job.crawl_run_id.as_deref()).await?;
+            cancel_related_run(&transaction, job.crawl_run_id.as_deref())?;
             Ok(())
-        }
-        .await;
+        })();
         match result {
             Ok(()) => transaction
                 .commit()
-                .await
+
                 .map_err(JobRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+        }).await
     }
 
     /// Cancels queued work atomically, or reports the current non-queued state
@@ -1038,17 +1029,14 @@ impl<'database> JobRepository<'database> {
         job_id: &JobId,
         now: i64,
     ) -> Result<JobState, JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
+        let job_id = job_id.clone();
+        self.database.call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let job = select_job(&transaction, job_id).await?;
+        let result = (|| {
+            let job = select_job(&transaction, &job_id)?;
             if job.state != JobState::Queued {
                 return Ok(job.state);
             }
@@ -1057,26 +1045,26 @@ impl<'database> JobRepository<'database> {
                     "UPDATE jobs SET state = 'CANCELLED', failure_code = 'CANCELLED', updated_at = ?1 WHERE id = ?2 AND state = 'QUEUED'",
                     (now, job_id.as_str()),
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             if changed != 1 {
                 return Err(JobRepositoryError::IllegalTransition);
             }
-            cancel_related_run(&transaction, job.crawl_run_id.as_deref()).await?;
+            cancel_related_run(&transaction, job.crawl_run_id.as_deref())?;
             Ok(JobState::Cancelled)
-        }
-        .await;
+        })();
         match result {
             Ok(state) => transaction
                 .commit()
-                .await
+
                 .map(|()| state)
                 .map_err(JobRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+        }).await
     }
 
     /// Changes queue ordering only for work that is still queued. The update
@@ -1092,18 +1080,15 @@ impl<'database> JobRepository<'database> {
         scheduled_at: i64,
         now: i64,
     ) -> Result<JobRecord, JobRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let changed = connection
-            .execute(
+        let job_id_owned = job_id.clone();
+        let changed = self.database.call(move |raw| {
+            let connection = Connection::new(raw);
+            connection.execute(
                 "UPDATE jobs SET priority = ?1, scheduled_at = ?2, updated_at = ?3 WHERE id = ?4 AND state = 'QUEUED'",
-                (priority, scheduled_at, now, job_id.as_str()),
+                (priority, scheduled_at, now, job_id_owned.as_str()),
             )
-            .await
-            .map_err(JobRepositoryError::database)?;
+            .map_err(JobRepositoryError::database)
+        }).await?;
         if changed != 1 {
             if matches!(self.job(job_id).await, Err(JobRepositoryError::NotFound)) {
                 return Err(JobRepositoryError::NotFound);
@@ -1120,17 +1105,14 @@ impl<'database> JobRepository<'database> {
     /// # Errors
     /// Returns `RemovalUnsafe` when any historical or lineage evidence exists.
     pub async fn remove_if_safe(&self, job_id: &JobId) -> Result<(), JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
+        let job_id = job_id.clone();
+        self.database.call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let job = select_job(&transaction, job_id).await?;
+        let result = (|| {
+            let job = select_job(&transaction, &job_id)?;
             if job.state != JobState::Queued
                 || job.current_attempt != 0
                 || job.crawl_run_id.is_some()
@@ -1143,11 +1125,11 @@ impl<'database> JobRepository<'database> {
                     "SELECT EXISTS(SELECT 1 FROM job_attempts WHERE job_id = ?1), EXISTS(SELECT 1 FROM job_checkpoints WHERE job_id = ?1), EXISTS(SELECT 1 FROM job_progress_events WHERE job_id = ?1), EXISTS(SELECT 1 FROM jobs WHERE parent_job_id = ?1)",
                     [job_id.as_str()],
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             let row = rows
                 .next()
-                .await
+
                 .map_err(JobRepositoryError::database)?
                 .ok_or(JobRepositoryError::QueueInvariant)?;
             let has_evidence = (0..4)
@@ -1164,24 +1146,24 @@ impl<'database> JobRepository<'database> {
                     "DELETE FROM jobs WHERE id = ?1 AND state = 'QUEUED' AND current_attempt = 0 AND crawl_run_id IS NULL AND parent_job_id IS NULL",
                     [job_id.as_str()],
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             if changed != 1 {
                 return Err(JobRepositoryError::RemovalUnsafe);
             }
             Ok(())
-        }
-        .await;
+        })();
         match result {
             Ok(()) => transaction
                 .commit()
-                .await
+
                 .map_err(JobRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+        }).await
     }
 
     /// Creates one queued action child with an explicit durable Crawl Run
@@ -1206,32 +1188,36 @@ impl<'database> JobRepository<'database> {
             }
             ActionRunAssociation::None | ActionRunAssociation::SameSourceRun => None,
         };
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
+        let source_job_id = source_job_id.clone();
+        let action_kind = action_kind.clone();
+        let same_source_run = matches!(run_association, ActionRunAssociation::SameSourceRun);
+        let independent_snapshot = match run_association {
+            ActionRunAssociation::NewIndependentRun(snapshot) => Some(snapshot.clone()),
+            ActionRunAssociation::None | ActionRunAssociation::SameSourceRun => None,
+        };
+        self.database.call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let source = select_job(&transaction, source_job_id).await?;
+        let result = (|| {
+            let source = select_job(&transaction, &source_job_id)?;
             validate_action_child_lineage(
                 &transaction,
                 &source,
-                source_job_id,
+                &source_job_id,
                 &action_kind,
             )
-            .await?;
+            ?;
             let child_id = JobId::new();
             let crawl_run_id = action_child_crawl_run_id(
                 &transaction,
                 &source,
-                run_association,
+                same_source_run,
+                independent_snapshot.as_ref(),
                 serialized_snapshot.as_deref(),
             )
-            .await?;
+            ?;
             transaction
                 .execute(
                     "INSERT INTO jobs (id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at) VALUES (?1, ?2, ?3, 'QUEUED', ?4, ?5, ?6, 0, ?7, NULL, NULL, 0, NULL, NULL, NULL, NULL, ?6, ?6)",
@@ -1245,22 +1231,22 @@ impl<'database> JobRepository<'database> {
                         i64::from(max_attempts.unwrap_or(source.max_attempts)),
                     ),
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
-            select_job(&transaction, &child_id).await
-        }
-        .await;
+            select_job(&transaction, &child_id)
+        })();
         match result {
             Ok(job) => transaction
                 .commit()
-                .await
+
                 .map(|()| job)
                 .map_err(JobRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+        }).await
     }
 
     /// Appends a bounded checkpoint while the supplied lease still owns its
@@ -1296,47 +1282,44 @@ impl<'database> JobRepository<'database> {
         lease: &JobLease,
         now: i64,
     ) -> Result<JobState, JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let job = select_owned_running_job(&transaction, job_id, lease, now).await?;
-            if let Some(run_id) = job.crawl_run_id.as_deref()
-                && let Some(reconciliation) = finish_after_terminal_crawl_run(
+        let job_id = job_id.clone();
+        let lease = lease.clone();
+        let result_job_id = job_id.clone();
+        let (reconciliation, state) = self.database.call(move |raw| {
+            let mut connection = Connection::new(raw);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(JobRepositoryError::database)?;
+            let result = (|| {
+                let job = select_owned_running_job(&transaction, &job_id, &lease, now)?;
+                if let Some(run_id) = job.crawl_run_id.as_deref()
+                    && let Some(reconciliation) = finish_after_terminal_crawl_run(
+                        &transaction,
+                        &job_id,
+                        &lease,
+                        run_id,
+                        now,
+                    )?
+                {
+                    return Ok((Some(reconciliation), reconciliation.state));
+                }
+                let has_current_attempt_checkpoint =
+                    has_checkpoint_for_current_attempt(&transaction, &job_id, &lease)?;
+                let next_state =
+                    if has_current_attempt_checkpoint && job.current_attempt < job.max_attempts {
+                        JobState::Queued
+                    } else {
+                        JobState::Failed
+                    };
+                finish_attempt_in_transaction(
                     &transaction,
-                    job_id,
-                    lease,
-                    run_id,
+                    &job_id,
+                    &lease,
                     now,
-                )
-                .await?
-            {
-                return Ok(Some(reconciliation));
-            }
-            let has_current_attempt_checkpoint =
-                has_checkpoint_for_current_attempt(&transaction, job_id, lease).await?;
-            let next_state = if has_current_attempt_checkpoint && job.current_attempt < job.max_attempts {
-                JobState::Queued
-            } else {
-                JobState::Failed
-            };
-            finish_attempt_in_transaction(
-                &transaction,
-                job_id,
-                lease,
-                now,
-                AttemptOutcome::Failed,
-                Some(JobFailureCode::StoragePressure),
-            )
-            .await?;
-            let changed = transaction
-                .execute(
+                    AttemptOutcome::Failed,
+                    Some(JobFailureCode::StoragePressure),
+                )?;
+                let changed = transaction.execute(
                     "UPDATE jobs SET state = ?1, scheduled_at = ?2, lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = 'STORAGE_PRESSURE', updated_at = ?2 WHERE id = ?3 AND state = 'RUNNING' AND lease_id = ?4 AND lease_owner = ?5 AND lease_generation = ?6",
                     (
                         next_state.as_sql(),
@@ -1347,39 +1330,32 @@ impl<'database> JobRepository<'database> {
                         i64::try_from(lease.generation)
                             .map_err(|_| JobRepositoryError::QueueInvariant)?,
                     ),
-                )
-                .await
-                .map_err(JobRepositoryError::database)?;
-            if changed != 1 {
-                return Err(JobRepositoryError::LeaseLost);
-            }
-            if next_state == JobState::Failed && job.crawl_run_id.is_some() {
-                finalize_crawl_failure_in_transaction(&transaction, &job, now).await?;
-            }
-            Ok(None::<TerminalJobReconciliation>)
-        }
-        .await;
-        match result {
-            Ok(reconciliation) => {
-                transaction
+                )?;
+                if changed != 1 {
+                    return Err(JobRepositoryError::LeaseLost);
+                }
+                if next_state == JobState::Failed && job.crawl_run_id.is_some() {
+                    finalize_crawl_failure_in_transaction(&transaction, &job, now)?;
+                }
+                Ok((None, next_state))
+            })();
+            match result {
+                Ok(value) => transaction
                     .commit()
-                    .await
-                    .map_err(JobRepositoryError::database)?;
-                if let Some(reconciliation) = reconciliation {
-                    self.append_terminal_progress_if_missing(job_id, reconciliation.progress, now)
-                        .await?;
-                    Ok(reconciliation.state)
-                } else {
-                    // The normal pressure transition returns its state through
-                    // the durable row; re-read it only after commit so this
-                    // branch remains independent of projection repair.
-                    Ok(self.job(job_id).await?.state)
+                    .map(|()| value)
+                    .map_err(JobRepositoryError::database),
+                Err(error) => {
+                    let _ = transaction.rollback();
+                    Err(error)
                 }
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+        }).await?;
+        if let Some(reconciliation) = reconciliation {
+            self.append_terminal_progress_if_missing(&result_job_id, reconciliation.progress, now)
+                .await?;
+            Ok(reconciliation.state)
+        } else {
+            Ok(state)
         }
     }
 
@@ -1455,33 +1431,29 @@ impl<'database> JobRepository<'database> {
         &self,
         now: i64,
     ) -> Result<StaleJobRecovery, JobRepositoryError> {
-        let mut connection = self
+        let recovery = self
             .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            ensure_queue_invariants(&transaction).await?;
-            recover_expired_in_transaction(&transaction, now).await
-        }
-        .await;
-        let recovery = match result {
-            Ok(recovery) => {
-                transaction
-                    .commit()
-                    .await
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(JobRepositoryError::database)?;
-                recovery
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        };
+                let result = (|| {
+                    ensure_queue_invariants(&transaction)?;
+                    recover_expired_in_transaction(&transaction, now)
+                })();
+                match result {
+                    Ok(recovery) => transaction
+                        .commit()
+                        .map(|()| recovery)
+                        .map_err(JobRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
+            .await?;
         // This scan is deliberately derived from durable rows. It repairs
         // terminal progress after a process restart even when the worker had
         // already released the Job lease before the append failed.
@@ -1497,25 +1469,21 @@ impl<'database> JobRepository<'database> {
     /// Returns a typed queue/progress error. Job and attempt reconciliation is
     /// committed before a later progress-projection error is returned.
     pub async fn reconcile_terminal_crawl_runs(&self, now: i64) -> Result<(), JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
+        let repairs = self.database.call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(JobRepositoryError::database)?;
-        let result = async {
+        let result = (|| {
             let mut rows = transaction
                 .query(
                     "SELECT jobs.id, crawl_runs.status FROM jobs JOIN crawl_runs ON crawl_runs.id = jobs.crawl_run_id WHERE crawl_runs.status IN ('SUCCEEDED', 'PARTIAL_RESULT', 'FAILED', 'CANCELLED') ORDER BY jobs.id",
                     (),
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             let mut repairs = Vec::new();
-            while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
+            while let Some(row) = rows.next().map_err(JobRepositoryError::database)? {
                 let job_id = JobId(row.get(0).map_err(JobRepositoryError::database)?);
                 let run_status = row
                     .get::<String>(1)
@@ -1526,27 +1494,27 @@ impl<'database> JobRepository<'database> {
                     &run_status,
                     now,
                 )
-                .await?
+                ?
                 {
                     repairs.push((job_id, reconciliation.progress));
                 }
             }
             Ok::<_, JobRepositoryError>(repairs)
-        }
-        .await;
-        let repairs = match result {
+        })();
+        match result {
             Ok(repairs) => {
                 transaction
                     .commit()
-                    .await
+
                     .map_err(JobRepositoryError::database)?;
-                repairs
+                Ok(repairs)
             }
             Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
+                let _ = transaction.rollback();
+                Err(error)
             }
-        };
+        }
+        }).await?;
         for (job_id, terminal) in repairs {
             self.append_terminal_progress_if_missing(&job_id, terminal, now)
                 .await?;
@@ -1567,44 +1535,48 @@ impl<'database> JobRepository<'database> {
         run_id: &str,
         now: i64,
     ) -> Result<TerminalJobReconciliation, JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            let run_status = select_crawl_run_status(&transaction, run_id)
-                .await?
-                .ok_or(JobRepositoryError::QueueInvariant)?;
-            let current_job = select_job(&transaction, job_id).await?;
-            if current_job.crawl_run_id.as_deref() != Some(run_id) {
-                return Err(JobRepositoryError::QueueInvariant);
-            }
-            if current_job.state == JobState::Running && current_job.lease.as_ref() != Some(lease) {
-                return Err(JobRepositoryError::LeaseLost);
-            }
-            let reconciliation =
-                reconcile_terminal_job_in_transaction(&transaction, job_id, &run_status, now)
-                    .await?
+        let job_id = job_id.clone();
+        let lease = lease.clone();
+        let run_id = run_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(JobRepositoryError::database)?;
+                let result = (|| {
+                    let run_status = select_crawl_run_status(&transaction, run_id.as_str())?
+                        .ok_or(JobRepositoryError::QueueInvariant)?;
+                    let current_job = select_job(&transaction, &job_id)?;
+                    if current_job.crawl_run_id.as_deref() != Some(run_id.as_str()) {
+                        return Err(JobRepositoryError::QueueInvariant);
+                    }
+                    if current_job.state == JobState::Running
+                        && current_job.lease.as_ref() != Some(&lease)
+                    {
+                        return Err(JobRepositoryError::LeaseLost);
+                    }
+                    let reconciliation = reconcile_terminal_job_in_transaction(
+                        &transaction,
+                        &job_id,
+                        &run_status,
+                        now,
+                    )?
                     .ok_or(JobRepositoryError::QueueInvariant)?;
-            Ok(reconciliation)
-        }
-        .await;
-        match result {
-            Ok(reconciliation) => transaction
-                .commit()
-                .await
-                .map(|()| reconciliation)
-                .map_err(JobRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+                    Ok(reconciliation)
+                })();
+                match result {
+                    Ok(reconciliation) => transaction
+                        .commit()
+                        .map(|()| reconciliation)
+                        .map_err(JobRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
+            .await
     }
 
     /// Repairs one terminal progress projection in its own immediate
@@ -1620,28 +1592,28 @@ impl<'database> JobRepository<'database> {
         terminal: ProgressTerminalState,
         now: i64,
     ) -> Result<(), JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
+        let job_id = job_id.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(JobRepositoryError::database)?;
+                let result = append_terminal_progress_if_missing_in_transaction(
+                    &transaction,
+                    &job_id,
+                    terminal,
+                    now,
+                );
+                match result {
+                    Ok(()) => transaction.commit().map_err(JobRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result =
-            append_terminal_progress_if_missing_in_transaction(&transaction, job_id, terminal, now)
-                .await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(JobRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Reconstructs scheduler occupancy from authoritative current leases.
@@ -1654,23 +1626,21 @@ impl<'database> JobRepository<'database> {
         now: i64,
     ) -> Result<ConcurrencyState, JobRepositoryError> {
         self.check_invariants().await?;
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let mut rows = connection
-            .query(
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut rows = connection.query(
                 "SELECT id FROM jobs WHERE state = 'RUNNING' AND lease_expires_at > ?1 ORDER BY id",
                 [now],
             )
-            .await
             .map_err(JobRepositoryError::database)?;
-        let mut running_jobs = Vec::new();
-        while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
-            running_jobs.push(JobId(row.get(0).map_err(JobRepositoryError::database)?));
-        }
-        Ok(ConcurrencyState { running_jobs })
+                let mut running_jobs = Vec::new();
+                while let Some(row) = rows.next().map_err(JobRepositoryError::database)? {
+                    running_jobs.push(JobId(row.get(0).map_err(JobRepositoryError::database)?));
+                }
+                Ok(ConcurrencyState { running_jobs })
+            })
+            .await
     }
 
     /// Reads one job without exposing a raw mutable database handle.
@@ -1679,12 +1649,13 @@ impl<'database> JobRepository<'database> {
     /// Returns `NotFound` when no job has this identity, or an error when its
     /// persisted state cannot be read safely.
     pub async fn job(&self, job_id: &JobId) -> Result<JobRecord, JobRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        let job_id = job_id.clone();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                select_job(&connection, &job_id)
+            })
             .await
-            .map_err(JobRepositoryError::from_db)?;
-        select_job(&connection, job_id).await
     }
 
     /// Returns durable attempt history in execution order.
@@ -1692,23 +1663,20 @@ impl<'database> JobRepository<'database> {
     /// # Errors
     /// Returns an error when attempt history cannot be read or is invalid.
     pub async fn attempts(&self, job_id: &JobId) -> Result<Vec<JobAttempt>, JobRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let mut rows = connection
-            .query(
+        let job_id = job_id.clone();
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
+        let mut rows = connection.query(
                 "SELECT id, job_id, attempt_number, lease_id, lease_generation, worker_id, started_at, finished_at, outcome, failure_code FROM job_attempts WHERE job_id = ?1 ORDER BY attempt_number",
                 [job_id.as_str()],
             )
-            .await
             .map_err(JobRepositoryError::database)?;
         let mut attempts = Vec::new();
-        while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
-            attempts.push(attempt_from_row(&row)?);
+        while let Some(row) = rows.next().map_err(JobRepositoryError::database)? {
+            attempts.push(attempt_from_row(row)?);
         }
         Ok(attempts)
+        }).await
     }
 
     /// Validates queue ownership/history relationships without altering data.
@@ -1717,12 +1685,12 @@ impl<'database> JobRepository<'database> {
     /// Returns `QueueInvariant` when durable ownership/history is inconsistent,
     /// or an error when the database cannot be inspected.
     pub async fn check_invariants(&self) -> Result<(), JobRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                ensure_queue_invariants(&connection)
+            })
             .await
-            .map_err(JobRepositoryError::from_db)?;
-        ensure_queue_invariants(&connection).await
     }
 
     async fn ownership_error(&self, job_id: &JobId) -> JobRepositoryError {
@@ -1741,18 +1709,16 @@ impl<'database> JobRepository<'database> {
         outcome: AttemptOutcome,
         failure: Option<JobFailureCode>,
     ) -> Result<(), JobRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(JobRepositoryError::database)?;
-        let result = async {
-            select_owned_running_job(&transaction, job_id, lease, now).await?;
-            finish_attempt_in_transaction(&transaction, job_id, lease, now, outcome, failure).await?;
+        let job_id = job_id.clone();
+        let lease = lease.clone();
+        self.database.call(move |raw| {
+            let mut connection = Connection::new(raw);
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(JobRepositoryError::database)?;
+            let result = (|| {
+            select_owned_running_job(&transaction, &job_id, &lease, now)?;
+            finish_attempt_in_transaction(&transaction, &job_id, &lease, now, outcome, failure)?;
             let changed = transaction
                 .execute(
                     "UPDATE jobs SET state = 'SUCCEEDED', lease_id = NULL, lease_owner = NULL, lease_acquired_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL, failure_code = NULL, updated_at = ?1 WHERE id = ?2 AND state = 'RUNNING' AND lease_id = ?3 AND lease_owner = ?4 AND lease_generation = ?5",
@@ -1764,30 +1730,24 @@ impl<'database> JobRepository<'database> {
                         i64::try_from(lease.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
                     ),
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
             if changed != 1 {
                 return Err(JobRepositoryError::LeaseLost);
             }
             Ok(())
-        }
-        .await;
+        })();
         match result {
             Ok(()) => transaction
                 .commit()
-                .await
+
                 .map_err(JobRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
-    }
-}
-
-impl JobRepositoryError {
-    fn from_db(error: DbError) -> Self {
-        Self::Database(error)
+        }).await
     }
 }
 
@@ -1798,8 +1758,8 @@ fn is_recovery_continuation_kind(kind: &str) -> bool {
     )
 }
 
-async fn validate_action_child_lineage(
-    connection: &Connection,
+fn validate_action_child_lineage(
+    connection: &impl crate::SqliteExecutor,
     source: &JobRecord,
     source_job_id: &JobId,
     action_kind: &JobKind,
@@ -1807,7 +1767,7 @@ async fn validate_action_child_lineage(
     if matches!(source.state, JobState::Queued | JobState::Running) {
         return Err(JobRepositoryError::IllegalTransition);
     }
-    if active_equivalent_action_child(connection, source_job_id, action_kind).await? {
+    if active_equivalent_action_child(connection, source_job_id, action_kind)? {
         return Err(JobRepositoryError::ActionAlreadyActive);
     }
     if is_recovery_continuation_kind(action_kind.as_str())
@@ -1815,33 +1775,30 @@ async fn validate_action_child_lineage(
             connection,
             source_job_id,
             "kind IN ('RETRY', 'RETRY_FAILED_PARTS', 'RESUME_CHECKPOINT', 'RESTART_FROM_BEGINNING') AND state IN ('QUEUED', 'RUNNING')",
-        )
-        .await?
+        )?
     {
         return Err(JobRepositoryError::ActionAlreadyActive);
     }
     Ok(())
 }
 
-async fn action_child_exists(
-    connection: &Connection,
+fn action_child_exists(
+    connection: &impl crate::SqliteExecutor,
     source_job_id: &JobId,
     predicate: &'static str,
 ) -> Result<bool, JobRepositoryError> {
     let query = format!("SELECT 1 FROM jobs WHERE parent_job_id = ?1 AND {predicate} LIMIT 1");
     let mut children = connection
-        .query(query, [source_job_id.as_str()])
-        .await
+        .query(query.as_str(), [source_job_id.as_str()])
         .map_err(JobRepositoryError::database)?;
     children
         .next()
-        .await
         .map_err(JobRepositoryError::database)
         .map(|row| row.is_some())
 }
 
-async fn active_equivalent_action_child(
-    connection: &Connection,
+fn active_equivalent_action_child(
+    connection: &impl crate::SqliteExecutor,
     source_job_id: &JobId,
     action_kind: &JobKind,
 ) -> Result<bool, JobRepositoryError> {
@@ -1850,58 +1807,54 @@ async fn active_equivalent_action_child(
             "SELECT 1 FROM jobs WHERE parent_job_id = ?1 AND kind = ?2 AND state IN ('QUEUED', 'RUNNING') LIMIT 1",
             (source_job_id.as_str(), action_kind.as_str()),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     children
         .next()
-        .await
         .map_err(JobRepositoryError::database)
         .map(|row| row.is_some())
 }
 
-async fn action_child_crawl_run_id(
-    connection: &Connection,
+fn action_child_crawl_run_id(
+    connection: &impl crate::SqliteExecutor,
     source: &JobRecord,
-    association: ActionRunAssociation<'_>,
+    same_source_run: bool,
+    independent_snapshot: Option<&CrawlRunSnapshot>,
     serialized_snapshot: Option<&str>,
 ) -> Result<Option<String>, JobRepositoryError> {
-    match association {
-        ActionRunAssociation::None => Ok(None),
-        ActionRunAssociation::SameSourceRun => {
-            let run_id = source
-                .crawl_run_id
-                .as_deref()
-                .ok_or(JobRepositoryError::QueueInvariant)?;
-            let changed = connection
+    if same_source_run {
+        let run_id = source
+            .crawl_run_id
+            .as_deref()
+            .ok_or(JobRepositoryError::QueueInvariant)?;
+        let changed = connection
                 .execute(
                     "UPDATE crawl_runs SET status = 'QUEUED' WHERE id = ?1 AND status IN ('QUEUED', 'SUCCEEDED', 'PARTIAL_RESULT', 'FAILED', 'CANCELLED')",
                     [run_id],
                 )
-                .await
+
                 .map_err(JobRepositoryError::database)?;
-            if changed != 1 {
-                return Err(JobRepositoryError::QueueInvariant);
-            }
-            Ok(Some(run_id.to_owned()))
+        if changed != 1 {
+            return Err(JobRepositoryError::QueueInvariant);
         }
-        ActionRunAssociation::NewIndependentRun(snapshot) => {
-            let run_id = CrawlRunId::new();
-            insert_run_in_transaction(
-                connection,
-                run_id,
-                CrawlRunStatus::Queued,
-                snapshot,
-                serialized_snapshot.ok_or(JobRepositoryError::QueueInvariant)?,
-            )
-            .await
-            .map_err(JobRepositoryError::from_db)?;
-            Ok(Some(run_id.to_string()))
-        }
+        Ok(Some(run_id.to_owned()))
+    } else if let Some(snapshot) = independent_snapshot {
+        let run_id = CrawlRunId::new();
+        insert_run_in_transaction(
+            connection,
+            run_id,
+            CrawlRunStatus::Queued,
+            snapshot,
+            serialized_snapshot.ok_or(JobRepositoryError::QueueInvariant)?,
+        )?;
+        Ok(Some(run_id.to_string()))
+    } else {
+        Ok(None)
     }
 }
 
-async fn select_eligible_job(
-    connection: &Connection,
+fn select_eligible_job(
+    connection: &impl crate::SqliteExecutor,
     now: i64,
     allow_artifact_heavy: bool,
 ) -> Result<Option<JobId>, JobRepositoryError> {
@@ -1910,17 +1863,16 @@ async fn select_eligible_job(
             "SELECT id FROM jobs WHERE state = 'QUEUED' AND scheduled_at <= ?1 AND (?2 = 1 OR crawl_run_id IS NULL) ORDER BY priority DESC, scheduled_at, created_at, id LIMIT 1",
             (now, i64::from(allow_artifact_heavy)),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     rows.next()
-        .await
         .map_err(JobRepositoryError::database)?
         .map(|row| row.get(0).map(JobId).map_err(JobRepositoryError::database))
         .transpose()
 }
 
-async fn has_checkpoint_for_current_attempt(
-    connection: &Connection,
+fn has_checkpoint_for_current_attempt(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     lease: &JobLease,
 ) -> Result<bool, JobRepositoryError> {
@@ -1933,11 +1885,10 @@ async fn has_checkpoint_for_current_attempt(
                 i64::try_from(lease.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
             ),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     let row = rows
         .next()
-        .await
         .map_err(JobRepositoryError::database)?
         .ok_or(JobRepositoryError::QueueInvariant)?;
     row.get::<i64>(0)
@@ -1945,8 +1896,8 @@ async fn has_checkpoint_for_current_attempt(
         .map_err(JobRepositoryError::database)
 }
 
-async fn has_any_checkpoint(
-    connection: &Connection,
+fn has_any_checkpoint(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<bool, JobRepositoryError> {
     let mut rows = connection
@@ -1954,11 +1905,9 @@ async fn has_any_checkpoint(
             "SELECT EXISTS(SELECT 1 FROM job_checkpoints WHERE job_id = ?1)",
             [job_id.as_str()],
         )
-        .await
         .map_err(JobRepositoryError::database)?;
     let row = rows
         .next()
-        .await
         .map_err(JobRepositoryError::database)?
         .ok_or(JobRepositoryError::QueueInvariant)?;
     row.get::<i64>(0)
@@ -1966,15 +1915,15 @@ async fn has_any_checkpoint(
         .map_err(JobRepositoryError::database)
 }
 
-async fn lease_queued_job(
-    connection: &Connection,
+fn lease_queued_job(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     worker_id: &str,
     now: i64,
     lease_duration_seconds: i64,
     allow_artifact_heavy: bool,
 ) -> Result<AcquiredJob, JobRepositoryError> {
-    let job = select_job(connection, job_id).await?;
+    let job = select_job(connection, job_id)?;
     if job.state != JobState::Queued
         || job.scheduled_at > now
         || job.current_attempt >= job.max_attempts
@@ -2004,7 +1953,7 @@ async fn lease_queued_job(
                 i64::from(job.current_attempt),
             ),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     if changed != 1 {
         return Err(JobRepositoryError::IllegalTransition);
@@ -2034,19 +1983,19 @@ async fn lease_queued_job(
                 now,
             ),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
-    let job = select_job(connection, job_id).await?;
+    let job = select_job(connection, job_id)?;
     Ok(AcquiredJob { job, attempt })
 }
 
-async fn select_owned_running_job(
-    connection: &Connection,
+fn select_owned_running_job(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     lease: &JobLease,
     now: i64,
 ) -> Result<JobRecord, JobRepositoryError> {
-    let job = select_job(connection, job_id).await?;
+    let job = select_job(connection, job_id)?;
     if job.state != JobState::Running {
         return Err(JobRepositoryError::IllegalTransition);
     }
@@ -2056,8 +2005,8 @@ async fn select_owned_running_job(
     Ok(job)
 }
 
-async fn finish_attempt_in_transaction(
-    connection: &Connection,
+fn finish_attempt_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     lease: &JobLease,
     now: i64,
@@ -2077,7 +2026,7 @@ async fn finish_attempt_in_transaction(
                 lease.owner.as_str(),
             ),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     if changed != 1 {
         return Err(JobRepositoryError::LeaseLost);
@@ -2086,8 +2035,8 @@ async fn finish_attempt_in_transaction(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn recover_expired_in_transaction(
-    connection: &Connection,
+fn recover_expired_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     now: i64,
 ) -> Result<StaleJobRecovery, JobRepositoryError> {
     let mut rows = connection
@@ -2095,17 +2044,16 @@ async fn recover_expired_in_transaction(
             "SELECT id FROM jobs WHERE state = 'RUNNING' AND lease_expires_at <= ?1 ORDER BY id",
             [now],
         )
-        .await
         .map_err(JobRepositoryError::database)?;
     let mut ids = Vec::new();
-    while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
+    while let Some(row) = rows.next().map_err(JobRepositoryError::database)? {
         ids.push(JobId(row.get(0).map_err(JobRepositoryError::database)?));
     }
     drop(rows);
 
     let mut recovery = StaleJobRecovery::default();
     for id in ids {
-        let job = select_job(connection, &id).await?;
+        let job = select_job(connection, &id)?;
         let lease = job
             .lease
             .clone()
@@ -2118,13 +2066,11 @@ async fn recover_expired_in_transaction(
         // authoritative at that point: reconcile this Job rather than trying
         // to force the terminal run through the generic failure transition.
         if let Some(run_id) = job.crawl_run_id.as_deref()
-            && finish_after_terminal_crawl_run(connection, &id, &lease, run_id, now)
-                .await?
-                .is_some()
+            && finish_after_terminal_crawl_run(connection, &id, &lease, run_id, now)?.is_some()
         {
             continue;
         }
-        let has_checkpoint = has_any_checkpoint(connection, &id).await?;
+        let has_checkpoint = has_any_checkpoint(connection, &id)?;
         let disposition = if job.crawl_run_id.is_some() || has_checkpoint {
             Some(
                 super::checkpoint::assess_one_stale_job(
@@ -2132,7 +2078,6 @@ async fn recover_expired_in_transaction(
                     &id,
                     job.crawl_run_id.as_deref(),
                 )
-                .await
                 .map_err(JobRepositoryError::Checkpoint)?,
             )
         } else {
@@ -2167,8 +2112,7 @@ async fn recover_expired_in_transaction(
             now,
             AttemptOutcome::LeaseExpired,
             Some(JobFailureCode::LeaseExpired),
-        )
-        .await?;
+        )?;
         let next_state = if checkpoint_allows_recovery && job.current_attempt < job.max_attempts {
             recovery.requeued = recovery.requeued.saturating_add(1);
             JobState::Queued
@@ -2188,20 +2132,20 @@ async fn recover_expired_in_transaction(
                     i64::try_from(lease.generation).map_err(|_| JobRepositoryError::QueueInvariant)?,
                 ),
             )
-            .await
+
             .map_err(JobRepositoryError::database)?;
         if changed != 1 {
             return Err(JobRepositoryError::LeaseLost);
         }
         if next_state == JobState::Failed && job.crawl_run_id.is_some() {
-            finalize_crawl_failure_in_transaction(connection, &job, now).await?;
+            finalize_crawl_failure_in_transaction(connection, &job, now)?;
         }
     }
     Ok(recovery)
 }
 
-async fn finalize_crawl_failure_in_transaction(
-    connection: &Connection,
+fn finalize_crawl_failure_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     job: &JobRecord,
     now: i64,
 ) -> Result<(), JobRepositoryError> {
@@ -2212,7 +2156,6 @@ async fn finalize_crawl_failure_in_transaction(
         .and_then(CrawlRunId::from_uuid)
         .ok_or(JobRepositoryError::QueueInvariant)?;
     transition_execution_status_in_transaction(connection, run_id, CrawlRunStatus::Failed)
-        .await
         .map_err(|_| JobRepositoryError::QueueInvariant)?;
     let event = NewProgressEvent::terminal(
         job.id.clone(),
@@ -2221,13 +2164,12 @@ async fn finalize_crawl_failure_in_transaction(
     )
     .map_err(|_| JobRepositoryError::QueueInvariant)?;
     append_in_transaction(connection, &event, now)
-        .await
         .map(|_| ())
         .map_err(|_| JobRepositoryError::QueueInvariant)
 }
 
-async fn cancel_related_run(
-    connection: &Connection,
+fn cancel_related_run(
+    connection: &impl crate::SqliteExecutor,
     crawl_run_id: Option<&str>,
 ) -> Result<(), JobRepositoryError> {
     let Some(crawl_run_id) = crawl_run_id else {
@@ -2238,38 +2180,36 @@ async fn cancel_related_run(
             "UPDATE crawl_runs SET status = 'CANCELLED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING')",
             [crawl_run_id],
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     Ok(())
 }
 
-async fn select_crawl_run_status(
-    connection: &Connection,
+fn select_crawl_run_status(
+    connection: &impl crate::SqliteExecutor,
     run_id: &str,
 ) -> Result<Option<String>, JobRepositoryError> {
     let mut rows = connection
         .query("SELECT status FROM crawl_runs WHERE id = ?1", [run_id])
-        .await
         .map_err(JobRepositoryError::database)?;
     rows.next()
-        .await
         .map_err(JobRepositoryError::database)?
         .map(|row| row.get::<String>(0).map_err(JobRepositoryError::database))
         .transpose()
 }
 
-async fn finish_after_terminal_crawl_run(
-    connection: &Connection,
+fn finish_after_terminal_crawl_run(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     lease: &JobLease,
     run_id: &str,
     now: i64,
 ) -> Result<Option<TerminalJobReconciliation>, JobRepositoryError> {
-    let Some(run_status) = select_crawl_run_status(connection, run_id).await? else {
+    let Some(run_status) = select_crawl_run_status(connection, run_id)? else {
         return Ok(None);
     };
     let Some(reconciliation) =
-        reconcile_terminal_job_in_transaction(connection, job_id, &run_status, now).await?
+        reconcile_terminal_job_in_transaction(connection, job_id, &run_status, now)?
     else {
         return Ok(None);
     };
@@ -2279,8 +2219,8 @@ async fn finish_after_terminal_crawl_run(
 
 /// Maps a terminal `CrawlRun` to the durable Job/JobAttempt outcome. It does not
 /// touch the progress projection, which must be independently repairable.
-async fn reconcile_terminal_job_in_transaction(
-    connection: &Connection,
+fn reconcile_terminal_job_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     run_status: &str,
     now: i64,
@@ -2306,15 +2246,15 @@ async fn reconcile_terminal_job_in_transaction(
         ),
         _ => return Ok(None),
     };
-    let job = select_job(connection, job_id).await?;
+    let job = select_job(connection, job_id)?;
     match job.state {
         JobState::Running => {
             let lease = job
                 .lease
                 .as_ref()
                 .ok_or(JobRepositoryError::QueueInvariant)?;
-            finish_attempt_in_transaction(connection, job_id, lease, now, outcome, failure).await?;
-            finish_job_after_terminal_run(connection, job_id, lease, now, state, failure).await?;
+            finish_attempt_in_transaction(connection, job_id, lease, now, outcome, failure)?;
+            finish_job_after_terminal_run(connection, job_id, lease, now, state, failure)?;
         }
         JobState::Succeeded if state == JobState::Succeeded => {}
         JobState::Failed if state == JobState::Failed => {}
@@ -2330,8 +2270,8 @@ async fn reconcile_terminal_job_in_transaction(
 /// Completes a progress stream exactly once while reconciliation is repairing
 /// a terminal `CrawlRun`. A different prior terminal state is durable corruption
 /// rather than a state to overwrite.
-async fn append_terminal_progress_if_missing_in_transaction(
-    connection: &Connection,
+fn append_terminal_progress_if_missing_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     terminal: ProgressTerminalState,
     now: i64,
@@ -2341,10 +2281,10 @@ async fn append_terminal_progress_if_missing_in_transaction(
             "SELECT sequence, payload_json FROM job_progress_events WHERE job_id = ?1 ORDER BY sequence ASC",
             [job_id.as_str()],
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     let mut terminal_count = 0_u8;
-    while let Some(row) = rows.next().await.map_err(JobRepositoryError::database)? {
+    while let Some(row) = rows.next().map_err(JobRepositoryError::database)? {
         let _sequence = row.get::<i64>(0).map_err(JobRepositoryError::database)?;
         let payload = row.get::<String>(1).map_err(JobRepositoryError::database)?;
         let payload: serde_json::Value =
@@ -2372,13 +2312,12 @@ async fn append_terminal_progress_if_missing_in_transaction(
     let event = NewProgressEvent::terminal(job_id.clone(), terminal, ProgressMetadata::default())
         .map_err(|_| JobRepositoryError::QueueInvariant)?;
     append_in_transaction(connection, &event, now)
-        .await
         .map(|_| ())
         .map_err(|_| JobRepositoryError::QueueInvariant)
 }
 
-async fn finish_job_after_terminal_run(
-    connection: &Connection,
+fn finish_job_after_terminal_run(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     lease: &JobLease,
     now: i64,
@@ -2399,7 +2338,7 @@ async fn finish_job_after_terminal_run(
                     .map_err(|_| JobRepositoryError::QueueInvariant)?,
             ),
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     if changed != 1 {
         return Err(JobRepositoryError::LeaseLost);
@@ -2407,8 +2346,8 @@ async fn finish_job_after_terminal_run(
     Ok(())
 }
 
-async fn select_job(
-    connection: &Connection,
+fn select_job(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<JobRecord, JobRepositoryError> {
     let mut rows = connection
@@ -2416,17 +2355,16 @@ async fn select_job(
             "SELECT id, kind, priority, state, parent_job_id, crawl_run_id, scheduled_at, current_attempt, max_attempts, lease_id, lease_owner, lease_generation, lease_acquired_at, lease_expires_at, heartbeat_at, failure_code, created_at, updated_at FROM jobs WHERE id = ?1",
             [job_id.as_str()],
         )
-        .await
+
         .map_err(JobRepositoryError::database)?;
     let row = rows
         .next()
-        .await
         .map_err(JobRepositoryError::database)?
         .ok_or(JobRepositoryError::NotFound)?;
-    job_from_row(&row)
+    job_from_row(row)
 }
 
-fn job_from_row(row: &turso::Row) -> Result<JobRecord, JobRepositoryError> {
+fn job_from_row(row: &Row) -> Result<JobRecord, JobRepositoryError> {
     let state = JobState::parse(&row.get::<String>(3).map_err(JobRepositoryError::database)?)?;
     let lease_id: Option<String> = row.get(9).map_err(JobRepositoryError::database)?;
     let lease = match lease_id {
@@ -2468,7 +2406,7 @@ fn job_from_row(row: &turso::Row) -> Result<JobRecord, JobRepositoryError> {
     })
 }
 
-fn attempt_from_row(row: &turso::Row) -> Result<JobAttempt, JobRepositoryError> {
+fn attempt_from_row(row: &Row) -> Result<JobAttempt, JobRepositoryError> {
     let failure: Option<String> = row.get(9).map_err(JobRepositoryError::database)?;
     Ok(JobAttempt {
         id: row.get(0).map_err(JobRepositoryError::database)?,
@@ -2488,7 +2426,9 @@ fn attempt_from_row(row: &turso::Row) -> Result<JobAttempt, JobRepositoryError> 
     })
 }
 
-async fn ensure_queue_invariants(connection: &Connection) -> Result<(), JobRepositoryError> {
+fn ensure_queue_invariants(
+    connection: &impl crate::SqliteExecutor,
+) -> Result<(), JobRepositoryError> {
     const INCONSISTENCIES: [&str; 5] = [
         "SELECT 1 FROM jobs AS job WHERE (job.state = 'RUNNING' AND (job.current_attempt = 0 OR job.lease_id IS NULL OR job.lease_owner IS NULL OR job.lease_generation = 0 OR job.lease_acquired_at IS NULL OR job.lease_expires_at IS NULL OR job.heartbeat_at IS NULL)) OR (job.state <> 'RUNNING' AND (job.lease_id IS NOT NULL OR job.lease_owner IS NOT NULL OR job.lease_acquired_at IS NOT NULL OR job.lease_expires_at IS NOT NULL OR job.heartbeat_at IS NOT NULL)) LIMIT 1",
         "SELECT 1 FROM jobs AS job LEFT JOIN job_attempts AS attempt ON attempt.job_id = job.id AND attempt.attempt_number = job.current_attempt AND attempt.outcome = 'RUNNING' WHERE job.state = 'RUNNING' AND (attempt.id IS NULL OR attempt.lease_id <> job.lease_id OR attempt.lease_generation <> job.lease_generation OR attempt.worker_id <> job.lease_owner) LIMIT 1",
@@ -2499,14 +2439,8 @@ async fn ensure_queue_invariants(connection: &Connection) -> Result<(), JobRepos
     for query in INCONSISTENCIES {
         let mut rows = connection
             .query(query, ())
-            .await
             .map_err(JobRepositoryError::database)?;
-        if rows
-            .next()
-            .await
-            .map_err(JobRepositoryError::database)?
-            .is_some()
-        {
+        if rows.next().map_err(JobRepositoryError::database)?.is_some() {
             return Err(JobRepositoryError::QueueInvariant);
         }
     }
@@ -2613,6 +2547,17 @@ mod quick_scrape_submission_tests {
         })?)
     }
 
+    async fn execute_sql<T, F>(
+        database: &ErabiDatabase,
+        operation: F,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+    {
+        Ok(crate::test_call(database, operation).await?)
+    }
+
     #[tokio::test]
     async fn root_job_insert_failure_rolls_back_the_new_run()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2629,13 +2574,14 @@ mod quick_scrape_submission_tests {
                 .is_err()
         );
 
-        let connection = database.connection().await?;
-        let row = connection
-            .prepare("SELECT COUNT(*) FROM crawl_runs WHERE actor = 'atomic-test'")
-            .await?
-            .query_row(())
-            .await?;
-        let count: i64 = row.get(0)?;
+        let count: i64 = execute_sql(&database, |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM crawl_runs WHERE actor = 'atomic-test'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .await?;
         assert_eq!(count, 0);
         Ok(())
     }

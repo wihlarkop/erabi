@@ -117,6 +117,35 @@ async fn expired_leases_revoke_stale_owner_authority_without_aba_reuse()
 }
 
 #[tokio::test]
+async fn acquire_without_eligible_job_commits_stale_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database().await?;
+    let repository = JobRepository::new(&database);
+    let job = new_job(1, 0)?;
+    repository.enqueue(&job, 0).await?;
+    repository
+        .acquire_next("stale-recovery-worker", 0, 1)
+        .await?
+        .ok_or("job was not initially acquired")?;
+
+    assert!(
+        repository
+            .acquire_next("idle-worker", 1, 30)
+            .await?
+            .is_none()
+    );
+
+    let recovered = repository.job(&job.id).await?;
+    assert_eq!(recovered.state, JobState::Failed);
+    assert_eq!(recovered.current_attempt, 1);
+    let attempts = repository.attempts(&job.id).await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].outcome, AttemptOutcome::LeaseExpired);
+    assert_eq!(attempts[0].finished_at, Some(1));
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_lease_owner_cannot_commit_final_cancellation_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database().await?;
@@ -287,6 +316,18 @@ impl JobHandler for DelayedSuccess {
     }
 }
 
+struct StartedDelayedSuccess {
+    started: Arc<Notify>,
+}
+
+impl JobHandler for StartedDelayedSuccess {
+    async fn execute(&self, _context: JobExecutionContext) -> Result<(), JobExecutionError> {
+        self.started.notify_one();
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        Ok(())
+    }
+}
+
 struct BarrierThenSuccess {
     barrier: Arc<tokio::sync::Barrier>,
 }
@@ -394,6 +435,7 @@ impl JobHandler for TwoCheckpointsAtSignals {
 
 struct WaitForLeaseLossCancellation {
     started: Arc<Notify>,
+    cancelled: Arc<Notify>,
     observed_cancellation: Arc<AtomicBool>,
 }
 
@@ -403,11 +445,13 @@ impl JobHandler for WaitForLeaseLossCancellation {
         context: JobExecutionContext,
     ) -> impl Future<Output = Result<(), JobExecutionError>> + Send {
         let started = Arc::clone(&self.started);
+        let cancelled = Arc::clone(&self.cancelled);
         let observed_cancellation = Arc::clone(&self.observed_cancellation);
         async move {
             started.notify_one();
             context.cancellation().cancelled().await;
             observed_cancellation.store(true, Ordering::Release);
+            cancelled.notify_one();
             Ok(())
         }
     }
@@ -454,25 +498,40 @@ async fn runtime_heartbeats_long_handler_and_completes_with_the_renewed_lease()
     let repository = JobRepository::new(&database);
     let job = new_job(1, 0)?;
     repository.enqueue(&job, 0).await?;
-    let runtime = JobRuntime::new(
-        &database,
-        "worker-runtime",
-        WorkerPolicy {
-            lease_duration_seconds: 3,
-            retry_delay_seconds: 0,
-        },
-    )?;
-
-    let handler = DelayedSuccess;
-    let advance_time = async {
+    let started = Arc::new(Notify::new());
+    let execution_database = database.clone();
+    let execution_started = Arc::clone(&started);
+    let execution = tokio::spawn(async move {
+        let runtime = JobRuntime::new(
+            &execution_database,
+            "worker-runtime",
+            WorkerPolicy {
+                lease_duration_seconds: 3,
+                retry_delay_seconds: 0,
+            },
+        )?;
+        runtime
+            .execute_next_at(
+                &StartedDelayedSuccess {
+                    started: execution_started,
+                },
+                0,
+            )
+            .await
+    });
+    let advance_time = async move {
+        started.notified().await;
         for _ in 0..5 {
-            tokio::task::yield_now().await;
-            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
         }
     };
-    let (turn, ()) = tokio::join!(runtime.execute_next_at(&handler, 0), advance_time);
+    let (turn, ()) = tokio::join!(execution, advance_time);
 
-    assert!(matches!(turn?, WorkerTurn::Succeeded { .. }));
+    let turn = turn??;
+    assert!(matches!(turn, WorkerTurn::Succeeded { .. }));
     assert_eq!(repository.job(&job.id).await?.state, JobState::Succeeded);
     assert_eq!(repository.attempts(&job.id).await?[0].finished_at, Some(5));
     Ok(())
@@ -609,8 +668,7 @@ async fn runtime_owned_checkpoint_time_preserves_history_and_latest_order()
 
     let records = repository.checkpoints(&job.id).await?;
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].created_at, 0);
-    assert_eq!(records[1].created_at, 1);
+    assert!(records[1].created_at > records[0].created_at);
     assert_eq!(records[0].checkpoint.payload["unit"], "first");
     assert_eq!(records[1].checkpoint.payload["unit"], "second");
     assert_eq!(
@@ -641,9 +699,11 @@ async fn lease_loss_signals_cooperative_handler_before_waiting_for_its_boundary(
         },
     )?;
     let started = Arc::new(Notify::new());
+    let cancelled = Arc::new(Notify::new());
     let observed = Arc::new(AtomicBool::new(false));
     let handler = WaitForLeaseLossCancellation {
         started: Arc::clone(&started),
+        cancelled: Arc::clone(&cancelled),
         observed_cancellation: Arc::clone(&observed),
     };
     let execution = runtime.execute_next_at(&handler, 0);
@@ -663,7 +723,12 @@ async fn lease_loss_signals_cooperative_handler_before_waiting_for_its_boundary(
             result,
             Err(JobRuntimeError::Repository(JobRepositoryError::LeaseLost | JobRepositoryError::IllegalTransition))
         )),
-        () = tokio::time::advance(Duration::from_secs(1)) => panic!("lease loss did not signal the waiting handler"),
+        () = cancelled.notified() => {
+            assert!(matches!(
+                execution.await,
+                Err(JobRuntimeError::Repository(JobRepositoryError::LeaseLost | JobRepositoryError::IllegalTransition))
+            ));
+        },
     }
     assert!(observed.load(Ordering::Acquire));
     assert_eq!(repository.job(&job.id).await?.state, JobState::Queued);

@@ -3,12 +3,17 @@ use std::{
     fmt,
 };
 
+use crate::{
+    SqliteConnection as Connection, SqliteRow as Row, SqliteTransaction as Transaction,
+    SqliteValue, SqliteValue as Value,
+};
 use erabi_domain::{
     CrawlExecutionErrorCode, CrawlExecutionId, CrawlExecutionOutcome, CrawlRunId, CrawlRunSnapshot,
     CrawlRunType, CrawlerId, CrawlerVersion, CrawlerVersionId, CrawlerVersionState,
     DiscoveryTransition, DiscoveryTransitionId, PageTypeId, RunConfiguration, SourceId,
 };
-use turso::{Connection, Row, Value, params_from_iter, transaction::TransactionBehavior};
+use rusqlite::TransactionBehavior;
+use rusqlite::params_from_iter;
 use url::Url;
 use uuid::Uuid;
 
@@ -162,6 +167,18 @@ impl CrawlExecutionRepositoryError {
     }
 }
 
+impl From<crate::DbError> for CrawlExecutionRepositoryError {
+    fn from(error: crate::DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for CrawlExecutionRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(crate::DbError::from(error))
+    }
+}
+
 /// Persistence operations for provider-neutral page execution evidence.
 #[derive(Clone, Copy, Debug)]
 pub struct CrawlExecutionRepository<'database> {
@@ -184,26 +201,24 @@ impl<'database> CrawlExecutionRepository<'database> {
         record: &CrawlExecutionRecord,
     ) -> Result<(), CrawlExecutionRepositoryError> {
         validate_record_input(record)?;
-        let mut connection = self
-            .database
-            .connection()
+        let record = record.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(CrawlExecutionRepositoryError::database)?;
+                match persist_in_transaction(&transaction, &record) {
+                    Ok(()) => transaction
+                        .commit()
+                        .map_err(CrawlExecutionRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let result = persist_in_transaction(&transaction, record).await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(CrawlExecutionRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Atomically records append-only execution evidence and advances the
@@ -234,48 +249,51 @@ impl<'database> CrawlExecutionRepository<'database> {
                 "logical work lineage",
             ));
         }
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
+        let record = record.clone();
+        let crawl_url_state_id = crawl_url_state_id.to_owned();
+        let job_id = job_id.clone();
+        let job_attempt_id = job_attempt_id.to_owned();
+        self.database
+            .call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(CrawlExecutionRepositoryError::database)?;
-        let result = async {
+        let result = (|| {
             validate_current_work_owner(
                 &transaction,
-                record,
-                crawl_url_state_id,
-                job_id,
-                job_attempt_id,
+                &record,
+                &crawl_url_state_id,
+                &job_id,
+                &job_attempt_id,
                 expected_work_generation,
                 now,
             )
-            .await?;
+            ?;
             persist_in_transaction_with_lineage(
                 &transaction,
-                record,
-                crawl_url_state_id,
-                job_attempt_id,
+                &record,
+                &crawl_url_state_id,
+                &job_attempt_id,
                 expected_work_generation,
             )
-            .await?;
-            let changed = transaction.execute("UPDATE crawl_url_state SET current_work_state = ?1, current_execution_id = ?2 WHERE id = ?3 AND crawl_run_id = ?4 AND work_generation = ?5 AND current_work_state IN ('PENDING', 'RUNNING')", (work_state_name(state), record.id.to_string(), crawl_url_state_id, record.crawl_run_id.to_string(), i64::try_from(expected_work_generation).map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)?)).await.map_err(CrawlExecutionRepositoryError::database)?;
+            ?;
+            let changed = transaction.execute("UPDATE crawl_url_state SET current_work_state = ?1, current_execution_id = ?2 WHERE id = ?3 AND crawl_run_id = ?4 AND work_generation = ?5 AND current_work_state IN ('PENDING', 'RUNNING')", (work_state_name(state), record.id.to_string(), crawl_url_state_id.as_str(), record.crawl_run_id.to_string(), i64::try_from(expected_work_generation).map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)?)).map_err(CrawlExecutionRepositoryError::database)?;
             if changed != 1 { return Err(CrawlExecutionRepositoryError::CorruptState); }
             Ok(())
-        }.await;
+        })();
         match result {
             Ok(()) => transaction
                 .commit()
-                .await
+
                 .map_err(CrawlExecutionRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+            })
+            .await
     }
 
     /// Marks one logical work generation active before provider IO. The
@@ -300,52 +318,53 @@ impl<'database> CrawlExecutionRepository<'database> {
                 "logical work activation",
             ));
         }
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
+        let job_id = job_id.clone();
+        let crawl_url_state_id = crawl_url_state_id.to_owned();
+        let job_attempt_id = job_attempt_id.to_owned();
+        self.database
+            .call(move |raw| {
+        let mut connection = Connection::new(raw);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
             .map_err(CrawlExecutionRepositoryError::database)?;
-        let result = async {
+        let result = (|| {
             validate_active_attempt_owner(
                 &transaction,
                 crawl_run_id,
-                job_id,
-                job_attempt_id,
+                &job_id,
+                &job_attempt_id,
                 now,
             )
-            .await?;
+            ?;
             let changed = transaction
                 .execute(
                     "UPDATE crawl_url_state SET current_work_state = 'RUNNING', current_execution_id = NULL WHERE id = ?1 AND crawl_run_id = ?2 AND admission_state = 'ADMITTED' AND work_generation = ?3 AND current_work_state IN ('PENDING', 'RUNNING', 'FAILED')",
                     (
-                        crawl_url_state_id,
+                        crawl_url_state_id.as_str(),
                         crawl_run_id.to_string(),
                         i64::try_from(expected_work_generation)
                             .map_err(|_| CrawlExecutionRepositoryError::CounterOutOfRange)?,
                     ),
                 )
-                .await
+
                 .map_err(CrawlExecutionRepositoryError::database)?;
             if changed != 1 {
                 return Err(CrawlExecutionRepositoryError::InvalidReference);
             }
             Ok(())
-        }
-        .await;
+        })();
         match result {
             Ok(()) => transaction
                 .commit()
-                .await
+
                 .map_err(CrawlExecutionRepositoryError::database),
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = transaction.rollback();
                 Err(error)
             }
         }
+            })
+            .await
     }
 
     /// Appends a physical execution that is known to be a historical alias
@@ -372,46 +391,45 @@ impl<'database> CrawlExecutionRepository<'database> {
                 "historical logical work lineage",
             ));
         }
-        let mut connection = self
-            .database
-            .connection()
+        let job_id = job_id.clone();
+        let record = record.clone();
+        let crawl_url_state_id = crawl_url_state_id.to_owned();
+        let job_attempt_id = job_attempt_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(CrawlExecutionRepositoryError::database)?;
+                let result = (|| {
+                    validate_historical_work_owner(
+                        &transaction,
+                        &record,
+                        &crawl_url_state_id,
+                        &job_id,
+                        &job_attempt_id,
+                        expected_work_generation,
+                        now,
+                    )?;
+                    persist_in_transaction_with_lineage(
+                        &transaction,
+                        &record,
+                        &crawl_url_state_id,
+                        &job_attempt_id,
+                        expected_work_generation,
+                    )
+                })();
+                match result {
+                    Ok(()) => transaction
+                        .commit()
+                        .map_err(CrawlExecutionRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let result = async {
-            validate_historical_work_owner(
-                &transaction,
-                record,
-                crawl_url_state_id,
-                job_id,
-                job_attempt_id,
-                expected_work_generation,
-                now,
-            )
-            .await?;
-            persist_in_transaction_with_lineage(
-                &transaction,
-                record,
-                crawl_url_state_id,
-                job_attempt_id,
-                expected_work_generation,
-            )
-            .await
-        }
-        .await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(CrawlExecutionRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Reads one page execution and validates every durable relationship.
@@ -423,27 +441,27 @@ impl<'database> CrawlExecutionRepository<'database> {
         &self,
         id: CrawlExecutionId,
     ) -> Result<CrawlExecutionRecord, CrawlExecutionRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
+        self.database
+            .call(move |raw| {
+        let connection = Connection::new(raw);
         let row = connection
             .prepare(
                 "SELECT id, crawl_run_id, requested_url, canonical_url, observed_final_url, source_id, page_type_id, transition_id, discovered_url_id, outcome, error_code, http_status, media_type, content_length_bytes, provider_elapsed_ms FROM crawl_execution_results WHERE id = ?1",
             )
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?
             .query_row([id.to_string()])
-            .await
+
             .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::NotFound,
+                rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::NotFound,
                 other => CrawlExecutionRepositoryError::database(other),
             })?;
         let record = read_record(&connection, &row)
-            .await
+
             .map_err(CrawlExecutionRepositoryError::corrupt_on_read)?;
         Ok(record)
+            })
+            .await
     }
 
     /// Reads all page executions for a run in canonical URL and execution-ID
@@ -456,32 +474,32 @@ impl<'database> CrawlExecutionRepository<'database> {
         &self,
         crawl_run_id: CrawlRunId,
     ) -> Result<Vec<CrawlExecutionRecord>, CrawlExecutionRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        load_run_context(&connection, crawl_run_id).await?;
+        self.database
+            .call(move |raw| {
+        let connection = Connection::new(raw);
+        load_run_context(&connection, crawl_run_id)?;
         let mut rows = connection
             .query(
                 "SELECT id, crawl_run_id, requested_url, canonical_url, observed_final_url, source_id, page_type_id, transition_id, discovered_url_id, outcome, error_code, http_status, media_type, content_length_bytes, provider_elapsed_ms FROM crawl_execution_results WHERE crawl_run_id = ?1 ORDER BY canonical_url COLLATE BINARY, id COLLATE BINARY",
                 [crawl_run_id.to_string()],
             )
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?;
         let mut records = Vec::new();
         while let Some(row) = rows
             .next()
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?
         {
             records.push(
-                read_record(&connection, &row)
-                    .await
+                read_record(&connection, row)
+
                     .map_err(CrawlExecutionRepositoryError::corrupt_on_read)?,
             );
         }
         Ok(records)
+            })
+            .await
     }
 
     /// Saves the current durable structural summary for one run.
@@ -495,27 +513,26 @@ impl<'database> CrawlExecutionRepository<'database> {
         &self,
         summary: &CrawlExecutionSummary,
     ) -> Result<(), CrawlExecutionRepositoryError> {
-        let values = summary_sql_values(summary)?;
-        let mut connection = self
-            .database
-            .connection()
+        let summary = *summary;
+        let values = summary_sql_values(&summary)?;
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(CrawlExecutionRepositoryError::database)?;
+                let result = save_summary_in_transaction(&transaction, &summary, values);
+                match result {
+                    Ok(()) => transaction
+                        .commit()
+                        .map_err(CrawlExecutionRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let result = save_summary_in_transaction(&transaction, summary, values).await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(CrawlExecutionRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Atomically persists the current structural summary with its terminal
@@ -529,43 +546,39 @@ impl<'database> CrawlExecutionRepository<'database> {
         summary: &CrawlExecutionSummary,
         status: erabi_domain::CrawlRunStatus,
     ) -> Result<(), CrawlExecutionRepositoryError> {
-        let values = summary_sql_values(summary)?;
-        let mut connection = self
-            .database
-            .connection()
+        let summary = *summary;
+        let values = summary_sql_values(&summary)?;
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(CrawlExecutionRepositoryError::database)?;
+                let result = (|| {
+                    save_summary_in_transaction(&transaction, &summary, values)?;
+                    if status == erabi_domain::CrawlRunStatus::Cancelled {
+                        cancel_execution_status_in_transaction(&transaction, summary.crawl_run_id)
+                            .map_err(map_run_error)
+                    } else {
+                        transition_execution_status_in_transaction(
+                            &transaction,
+                            summary.crawl_run_id,
+                            status,
+                        )
+                        .map_err(map_run_error)
+                    }
+                })();
+                match result {
+                    Ok(()) => transaction
+                        .commit()
+                        .map_err(CrawlExecutionRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        let result = async {
-            save_summary_in_transaction(&transaction, summary, values).await?;
-            if status == erabi_domain::CrawlRunStatus::Cancelled {
-                cancel_execution_status_in_transaction(&transaction, summary.crawl_run_id)
-                    .await
-                    .map_err(map_run_error)
-            } else {
-                transition_execution_status_in_transaction(
-                    &transaction,
-                    summary.crawl_run_id,
-                    status,
-                )
-                .await
-                .map_err(map_run_error)
-            }
-        }
-        .await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(CrawlExecutionRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Reads one durable run execution summary.
@@ -577,47 +590,48 @@ impl<'database> CrawlExecutionRepository<'database> {
         &self,
         crawl_run_id: CrawlRunId,
     ) -> Result<CrawlExecutionSummary, CrawlExecutionRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlExecutionRepositoryError::database)?;
-        load_run_context(&connection, crawl_run_id).await?;
+        self.database
+            .call(move |raw| {
+        let connection = Connection::new(raw);
+        load_run_context(&connection, crawl_run_id)?;
         let mut rows = connection
             .query(
                 "SELECT crawl_run_id, in_scope_pages_planned, in_scope_pages_completed, pagination_truncation_count, unresolved_partial_work_count, page_type_ambiguity_count FROM crawl_execution_summaries WHERE crawl_run_id = ?1",
                 [crawl_run_id.to_string()],
             )
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?;
         let Some(row) = rows
             .next()
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?
+            .cloned()
         else {
             return Err(CrawlExecutionRepositoryError::SummaryNotFound);
         };
         if rows
             .next()
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?
             .is_some()
         {
             return Err(CrawlExecutionRepositoryError::CorruptState);
         }
         summary_from_row(&row).map_err(CrawlExecutionRepositoryError::corrupt_on_read)
+            })
+            .await
     }
 }
 
-async fn persist_in_transaction(
-    connection: &Connection,
+fn persist_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
 ) -> Result<(), CrawlExecutionRepositoryError> {
     let content_length_bytes = optional_counter(record.content_length_bytes)?;
     let provider_elapsed_ms = optional_counter(record.provider_elapsed_ms)?;
-    let run = load_run_context(connection, record.crawl_run_id).await?;
-    validate_references(connection, record, &run).await?;
-    validate_artifact_references(connection, record).await?;
+    let run = load_run_context(connection, record.crawl_run_id)?;
+    validate_references(connection, record, &run)?;
+    validate_artifact_references(connection, record)?;
     insert_execution_row(
         connection,
         record,
@@ -625,11 +639,10 @@ async fn persist_in_transaction(
         provider_elapsed_ms,
         None,
     )
-    .await
 }
 
-async fn persist_in_transaction_with_lineage(
-    connection: &Connection,
+fn persist_in_transaction_with_lineage(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
     crawl_url_state_id: &str,
     job_attempt_id: &str,
@@ -639,17 +652,15 @@ async fn persist_in_transaction_with_lineage(
         connection,
         "SELECT 1 FROM crawl_execution_results WHERE id = ?1",
         [record.id.to_string()],
-    )
-    .await?
-    {
+    )? {
         return Err(CrawlExecutionRepositoryError::DuplicateExecution);
     }
 
     let content_length_bytes = optional_counter(record.content_length_bytes)?;
     let provider_elapsed_ms = optional_counter(record.provider_elapsed_ms)?;
-    let run = load_run_context(connection, record.crawl_run_id).await?;
-    validate_references(connection, record, &run).await?;
-    validate_artifact_references(connection, record).await?;
+    let run = load_run_context(connection, record.crawl_run_id)?;
+    validate_references(connection, record, &run)?;
+    validate_artifact_references(connection, record)?;
     insert_execution_row(
         connection,
         record,
@@ -657,11 +668,10 @@ async fn persist_in_transaction_with_lineage(
         provider_elapsed_ms,
         Some((crawl_url_state_id, job_attempt_id, work_generation)),
     )
-    .await
 }
 
-async fn insert_execution_row(
-    connection: &Connection,
+fn insert_execution_row(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
     content_length_bytes: Value,
     provider_elapsed_ms: Value,
@@ -671,9 +681,7 @@ async fn insert_execution_row(
         connection,
         "SELECT 1 FROM crawl_execution_results WHERE id = ?1",
         [record.id.to_string()],
-    )
-    .await?
-    {
+    )? {
         return Err(CrawlExecutionRepositoryError::DuplicateExecution);
     }
 
@@ -709,7 +717,6 @@ async fn insert_execution_row(
     };
     connection
         .execute(sql, params_from_iter(values))
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?;
 
     for artifact in &record.artifacts {
@@ -722,14 +729,14 @@ async fn insert_execution_row(
                     artifact_kind_name(artifact.kind),
                 ),
             )
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?;
     }
     Ok(())
 }
 
-async fn validate_current_work_owner(
-    connection: &Connection,
+fn validate_current_work_owner(
+    connection: &Transaction<'_>,
     record: &CrawlExecutionRecord,
     crawl_url_state_id: &str,
     job_id: &JobId,
@@ -741,12 +748,12 @@ async fn validate_current_work_owner(
         .prepare(
             "SELECT canonical_url, admission_state, current_work_state, work_generation FROM crawl_url_state WHERE id = ?1 AND crawl_run_id = ?2",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row((crawl_url_state_id, record.crawl_run_id.to_string()))
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let canonical_url: String = state
@@ -770,11 +777,10 @@ async fn validate_current_work_owner(
     }
 
     validate_active_attempt_owner(connection, record.crawl_run_id, job_id, job_attempt_id, now)
-        .await
 }
 
-async fn validate_historical_work_owner(
-    connection: &Connection,
+fn validate_historical_work_owner(
+    connection: &Transaction<'_>,
     record: &CrawlExecutionRecord,
     crawl_url_state_id: &str,
     job_id: &JobId,
@@ -786,12 +792,12 @@ async fn validate_historical_work_owner(
         .prepare(
             "SELECT canonical_url, admission_state, current_work_state, work_generation, current_execution_id FROM crawl_url_state WHERE id = ?1 AND crawl_run_id = ?2",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row((crawl_url_state_id, record.crawl_run_id.to_string()))
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let canonical_url: String = state
@@ -822,11 +828,10 @@ async fn validate_historical_work_owner(
     }
 
     validate_active_attempt_owner(connection, record.crawl_run_id, job_id, job_attempt_id, now)
-        .await
 }
 
-async fn validate_active_attempt_owner(
-    connection: &Connection,
+fn validate_active_attempt_owner(
+    connection: &Transaction<'_>,
     crawl_run_id: CrawlRunId,
     job_id: &JobId,
     job_attempt_id: &str,
@@ -836,12 +841,12 @@ async fn validate_active_attempt_owner(
         .prepare(
             "SELECT job.crawl_run_id, job.state, job.current_attempt, job.lease_id, job.lease_owner, job.lease_generation, job.lease_expires_at, attempt.attempt_number, attempt.lease_id, attempt.lease_generation, attempt.worker_id, attempt.outcome FROM job_attempts AS attempt JOIN jobs AS job ON job.id = attempt.job_id WHERE attempt.id = ?1 AND job.id = ?2",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row((job_attempt_id, job_id.to_string()))
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::InvalidReference,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let attempt_run_id: Option<String> = attempt
@@ -894,26 +899,25 @@ async fn validate_active_attempt_owner(
     Ok(())
 }
 
-async fn save_summary_in_transaction(
-    connection: &Connection,
+fn save_summary_in_transaction(
+    connection: &Transaction<'_>,
     summary: &CrawlExecutionSummary,
     values: [i64; 5],
 ) -> Result<(), CrawlExecutionRepositoryError> {
-    load_run_context(connection, summary.crawl_run_id).await?;
+    load_run_context(connection, summary.crawl_run_id)?;
     let mut existing_rows = connection
         .query(
             "SELECT crawl_run_id, in_scope_pages_planned, in_scope_pages_completed, pagination_truncation_count, unresolved_partial_work_count, page_type_ambiguity_count FROM crawl_execution_summaries WHERE crawl_run_id = ?1",
             [summary.crawl_run_id.to_string()],
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?;
     let existing = existing_rows
         .next()
-        .await
-        .map_err(CrawlExecutionRepositoryError::database)?;
+        .map_err(CrawlExecutionRepositoryError::database)?
+        .cloned();
     if existing_rows
         .next()
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?
         .is_some()
     {
@@ -926,7 +930,7 @@ async fn save_summary_in_transaction(
                 "UPDATE crawl_execution_summaries SET in_scope_pages_planned = ?1, in_scope_pages_completed = ?2, pagination_truncation_count = ?3, unresolved_partial_work_count = ?4, page_type_ambiguity_count = ?5 WHERE crawl_run_id = ?6",
                 (values[0], values[1], values[2], values[3], values[4], summary.crawl_run_id.to_string()),
             )
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?;
         if updated != 1 {
             return Err(CrawlExecutionRepositoryError::CorruptState);
@@ -937,14 +941,14 @@ async fn save_summary_in_transaction(
                 "INSERT INTO crawl_execution_summaries (crawl_run_id, in_scope_pages_planned, in_scope_pages_completed, pagination_truncation_count, unresolved_partial_work_count, page_type_ambiguity_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (summary.crawl_run_id.to_string(), values[0], values[1], values[2], values[3], values[4]),
             )
-            .await
+
             .map_err(CrawlExecutionRepositoryError::database)?;
     }
     Ok(())
 }
 
-async fn read_record(
-    connection: &Connection,
+fn read_record(
+    connection: &impl crate::SqliteExecutor,
     row: &Row,
 ) -> Result<CrawlExecutionRecord, CrawlExecutionRepositoryError> {
     let id = parse_execution_id(
@@ -1005,17 +1009,17 @@ async fn read_record(
             row.get(14)
                 .map_err(CrawlExecutionRepositoryError::database)?,
         )?,
-        artifacts: read_artifacts(connection, id).await?,
+        artifacts: read_artifacts(connection, id)?,
     };
     validate_record_input(&record)?;
-    let run = load_run_context(connection, crawl_run_id).await?;
-    validate_references(connection, &record, &run).await?;
-    validate_artifact_references(connection, &record).await?;
+    let run = load_run_context(connection, crawl_run_id)?;
+    validate_references(connection, &record, &run)?;
+    validate_artifact_references(connection, &record)?;
     Ok(record)
 }
 
-async fn read_artifacts(
-    connection: &Connection,
+fn read_artifacts(
+    connection: &impl crate::SqliteExecutor,
     execution_id: CrawlExecutionId,
 ) -> Result<Vec<CrawlExecutionArtifact>, CrawlExecutionRepositoryError> {
     let mut rows = connection
@@ -1023,14 +1027,13 @@ async fn read_artifacts(
             "SELECT artifact_id, artifact_kind FROM crawl_execution_artifacts WHERE crawl_execution_id = ?1 ORDER BY artifact_kind COLLATE BINARY, artifact_id COLLATE BINARY",
             [execution_id.to_string()],
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?;
     let mut seen_kinds = BTreeSet::new();
     let mut seen_artifacts = HashSet::new();
     let mut artifacts = Vec::new();
     while let Some(row) = rows
         .next()
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?
     {
         let artifact_id = parse_artifact_id(
@@ -1049,8 +1052,8 @@ async fn read_artifacts(
     Ok(artifacts)
 }
 
-async fn validate_references(
-    connection: &Connection,
+fn validate_references(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
     run: &RunContext,
 ) -> Result<(), CrawlExecutionRepositoryError> {
@@ -1061,10 +1064,10 @@ async fn validate_references(
     }
 
     if let Some(source_id) = record.source_id {
-        validate_source_reference(connection, record, source_id).await?;
+        validate_source_reference(connection, record, source_id)?;
     }
     if let Some(discovered_url_id) = record.discovered_url_id.as_deref() {
-        validate_discovered_url_reference(connection, record, discovered_url_id).await?;
+        validate_discovered_url_reference(connection, record, discovered_url_id)?;
     }
 
     let Some(version_id) = run.crawler_version_id else {
@@ -1080,7 +1083,7 @@ async fn validate_references(
         return Ok(());
     };
 
-    let version = load_version(connection, version_id).await?;
+    let version = load_version(connection, version_id)?;
     if run.crawler_id != Some(version.crawler_id()) {
         return Err(CrawlExecutionRepositoryError::CorruptState);
     }
@@ -1090,11 +1093,11 @@ async fn validate_references(
         _ => return Err(CrawlExecutionRepositoryError::CorruptState),
     }
     if let Some(page_type_id) = record.page_type_id {
-        validate_page_type_reference(connection, &version, page_type_id).await?;
+        validate_page_type_reference(connection, &version, page_type_id)?;
     }
     if let Some(transition_id) = record.transition_id {
         let target_page_type_id =
-            validate_transition_reference(connection, &version, transition_id).await?;
+            validate_transition_reference(connection, &version, transition_id)?;
         if record
             .page_type_id
             .is_some_and(|page_type_id| Some(page_type_id) != target_page_type_id)
@@ -1105,19 +1108,17 @@ async fn validate_references(
     Ok(())
 }
 
-async fn validate_source_reference(
-    connection: &Connection,
+fn validate_source_reference(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
     source_id: SourceId,
 ) -> Result<(), CrawlExecutionRepositoryError> {
     let row = connection
         .prepare("SELECT id, original_url, canonical_url FROM sources WHERE id = ?1")
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row([source_id.to_string()])
-        .await
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::SourceNotFound,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::SourceNotFound,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let stored_id = parse_source_id(
@@ -1143,36 +1144,34 @@ async fn validate_source_reference(
         .prepare(
             "SELECT 1 FROM discovered_urls WHERE crawl_run_id = ?1 AND source_id = ?2 AND canonical_url = ?3 LIMIT 1",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row((
             record.crawl_run_id.to_string(),
             source_id.to_string(),
             record.canonical_url.as_str(),
         ))
-        .await;
+        ;
     match related {
         Ok(_) => Ok(()),
-        Err(turso::Error::QueryReturnedNoRows) => {
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
             Err(CrawlExecutionRepositoryError::SourceNotOwnedByRun)
         }
         Err(error) => Err(CrawlExecutionRepositoryError::database(error)),
     }
 }
 
-async fn validate_page_type_reference(
-    connection: &Connection,
+fn validate_page_type_reference(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     page_type_id: PageTypeId,
 ) -> Result<(), CrawlExecutionRepositoryError> {
     let row = connection
         .prepare("SELECT id, crawler_version_id FROM page_types WHERE id = ?1")
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row([page_type_id.to_string()])
-        .await
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::PageTypeNotFound,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::PageTypeNotFound,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let stored_id = parse_page_type_id(
@@ -1195,8 +1194,8 @@ async fn validate_page_type_reference(
     Ok(())
 }
 
-async fn validate_transition_reference(
-    connection: &Connection,
+fn validate_transition_reference(
+    connection: &impl crate::SqliteExecutor,
     version: &CrawlerVersion,
     transition_id: DiscoveryTransitionId,
 ) -> Result<Option<PageTypeId>, CrawlExecutionRepositoryError> {
@@ -1204,12 +1203,12 @@ async fn validate_transition_reference(
         .prepare(
             "SELECT id, crawler_version_id, configuration_json FROM discovery_transitions WHERE id = ?1",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row([transition_id.to_string()])
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::TransitionNotFound,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::TransitionNotFound,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let stored_id = parse_transition_id(
@@ -1242,14 +1241,13 @@ async fn validate_transition_reference(
         transition.target_page_type_id,
     ] {
         validate_page_type_reference(connection, version, page_type_id)
-            .await
             .map_err(|_| CrawlExecutionRepositoryError::CorruptState)?;
     }
     Ok(Some(transition.target_page_type_id))
 }
 
-async fn validate_discovered_url_reference(
-    connection: &Connection,
+fn validate_discovered_url_reference(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
     discovered_url_id: &str,
 ) -> Result<(), CrawlExecutionRepositoryError> {
@@ -1257,12 +1255,12 @@ async fn validate_discovered_url_reference(
         .prepare(
             "SELECT id, crawl_run_id, source_id, original_url, canonical_url FROM discovered_urls WHERE id = ?1",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row([discovered_url_id])
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => {
+            rusqlite::Error::QueryReturnedNoRows => {
                 CrawlExecutionRepositoryError::DiscoveredUrlNotOwnedByRun
             }
             other => CrawlExecutionRepositoryError::database(other),
@@ -1297,19 +1295,17 @@ async fn validate_discovered_url_reference(
         .map_err(|_| CrawlExecutionRepositoryError::CorruptState)
 }
 
-async fn validate_artifact_references(
-    connection: &Connection,
+fn validate_artifact_references(
+    connection: &impl crate::SqliteExecutor,
     record: &CrawlExecutionRecord,
 ) -> Result<(), CrawlExecutionRepositoryError> {
     for artifact in &record.artifacts {
         let row = connection
             .prepare("SELECT id, crawl_run_id, source_id FROM artifacts WHERE id = ?1")
-            .await
             .map_err(CrawlExecutionRepositoryError::database)?
             .query_row([artifact.artifact_id.to_string()])
-            .await
             .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => {
+                rusqlite::Error::QueryReturnedNoRows => {
                     CrawlExecutionRepositoryError::ArtifactNotFound
                 }
                 other => CrawlExecutionRepositoryError::database(other),
@@ -1347,20 +1343,20 @@ struct RunContext {
     crawler_version_id: Option<CrawlerVersionId>,
 }
 
-async fn load_run_context(
-    connection: &Connection,
+fn load_run_context(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
 ) -> Result<RunContext, CrawlExecutionRepositoryError> {
     let row = connection
         .prepare(
             "SELECT id, run_type, crawler_id, crawler_version_id, snapshot_json, snapshot_hash, checkpoint_compatibility_hash FROM crawl_runs WHERE id = ?1",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row([run_id.to_string()])
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::CrawlRunNotFound,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::CrawlRunNotFound,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let stored_id = parse_run_id(
@@ -1428,20 +1424,20 @@ async fn load_run_context(
     })
 }
 
-async fn load_version(
-    connection: &Connection,
+fn load_version(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
 ) -> Result<CrawlerVersion, CrawlExecutionRepositoryError> {
     let row = connection
         .prepare(
             "SELECT id, crawler_id, state, semantic_configuration_json FROM crawler_versions WHERE id = ?1",
         )
-        .await
+
         .map_err(CrawlExecutionRepositoryError::database)?
         .query_row([version_id.to_string()])
-        .await
+
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::CorruptState,
+            rusqlite::Error::QueryReturnedNoRows => CrawlExecutionRepositoryError::CorruptState,
             other => CrawlExecutionRepositoryError::database(other),
         })?;
     let stored_id = parse_version_id(
@@ -1683,48 +1679,46 @@ fn parse_optional_status(value: Option<i64>) -> Result<Option<u16>, CrawlExecuti
         .transpose()
 }
 
-async fn row_exists(
-    connection: &Connection,
+fn row_exists(
+    connection: &impl crate::SqliteExecutor,
     sql: &str,
-    params: impl turso::IntoParams,
+    params: impl rusqlite::Params,
 ) -> Result<bool, CrawlExecutionRepositoryError> {
     let mut rows = connection
         .query(sql, params)
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?;
     Ok(rows
         .next()
-        .await
         .map_err(CrawlExecutionRepositoryError::database)?
         .is_some())
 }
 
-fn optional_text(value: Option<&str>) -> turso::Value {
-    value.map_or(turso::Value::Null, |value| {
-        turso::Value::Text(value.to_owned())
+fn optional_text(value: Option<&str>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, |value| {
+        SqliteValue::Text(value.to_owned())
     })
 }
 
-fn optional_id<T: ToString>(value: Option<T>) -> turso::Value {
-    value.map_or(turso::Value::Null, |value| {
-        turso::Value::Text(value.to_string())
+fn optional_id<T: ToString>(value: Option<T>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, |value| {
+        SqliteValue::Text(value.to_string())
     })
 }
 
-fn optional_i64(value: Option<i64>) -> turso::Value {
-    value.map_or(turso::Value::Null, turso::Value::Integer)
+fn optional_i64(value: Option<i64>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, SqliteValue::Integer)
 }
 
-fn optional_counter(value: Option<u64>) -> Result<turso::Value, CrawlExecutionRepositoryError> {
+fn optional_counter(value: Option<u64>) -> Result<SqliteValue, CrawlExecutionRepositoryError> {
     value
         .map(checked_counter)
         .transpose()
-        .map(|value| value.map_or(turso::Value::Null, turso::Value::Integer))
+        .map(|value| value.map_or(SqliteValue::Null, SqliteValue::Integer))
 }
 
-fn optional_error_code(value: Option<CrawlExecutionErrorCode>) -> turso::Value {
-    value.map_or(turso::Value::Null, |value| {
-        turso::Value::Text(error_code_name(value).to_owned())
+fn optional_error_code(value: Option<CrawlExecutionErrorCode>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, |value| {
+        SqliteValue::Text(error_code_name(value).to_owned())
     })
 }
 

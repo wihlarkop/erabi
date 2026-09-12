@@ -1,7 +1,8 @@
+use crate::{SqliteConnection as Connection, SqliteRow as Row};
 use erabi_domain::{
     CrawlerVersionId, DiscoveryTransition, PageTypeId, TestEvidence, TestEvidenceId,
 };
-use turso::{Connection, Row, transaction::TransactionBehavior};
+use rusqlite::TransactionBehavior;
 use uuid::Uuid;
 
 use crate::{DbError, ErabiDatabase};
@@ -37,6 +38,18 @@ pub enum TestEvidenceRepositoryError {
     Database(#[source] DbError),
 }
 
+impl From<DbError> for TestEvidenceRepositoryError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for TestEvidenceRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
+}
+
 impl From<CrawlerRepositoryError> for TestEvidenceRepositoryError {
     fn from(error: CrawlerRepositoryError) -> Self {
         Self::Crawler(error)
@@ -69,26 +82,25 @@ impl<'database> TestEvidenceRepository<'database> {
         evidence
             .validate()
             .map_err(|_| TestEvidenceRepositoryError::CorruptState)?;
-        let mut connection = self
-            .database
-            .connection()
+        let evidence = evidence.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
+                let result = persist_in_transaction(&transaction, crawler_id, &evidence);
+                match result {
+                    Ok(()) => transaction
+                        .commit()
+                        .map_err(|error| TestEvidenceRepositoryError::Database(error.into())),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(TestEvidenceRepositoryError::Database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
-        let result = persist_in_transaction(&transaction, crawler_id, evidence).await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(|error| TestEvidenceRepositoryError::Database(error.into())),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Reads one evidence row and validates its duplicated projections.
@@ -101,33 +113,31 @@ impl<'database> TestEvidenceRepository<'database> {
         version_id: CrawlerVersionId,
         evidence_id: TestEvidenceId,
     ) -> Result<TestEvidenceRecord, TestEvidenceRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(TestEvidenceRepositoryError::Database)?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
         let mut rows = connection
             .query(
                 "SELECT id, crawler_version_id, evidence_json, executed_at FROM test_evidence WHERE id = ?1",
                 [evidence_id.to_string()],
             )
-            .await
+
             .map_err(Self::database)?;
-        let Some(row) = rows.next().await.map_err(Self::database)? else {
+        let Some(row) = rows.next().map_err(Self::database)? else {
             return Err(TestEvidenceRepositoryError::TestEvidenceNotFound);
         };
-        let stored = read_row(&row)?;
+        let stored = read_row(row)?;
         if stored.evidence.crawler_version_id != version_id {
             return Err(TestEvidenceRepositoryError::TestEvidenceNotOwnedByVersion);
         }
         let current_hash =
             semantic_hash_for_version_in_connection(&connection, crawler_id, version_id)
-                .await
+
                 .map_err(TestEvidenceRepositoryError::from)?;
         Ok(TestEvidenceRecord {
             matches_current_configuration: stored.evidence.config_hash == current_hash,
             evidence: stored.evidence,
         })
+        }).await
     }
 
     /// Lists evidence in deterministic execution-time/UUID order.
@@ -139,25 +149,20 @@ impl<'database> TestEvidenceRepository<'database> {
         crawler_id: erabi_domain::CrawlerId,
         version_id: CrawlerVersionId,
     ) -> Result<Vec<TestEvidenceRecord>, TestEvidenceRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(TestEvidenceRepositoryError::Database)?;
-        let current_hash =
-            semantic_hash_for_version_in_connection(&connection, crawler_id, version_id)
-                .await
-                .map_err(TestEvidenceRepositoryError::from)?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
+        let current_hash = semantic_hash_for_version_in_connection(&connection, crawler_id, version_id)
+            .map_err(TestEvidenceRepositoryError::from)?;
         let mut rows = connection
             .query(
                 "SELECT id, crawler_version_id, evidence_json, executed_at FROM test_evidence WHERE crawler_version_id = ?1 ORDER BY executed_at COLLATE BINARY, id COLLATE BINARY",
                 [version_id.to_string()],
             )
-            .await
+
             .map_err(Self::database)?;
         let mut records = Vec::new();
-        while let Some(row) = rows.next().await.map_err(Self::database)? {
-            let stored = read_row(&row)?;
+        while let Some(row) = rows.next().map_err(Self::database)? {
+            let stored = read_row(row)?;
             if stored.evidence.crawler_version_id != version_id {
                 return Err(TestEvidenceRepositoryError::CorruptState);
             }
@@ -167,9 +172,10 @@ impl<'database> TestEvidenceRepository<'database> {
             });
         }
         Ok(records)
+        }).await
     }
 
-    fn database(error: turso::Error) -> TestEvidenceRepositoryError {
+    fn database(error: rusqlite::Error) -> TestEvidenceRepositoryError {
         TestEvidenceRepositoryError::Database(error.into())
     }
 }
@@ -184,8 +190,8 @@ struct StoredEvidence {
 /// whose hash exactly matches the publication candidate; stale evidence is
 /// durable history and may name a `PageType` or `DiscoveryTransition` since
 /// deleted from the Draft.
-pub(crate) async fn load_for_version_in_transaction(
-    connection: &Connection,
+pub(crate) fn load_for_version_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     candidate_config_hash: &str,
 ) -> Result<Vec<TestEvidence>, TestEvidenceRepositoryError> {
@@ -194,15 +200,14 @@ pub(crate) async fn load_for_version_in_transaction(
             "SELECT id, crawler_version_id, evidence_json, executed_at FROM test_evidence WHERE crawler_version_id = ?1 ORDER BY executed_at COLLATE BINARY, id COLLATE BINARY",
             [version_id.to_string()],
         )
-        .await
+
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
     let mut evidence = Vec::new();
     while let Some(row) = rows
         .next()
-        .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?
     {
-        let stored = read_row(&row)?;
+        let stored = read_row(row)?;
         if stored.evidence.crawler_version_id != version_id {
             return Err(TestEvidenceRepositoryError::CorruptState);
         }
@@ -210,9 +215,9 @@ pub(crate) async fn load_for_version_in_transaction(
             .evidence
             .validate()
             .map_err(|_| TestEvidenceRepositoryError::CorruptState)?;
-        validate_artifact_references(connection, &stored.evidence).await?;
+        validate_artifact_references(connection, &stored.evidence)?;
         if stored.evidence.config_hash == candidate_config_hash {
-            validate_semantic_references(connection, &stored.evidence).await?;
+            validate_semantic_references(connection, &stored.evidence)?;
         }
         evidence.push(stored.evidence);
     }
@@ -245,8 +250,8 @@ fn read_row(row: &Row) -> Result<StoredEvidence, TestEvidenceRepositoryError> {
     Ok(StoredEvidence { evidence })
 }
 
-async fn persist_in_transaction(
-    connection: &Connection,
+fn persist_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     crawler_id: erabi_domain::CrawlerId,
     evidence: &TestEvidence,
 ) -> Result<(), TestEvidenceRepositoryError> {
@@ -255,12 +260,11 @@ async fn persist_in_transaction(
         crawler_id,
         evidence.crawler_version_id,
     )
-    .await
     .map_err(TestEvidenceRepositoryError::from)?;
     if current_hash != evidence.config_hash {
         return Err(TestEvidenceRepositoryError::ConfigurationChanged);
     }
-    validate_references(connection, evidence).await?;
+    validate_references(connection, evidence)?;
     connection
         .execute(
             "INSERT INTO test_evidence (id, crawler_version_id, evidence_json, executed_at) VALUES (?1, ?2, ?3, ?4)",
@@ -272,7 +276,7 @@ async fn persist_in_transaction(
                 evidence.executed_at.as_str(),
             ),
         )
-        .await
+
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
     if is_valid_discovery_transition_evidence(evidence) {
         let transition_id = evidence
@@ -283,8 +287,7 @@ async fn persist_in_transaction(
             evidence.crawler_version_id,
             transition_id,
             evidence.id,
-        )
-        .await?;
+        )?;
     }
     Ok(())
 }
@@ -298,30 +301,30 @@ fn is_valid_discovery_transition_evidence(evidence: &TestEvidence) -> bool {
             .is_some_and(|discovery| discovery.transition_id == evidence.tested_transition_id)
 }
 
-async fn validate_references(
-    connection: &Connection,
+fn validate_references(
+    connection: &impl crate::SqliteExecutor,
     evidence: &TestEvidence,
 ) -> Result<(), TestEvidenceRepositoryError> {
-    validate_semantic_references(connection, evidence).await?;
-    validate_artifact_references(connection, evidence).await
+    validate_semantic_references(connection, evidence)?;
+    validate_artifact_references(connection, evidence)
 }
 
-async fn validate_semantic_references(
-    connection: &Connection,
+fn validate_semantic_references(
+    connection: &impl crate::SqliteExecutor,
     evidence: &TestEvidence,
 ) -> Result<(), TestEvidenceRepositoryError> {
     let page_type_ids = evidence_page_type_ids(evidence);
     for page_type_id in page_type_ids {
-        ensure_page_type(connection, evidence.crawler_version_id, page_type_id).await?;
+        ensure_page_type(connection, evidence.crawler_version_id, page_type_id)?;
     }
     if let Some(transition_id) = evidence.tested_transition_id {
-        ensure_transition(connection, evidence.crawler_version_id, transition_id).await?;
+        ensure_transition(connection, evidence.crawler_version_id, transition_id)?;
     }
     Ok(())
 }
 
-async fn validate_artifact_references(
-    connection: &Connection,
+fn validate_artifact_references(
+    connection: &impl crate::SqliteExecutor,
     evidence: &TestEvidence,
 ) -> Result<(), TestEvidenceRepositoryError> {
     for artifact_id in &evidence.artifact_ids {
@@ -330,11 +333,9 @@ async fn validate_artifact_references(
                 "SELECT 1 FROM artifacts WHERE id = ?1",
                 [artifact_id.to_string()],
             )
-            .await
             .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
         if rows
             .next()
-            .await
             .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?
             .is_none()
         {
@@ -380,8 +381,8 @@ fn evidence_page_type_ids(evidence: &TestEvidence) -> Vec<PageTypeId> {
     ids
 }
 
-async fn ensure_page_type(
-    connection: &Connection,
+fn ensure_page_type(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     page_type_id: PageTypeId,
 ) -> Result<(), TestEvidenceRepositoryError> {
@@ -390,11 +391,9 @@ async fn ensure_page_type(
             "SELECT crawler_version_id FROM page_types WHERE id = ?1",
             [page_type_id.to_string()],
         )
-        .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
     let Some(row) = rows
         .next()
-        .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?
     else {
         return Err(TestEvidenceRepositoryError::Crawler(
@@ -413,8 +412,8 @@ async fn ensure_page_type(
     Ok(())
 }
 
-async fn ensure_transition(
-    connection: &Connection,
+fn ensure_transition(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     transition_id: erabi_domain::DiscoveryTransitionId,
 ) -> Result<(), TestEvidenceRepositoryError> {
@@ -423,11 +422,9 @@ async fn ensure_transition(
             "SELECT crawler_version_id FROM discovery_transitions WHERE id = ?1",
             [transition_id.to_string()],
         )
-        .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
     let Some(row) = rows
         .next()
-        .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?
     else {
         return Err(TestEvidenceRepositoryError::Crawler(
@@ -446,8 +443,8 @@ async fn ensure_transition(
     Ok(())
 }
 
-async fn attach_transition_evidence(
-    connection: &Connection,
+fn attach_transition_evidence(
+    connection: &impl crate::SqliteExecutor,
     version_id: CrawlerVersionId,
     transition_id: erabi_domain::DiscoveryTransitionId,
     evidence_id: TestEvidenceId,
@@ -457,11 +454,10 @@ async fn attach_transition_evidence(
             "SELECT configuration_json FROM discovery_transitions WHERE id = ?1 AND crawler_version_id = ?2",
             (transition_id.to_string(), version_id.to_string()),
         )
-        .await
+
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
     let Some(row) = rows
         .next()
-        .await
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?
     else {
         return Err(TestEvidenceRepositoryError::Crawler(
@@ -485,7 +481,7 @@ async fn attach_transition_evidence(
             "UPDATE discovery_transitions SET configuration_json = ?1 WHERE id = ?2 AND crawler_version_id = ?3",
             (configuration, transition_id.to_string(), version_id.to_string()),
         )
-        .await
+
         .map_err(|error| TestEvidenceRepositoryError::Database(error.into()))?;
     if updated != 1 {
         return Err(TestEvidenceRepositoryError::Crawler(

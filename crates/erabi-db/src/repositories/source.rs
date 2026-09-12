@@ -1,9 +1,12 @@
 use std::fmt;
 
+use crate::{
+    SqliteConnection as Connection, SqliteRow as Row, SqliteTransaction as Transaction, SqliteValue,
+};
 use erabi_domain::{
     CanonicalizationPolicy, CollectionId, Source, SourceId, SourceStatus, SourceTargetType,
 };
-use turso::{Connection, Row, transaction::TransactionBehavior};
+use rusqlite::TransactionBehavior;
 use url::Url;
 use uuid::Uuid;
 
@@ -80,28 +83,27 @@ impl<'database> SourceRepository<'database> {
         input: &NewSource,
     ) -> Result<Source, SourceRepositoryError> {
         validate_new_source(input)?;
-        let mut connection = self
-            .database
-            .connection()
-            .await
-            .map_err(SourceRepositoryError::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(SourceRepositoryError::database)?;
+        let input = input.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(SourceRepositoryError::database)?;
 
-        let result = create_or_reuse_in_transaction(&transaction, input).await;
-        match result {
-            Ok(source) => transaction
-                .commit()
-                .await
-                .map(|()| source)
-                .map_err(SourceRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+                let result = create_or_reuse_in_transaction(&transaction, &input);
+                match result {
+                    Ok(source) => transaction
+                        .commit()
+                        .map(|()| source)
+                        .map_err(SourceRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
+            .await
     }
 
     /// Reads and validates one complete persisted Source row.
@@ -110,24 +112,32 @@ impl<'database> SourceRepository<'database> {
     /// Returns `NotFound` for a missing Source and `CorruptState` for any
     /// malformed durable field or broken collection relationship.
     pub async fn read(&self, id: SourceId) -> Result<Source, SourceRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut statement = connection
+                    .prepare(
+                        "SELECT id, collection_id, name, original_url, canonical_url, target_type, status FROM sources WHERE id = ?1",
+                    )
+                    .map_err(SourceRepositoryError::database)?;
+                let row = statement.query_row([id.to_string()]).map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => SourceRepositoryError::NotFound,
+                    other => SourceRepositoryError::database(other),
+                })?;
+                let source = read_source(&row)?;
+                if let Some(collection_id) = source.collection_id {
+                    ensure_collection_exists_on_connection(&connection, collection_id).map_err(|error| {
+                        match error {
+                            SourceRepositoryError::CollectionNotFound => {
+                                SourceRepositoryError::CorruptState
+                            }
+                            other => other,
+                        }
+                    })?;
+                }
+                Ok(source)
+            })
             .await
-            .map_err(SourceRepositoryError::database)?;
-        let row = connection
-            .prepare(
-                "SELECT id, collection_id, name, original_url, canonical_url, target_type, status FROM sources WHERE id = ?1",
-            )
-            .await
-            .map_err(SourceRepositoryError::database)?
-            .query_row([id.to_string()])
-            .await
-            .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => SourceRepositoryError::NotFound,
-                other => SourceRepositoryError::database(other),
-            })?;
-        read_source(&connection, &row).await
     }
 
     /// Marks a Source as a direct file target without changing its identity,
@@ -137,36 +147,34 @@ impl<'database> SourceRepository<'database> {
     /// # Errors
     /// Returns `NotFound`, `CorruptState`, or a database error.
     pub async fn mark_file_asset(&self, id: SourceId) -> Result<Source, SourceRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(SourceRepositoryError::database)?;
+                let result = mark_file_asset_in_transaction(&transaction, id);
+                match result {
+                    Ok(source) => transaction
+                        .commit()
+                        .map(|()| source)
+                        .map_err(SourceRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(SourceRepositoryError::database)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(SourceRepositoryError::database)?;
-        let result = mark_file_asset_in_transaction(&transaction, id).await;
-        match result {
-            Ok(source) => transaction
-                .commit()
-                .await
-                .map(|()| source)
-                .map_err(SourceRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 }
 
-async fn create_or_reuse_in_transaction(
-    connection: &Connection,
+fn create_or_reuse_in_transaction(
+    connection: &Transaction<'_>,
     input: &NewSource,
 ) -> Result<Source, SourceRepositoryError> {
     if let Some(collection_id) = input.collection_id {
-        ensure_collection_exists(connection, collection_id).await?;
+        ensure_collection_exists(connection, collection_id)?;
     }
 
     let mut rows = if let Some(collection_id) = input.collection_id {
@@ -175,7 +183,6 @@ async fn create_or_reuse_in_transaction(
                 "SELECT id, collection_id, name, original_url, canonical_url, target_type, status FROM sources WHERE collection_id = ?1 AND canonical_url = ?2",
                 (collection_id.to_string(), input.canonical_url.as_str()),
             )
-            .await
             .map_err(SourceRepositoryError::database)?
     } else {
         connection
@@ -183,13 +190,12 @@ async fn create_or_reuse_in_transaction(
                 "SELECT id, collection_id, name, original_url, canonical_url, target_type, status FROM sources WHERE collection_id IS NULL AND canonical_url = ?1",
                 [input.canonical_url.as_str()],
             )
-            .await
             .map_err(SourceRepositoryError::database)?
     };
 
     let mut matches = Vec::new();
-    while let Some(row) = rows.next().await.map_err(SourceRepositoryError::database)? {
-        matches.push(read_source(connection, &row).await?);
+    while let Some(row) = rows.next().map_err(SourceRepositoryError::database)? {
+        matches.push(read_source(row)?);
     }
     if matches.len() > 1 {
         return Err(SourceRepositoryError::CorruptState);
@@ -225,7 +231,7 @@ async fn create_or_reuse_in_transaction(
                 source.id.to_string(),
                 source
                     .collection_id
-                    .map_or(turso::Value::Null, |value| turso::Value::Text(value.to_string())),
+                    .map_or(SqliteValue::Null, |value| SqliteValue::Text(value.to_string())),
                 source.name.as_str(),
                 input.original_url.as_str(),
                 source.canonical_url.as_str(),
@@ -233,35 +239,31 @@ async fn create_or_reuse_in_transaction(
                 source_status_name(source.status),
             ),
         )
-        .await
         .map_err(SourceRepositoryError::database)?;
     Ok(source)
 }
 
-async fn mark_file_asset_in_transaction(
-    connection: &Connection,
+fn mark_file_asset_in_transaction(
+    connection: &Transaction<'_>,
     id: SourceId,
 ) -> Result<Source, SourceRepositoryError> {
     let row = connection
         .prepare(
             "SELECT id, collection_id, name, original_url, canonical_url, target_type, status FROM sources WHERE id = ?1",
         )
-        .await
         .map_err(SourceRepositoryError::database)?
         .query_row([id.to_string()])
-        .await
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => SourceRepositoryError::NotFound,
+            rusqlite::Error::QueryReturnedNoRows => SourceRepositoryError::NotFound,
             other => SourceRepositoryError::database(other),
         })?;
-    let source = read_source(connection, &row).await?;
+    let source = read_source(&row)?;
     if source.target_type == SourceTargetType::WebPage {
         connection
             .execute(
                 "UPDATE sources SET target_type = 'FILE_ASSET' WHERE id = ?1",
                 [id.to_string()],
             )
-            .await
             .map_err(SourceRepositoryError::database)?;
         return Ok(Source {
             target_type: SourceTargetType::FileAsset,
@@ -271,18 +273,16 @@ async fn mark_file_asset_in_transaction(
     Ok(source)
 }
 
-async fn ensure_collection_exists(
-    connection: &Connection,
+fn ensure_collection_exists(
+    connection: &Transaction<'_>,
     collection_id: CollectionId,
 ) -> Result<(), SourceRepositoryError> {
     let row = connection
         .prepare("SELECT id FROM collections WHERE id = ?1")
-        .await
         .map_err(SourceRepositoryError::database)?
         .query_row([collection_id.to_string()])
-        .await
         .map_err(|error| match error {
-            turso::Error::QueryReturnedNoRows => SourceRepositoryError::CollectionNotFound,
+            rusqlite::Error::QueryReturnedNoRows => SourceRepositoryError::CollectionNotFound,
             other => SourceRepositoryError::database(other),
         })?;
     let stored_id: String = row
@@ -294,7 +294,40 @@ async fn ensure_collection_exists(
     Ok(())
 }
 
-async fn read_source(connection: &Connection, row: &Row) -> Result<Source, SourceRepositoryError> {
+impl From<crate::DbError> for SourceRepositoryError {
+    fn from(error: crate::DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for SourceRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(crate::DbError::from(error))
+    }
+}
+
+fn ensure_collection_exists_on_connection(
+    connection: &Connection<'_>,
+    collection_id: CollectionId,
+) -> Result<(), SourceRepositoryError> {
+    let row = connection
+        .prepare("SELECT id FROM collections WHERE id = ?1")
+        .map_err(SourceRepositoryError::database)?
+        .query_row([collection_id.to_string()])
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => SourceRepositoryError::CollectionNotFound,
+            other => SourceRepositoryError::database(other),
+        })?;
+    let stored_id: String = row
+        .get(0)
+        .map_err(|_| SourceRepositoryError::CorruptState)?;
+    if stored_id != collection_id.to_string() {
+        return Err(SourceRepositoryError::CorruptState);
+    }
+    Ok(())
+}
+
+fn read_source(row: &Row) -> Result<Source, SourceRepositoryError> {
     let id_text: String = row
         .get(0)
         .map_err(|_| SourceRepositoryError::CorruptState)?;
@@ -348,14 +381,6 @@ async fn read_source(connection: &Connection, row: &Row) -> Result<Source, Sourc
         .canonical_url;
     if expected_canonical != canonical_url {
         return Err(SourceRepositoryError::CorruptState);
-    }
-    if let Some(collection_id) = collection_id {
-        ensure_collection_exists(connection, collection_id)
-            .await
-            .map_err(|error| match error {
-                SourceRepositoryError::CollectionNotFound => SourceRepositoryError::CorruptState,
-                other => other,
-            })?;
     }
     let target_type =
         parse_target_type(&target_type_text).ok_or(SourceRepositoryError::CorruptState)?;

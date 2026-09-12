@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use erabi_db::{
     ErabiDatabase, MigrationRunner,
@@ -19,6 +22,89 @@ use erabi_domain::{
     SourceStatus, SourceTargetType, TransitionBudget,
 };
 use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+struct TestConnection {
+    database: Arc<Mutex<rusqlite::Connection>>,
+}
+
+struct TestStatement {
+    database: Arc<Mutex<rusqlite::Connection>>,
+    sql: String,
+}
+
+struct TestRow {
+    values: Vec<rusqlite::types::Value>,
+}
+
+#[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+impl TestConnection {
+    async fn execute<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<usize, rusqlite::Error> {
+        self.database
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .execute(sql, params)
+    }
+
+    async fn execute_batch(&self, sql: &str) -> Result<(), rusqlite::Error> {
+        self.database
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .execute_batch(sql)
+    }
+
+    async fn prepare(&self, sql: &str) -> Result<TestStatement, rusqlite::Error> {
+        self.database
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .prepare(sql)
+            .map(|_| TestStatement {
+                database: Arc::clone(&self.database),
+                sql: sql.to_owned(),
+            })
+    }
+}
+
+#[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+impl TestStatement {
+    async fn query_row<P: rusqlite::Params>(&self, params: P) -> Result<TestRow, rusqlite::Error> {
+        let database = self
+            .database
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut statement = database.prepare(&self.sql)?;
+        statement.query_row(params, |row| {
+            let mut values = Vec::with_capacity(row.as_ref().column_count());
+            for index in 0..row.as_ref().column_count() {
+                let value = row.get_ref(index)?;
+                values.push(rusqlite::types::Value::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        value.data_type(),
+                        Box::new(error),
+                    )
+                })?);
+            }
+            Ok(TestRow { values })
+        })
+    }
+}
+
+impl TestRow {
+    fn get<T: rusqlite::types::FromSql>(&self, index: usize) -> Result<T, rusqlite::Error> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or(rusqlite::Error::InvalidColumnIndex(index))?;
+        T::column_result(rusqlite::types::ValueRef::from(value)).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+        })
+    }
+}
 
 fn resolved<T>(value: T) -> ResolvedValue<T> {
     ResolvedValue {
@@ -92,14 +178,16 @@ fn crawler_version_snapshot(
     })?)
 }
 
+#[allow(clippy::unused_async)]
 async fn raw_connection(
     directory: &tempfile::TempDir,
-) -> Result<turso::Connection, Box<dyn std::error::Error>> {
+) -> Result<TestConnection, Box<dyn std::error::Error>> {
     let path = directory.path().join("erabi.db");
-    let database = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    Ok(database.connect()?)
+    let connection = rusqlite::Connection::open(path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(TestConnection {
+        database: Arc::new(Mutex::new(connection)),
+    })
 }
 
 async fn quick_setup(
@@ -310,7 +398,9 @@ async fn insert_artifact(
             (
                 artifact_id.to_string(),
                 run_id.to_string(),
-                source_id.map_or(turso::Value::Null, |id| turso::Value::Text(id.to_string())),
+                source_id.map_or(rusqlite::types::Value::Null, |id| {
+                    rusqlite::types::Value::Text(id.to_string())
+                }),
                 format!("pages/{artifact_id}.html"),
             ),
         )
@@ -1346,6 +1436,115 @@ async fn traversal_reconstruction_uses_persisted_order_parent_and_generation()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn empty_recovery_action_selection_commits_action_record()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, database, run_id) = quick_setup("https://example.test/empty-recovery").await?;
+    let mut source_job = NewJob::new(JobKind::new("PRODUCTION_CRAWL")?, 0, 0, 1)?;
+    source_job.crawl_run_id = Some(run_id.to_string());
+    let jobs = JobRepository::new(&database);
+    jobs.enqueue(&source_job, 0).await?;
+    let source_acquired = jobs
+        .acquire_next("empty-recovery-source", 0, 30)
+        .await?
+        .ok_or("source job was not acquired")?;
+    let source_lease = source_acquired
+        .job
+        .lease
+        .clone()
+        .ok_or("source lease missing")?;
+    jobs.cancel(&source_job.id, &source_lease, 1).await?;
+    let action_job = jobs
+        .enqueue_action_child(
+            &source_job.id,
+            JobKind::new("RETRY")?,
+            2,
+            erabi_db::repositories::ActionRunAssociation::SameSourceRun,
+            Some(1),
+        )
+        .await?;
+    let action_acquired = jobs
+        .acquire_next("empty-recovery-worker", 2, 30)
+        .await?
+        .ok_or("action job was not acquired")?;
+    let action_attempt_id = action_acquired.attempt.id.clone();
+    let repository = CrawlTraversalRepository::new(&database);
+
+    let selection = repository
+        .prepare_recovery_action(
+            &action_job.id,
+            &action_attempt_id,
+            run_id,
+            CrawlRecoveryActionKind::Retry,
+            2,
+        )
+        .await?;
+    assert!(selection.state_ids.is_empty());
+
+    let late_work = CrawlUrlStateRecord {
+        id: "late-recovery-work".to_owned(),
+        crawl_run_id: run_id,
+        canonical_url: "https://example.test/empty-recovery/late".to_owned(),
+        first_discovered_url_id: None,
+        requested_url: "https://example.test/empty-recovery/late".to_owned(),
+        parent_url_state_id: None,
+        parent_discovered_url_id: None,
+        admission_state: CrawlAdmissionState::Admitted,
+        preserve_reason: None,
+        resolved_to_url_state_id: None,
+        admission_sequence: Some(0),
+        depth: Some(0),
+        target_page_type_id: None,
+        transition_id: None,
+        pagination: false,
+        final_canonical_url: None,
+        current_work_state: Some(CrawlWorkState::Pending),
+        work_generation: 0,
+        current_execution_id: None,
+        seed_provenance: Vec::new(),
+        seen: true,
+        sampled: false,
+        expanded: false,
+        in_scope: false,
+        page_type_match_state: None,
+    };
+    let control = CrawlTraversalControl {
+        crawl_run_id: run_id,
+        consumed_bytes: 0,
+        raw_link_count: 0,
+        duplicate_count: 0,
+        robots_excluded_count: 0,
+        provider_error_count: 0,
+        external_url_count: 0,
+        blocked_url_count: 0,
+        peak_expansion_count: 0,
+        elapsed_millis: 0,
+        time_budget_hit: false,
+        duration_work_not_expanded: false,
+        pagination_truncation_count: 0,
+        next_admission_sequence: 1,
+    };
+    repository
+        .initialize_run_state(run_id, &[late_work], &control)
+        .await?;
+
+    let replay = repository
+        .prepare_recovery_action(
+            &action_job.id,
+            &action_attempt_id,
+            run_id,
+            CrawlRecoveryActionKind::Retry,
+            2,
+        )
+        .await?;
+    assert_eq!(replay, selection);
+    let reconstructed = repository.reconstruct_recovery_state(run_id).await?;
+    assert_eq!(reconstructed.work.len(), 1);
+    assert_eq!(reconstructed.work[0].id, "late-recovery-work");
+    Ok(())
+}
+
+#[tokio::test]
 async fn discovery_evidence_replay_is_idempotent_and_conflicts_fail()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_directory, database, run_id) = quick_setup("https://example.test/replay").await?;
@@ -1432,7 +1631,6 @@ async fn discovery_evidence_replay_is_idempotent_and_conflicts_fail()
             .len(),
         1
     );
-
     let mut conflicting = evidence;
     conflicting.status = "PRESERVE_ONLY".to_owned();
     assert!(
@@ -1513,7 +1711,7 @@ async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
         pagination_truncation_count: 0,
         next_admission_sequence: 1,
     };
-    let evidence = DiscoveredUrlRecord {
+    let evidence_a = DiscoveredUrlRecord {
         id: evidence_id,
         crawl_run_id: run_id,
         source_id: None,
@@ -1523,6 +1721,17 @@ async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
         status: "ADMITTED".to_owned(),
         discovered_at: "unix:1".to_owned(),
         detail: serde_json::json!({"origin":"SEED","seed_ids":[]}),
+    };
+    let evidence_b = DiscoveredUrlRecord {
+        id: uuid::Uuid::now_v7().to_string(),
+        crawl_run_id: run_id,
+        source_id: None,
+        raw_href: Some("/child".to_owned()),
+        original_url: "https://example.test/child".to_owned(),
+        canonical_url: "https://example.test/child".to_owned(),
+        status: "ADMITTED".to_owned(),
+        discovered_at: "unix:2".to_owned(),
+        detail: serde_json::json!({"origin":"DISCOVERY_PATH","parent":"https://example.test/seed"}),
     };
     let checkpoint = CheckpointEnvelope::new(
         CheckpointIdentity::new(
@@ -1542,7 +1751,7 @@ async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
         .initialize_run_state_with_checkpoint_and_evidence(
             run_id,
             std::slice::from_ref(&root),
-            std::slice::from_ref(&evidence),
+            std::slice::from_ref(&evidence_a),
             &control,
             &projection,
             &job.id,
@@ -1556,7 +1765,7 @@ async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
         .initialize_run_state_with_checkpoint_and_evidence(
             run_id,
             std::slice::from_ref(&root),
-            std::slice::from_ref(&evidence),
+            std::slice::from_ref(&evidence_b),
             &control,
             &projection,
             &job.id,
@@ -1566,14 +1775,31 @@ async fn initial_root_evidence_and_checkpoint_replay_as_one_idempotent_phase()
             2,
         )
         .await?;
-    assert_eq!(
-        CrawlRunRepository::new(&database)
-            .discovered_urls(run_id)
-            .await?
-            .len(),
-        1
+    let discovered_urls = CrawlRunRepository::new(&database)
+        .discovered_urls(run_id)
+        .await?;
+    assert_eq!(discovered_urls.len(), 2);
+    assert!(
+        discovered_urls
+            .iter()
+            .any(|record| record.id == evidence_a.id)
+    );
+    assert!(
+        discovered_urls
+            .iter()
+            .any(|record| record.id == evidence_b.id)
     );
     assert_eq!(jobs.checkpoints(&job.id).await?.len(), 1);
+    let reconstructed = repository.reconstruct_recovery_state(run_id).await?;
+    assert_eq!(reconstructed.control, control);
+    assert_eq!(reconstructed.work, vec![root]);
+    assert_eq!(
+        jobs.latest_checkpoint(&job.id)
+            .await?
+            .as_ref()
+            .map(|record| record.created_at),
+        Some(1)
+    );
     Ok(())
 }
 

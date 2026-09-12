@@ -1,5 +1,5 @@
 use erabi_db::{
-    DbError, ErabiDatabase, MigrationRunner,
+    DatabaseFailure, DbError, ErabiDatabase, MigrationRunner,
     repositories::{CrawlRunRepository, CrawlerRepository},
 };
 use erabi_domain::{
@@ -42,7 +42,7 @@ async fn fresh_repository_connection_enforces_crawler_foreign_keys()
         repository
             .save_draft(&orphan_draft, "operator", "2026-08-23T00:00:00Z")
             .await,
-        Err(DbError::Turso(_))
+        Err(DbError::Database(DatabaseFailure::ConstraintViolation))
     ));
     Ok(())
 }

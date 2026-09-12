@@ -20,6 +20,7 @@ pub use checkpoint::{
     MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_PAYLOAD_KIND_BYTES,
 };
 pub use configuration::ConfigurationRepository;
+pub(crate) use configuration::validate_all_with_connection;
 pub use crawl_execution::{
     CrawlExecutionArtifact, CrawlExecutionArtifactKind, CrawlExecutionRecord,
     CrawlExecutionRepository, CrawlExecutionRepositoryError, CrawlExecutionSummary,

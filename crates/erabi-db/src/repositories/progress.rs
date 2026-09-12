@@ -2,8 +2,9 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use crate::{SqliteConnection as Connection, SqliteRow as Row};
+use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
-use turso::{Connection, transaction::TransactionBehavior};
 use uuid::Uuid;
 
 use crate::{DbError, ErabiDatabase};
@@ -397,27 +398,26 @@ impl<'database> ProgressRepository<'database> {
         event: &NewProgressEvent,
         created_at: i64,
     ) -> Result<ProgressEvent, ProgressRepositoryError> {
-        let mut connection = self
-            .database
-            .connection()
+        let event = event.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(ProgressRepositoryError::database)?;
+                let result = append_in_transaction(&transaction, &event, created_at);
+                match result {
+                    Ok(progress) => transaction
+                        .commit()
+                        .map(|()| progress)
+                        .map_err(ProgressRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(ProgressRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(ProgressRepositoryError::database)?;
-        let result = append_in_transaction(&transaction, event, created_at).await;
-        match result {
-            Ok(progress) => transaction
-                .commit()
-                .await
-                .map(|()| progress)
-                .map_err(ProgressRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Returns events with a sequence strictly after `request.after`, in
@@ -431,12 +431,11 @@ impl<'database> ProgressRepository<'database> {
         job_id: &JobId,
         request: ProgressReplayRequest,
     ) -> Result<ProgressReplayPage, ProgressRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(ProgressRepositoryError::from_db)?;
-        ensure_job_exists(&connection, job_id).await?;
+        let job_id = job_id.clone();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                ensure_job_exists_on_connection(&connection, &job_id)?;
         let after = request.after.map_or(Ok(0_i64), |value| {
             i64::try_from(value.get()).map_err(|_| ProgressRepositoryError::InvalidReplayRequest)
         })?;
@@ -446,41 +445,40 @@ impl<'database> ProgressRepository<'database> {
             .query(
                 "SELECT id, job_id, attempt_id, sequence, event_type, payload_json, created_at FROM job_progress_events WHERE job_id = ?1 AND sequence > ?2 ORDER BY sequence ASC LIMIT ?3",
                 (job_id.as_str(), after, query_limit),
-            )
-            .await
-            .map_err(ProgressRepositoryError::database)?;
+                )?;
         let mut events = Vec::with_capacity(request.limit);
         let mut has_more = false;
         while let Some(row) = rows
             .next()
-            .await
             .map_err(ProgressRepositoryError::database)?
         {
             if events.len() == request.limit {
                 has_more = true;
                 break;
             }
-            events.push(progress_event_from_row(&row)?);
+            events.push(progress_event_from_row(row)?);
         }
         let next_after = has_more
             .then(|| events.last().map(|event| event.sequence))
             .flatten();
-        Ok(ProgressReplayPage { events, next_after })
+                Ok(ProgressReplayPage { events, next_after })
+            })
+            .await
     }
 }
 
 /// Appends one validated progress event to an existing transaction. This is
 /// shared by the queue's atomic terminal-failure boundary and the ordinary
 /// repository append path.
-pub(crate) async fn append_in_transaction(
-    connection: &Connection,
+pub(crate) fn append_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     event: &NewProgressEvent,
     created_at: i64,
 ) -> Result<ProgressEvent, ProgressRepositoryError> {
-    ensure_job_exists(connection, event.job_id()).await?;
-    ensure_attempt_belongs_to_job(connection, event).await?;
-    ensure_stream_open(connection, event.job_id()).await?;
-    let sequence = allocate_sequence(connection, event.job_id()).await?;
+    ensure_job_exists(connection, event.job_id())?;
+    ensure_attempt_belongs_to_job(connection, event)?;
+    ensure_stream_open(connection, event.job_id())?;
+    let sequence = allocate_sequence(connection, event.job_id())?;
     let payload = StoredProgressPayload::from_event(event)?;
     let payload_json =
         serde_json::to_string(&payload).map_err(|_| ProgressRepositoryError::ProgressInvariant)?;
@@ -499,7 +497,6 @@ pub(crate) async fn append_in_transaction(
                 created_at,
             ),
         )
-        .await
         .map_err(ProgressRepositoryError::database)?;
     Ok(ProgressEvent {
         id,
@@ -514,11 +511,7 @@ pub(crate) async fn append_in_transaction(
 }
 
 impl ProgressRepositoryError {
-    fn from_db(error: DbError) -> Self {
-        Self::Database(error)
-    }
-
-    fn database(error: turso::Error) -> Self {
+    fn database(error: rusqlite::Error) -> Self {
         Self::Database(DbError::from(error))
     }
 }
@@ -598,8 +591,8 @@ impl StoredProgressPayload {
     }
 }
 
-async fn ensure_job_exists(
-    connection: &Connection,
+fn ensure_job_exists(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<(), ProgressRepositoryError> {
     let mut rows = connection
@@ -607,11 +600,9 @@ async fn ensure_job_exists(
             "SELECT 1 FROM jobs WHERE id = ?1 LIMIT 1",
             [job_id.as_str()],
         )
-        .await
         .map_err(ProgressRepositoryError::database)?;
     if rows
         .next()
-        .await
         .map_err(ProgressRepositoryError::database)?
         .is_some()
     {
@@ -621,8 +612,41 @@ async fn ensure_job_exists(
     }
 }
 
-async fn ensure_attempt_belongs_to_job(
-    connection: &Connection,
+impl From<DbError> for ProgressRepositoryError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for ProgressRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
+}
+
+fn ensure_job_exists_on_connection(
+    connection: &impl crate::SqliteExecutor,
+    job_id: &JobId,
+) -> Result<(), ProgressRepositoryError> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM jobs WHERE id = ?1 LIMIT 1",
+            [job_id.as_str()],
+        )
+        .map_err(ProgressRepositoryError::database)?;
+    if rows
+        .next()
+        .map_err(ProgressRepositoryError::database)?
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(ProgressRepositoryError::JobNotFound)
+    }
+}
+
+fn ensure_attempt_belongs_to_job(
+    connection: &impl crate::SqliteExecutor,
     event: &NewProgressEvent,
 ) -> Result<(), ProgressRepositoryError> {
     let Some(attempt_id) = &event.attempt_id else {
@@ -633,11 +657,9 @@ async fn ensure_attempt_belongs_to_job(
             "SELECT job_id FROM job_attempts WHERE id = ?1 LIMIT 1",
             [attempt_id.as_str()],
         )
-        .await
         .map_err(ProgressRepositoryError::database)?;
     let row = rows
         .next()
-        .await
         .map_err(ProgressRepositoryError::database)?
         .ok_or(ProgressRepositoryError::AttemptNotFound)?;
     let attempt_job_id: String = row.get(0).map_err(ProgressRepositoryError::database)?;
@@ -648,8 +670,8 @@ async fn ensure_attempt_belongs_to_job(
     }
 }
 
-async fn ensure_stream_open(
-    connection: &Connection,
+fn ensure_stream_open(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<(), ProgressRepositoryError> {
     let mut rows = connection
@@ -657,13 +679,8 @@ async fn ensure_stream_open(
             "SELECT payload_json FROM job_progress_events WHERE job_id = ?1 ORDER BY sequence DESC LIMIT 1",
             [job_id.as_str()],
         )
-        .await
         .map_err(ProgressRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(ProgressRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(ProgressRepositoryError::database)? else {
         return Ok(());
     };
     let payload_json: String = row.get(0).map_err(ProgressRepositoryError::database)?;
@@ -677,16 +694,14 @@ async fn ensure_stream_open(
     }
 }
 
-async fn allocate_sequence(
-    connection: &Connection,
+fn allocate_sequence(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<ProgressSequence, ProgressRepositoryError> {
     let row = connection
         .prepare("SELECT COALESCE(MAX(sequence), 0) FROM job_progress_events WHERE job_id = ?1")
-        .await
         .map_err(ProgressRepositoryError::database)?
         .query_row([job_id.as_str()])
-        .await
         .map_err(ProgressRepositoryError::database)?;
     let previous: i64 = row.get(0).map_err(ProgressRepositoryError::database)?;
     let next = previous
@@ -696,7 +711,7 @@ async fn allocate_sequence(
     ProgressSequence::new(next).map_err(|_| ProgressRepositoryError::ProgressInvariant)
 }
 
-fn progress_event_from_row(row: &turso::Row) -> Result<ProgressEvent, ProgressRepositoryError> {
+fn progress_event_from_row(row: &Row) -> Result<ProgressEvent, ProgressRepositoryError> {
     let id: String = row.get(0).map_err(ProgressRepositoryError::database)?;
     Uuid::parse_str(&id).map_err(|_| ProgressRepositoryError::ProgressInvariant)?;
     let job_id = JobId::from_stored(row.get(1).map_err(ProgressRepositoryError::database)?);

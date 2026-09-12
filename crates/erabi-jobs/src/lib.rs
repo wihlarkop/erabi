@@ -1664,7 +1664,8 @@ mod tests {
     use std::{collections::BTreeMap, future::Future, path::Path};
 
     use erabi_db::{
-        DbError, ErabiDatabase, MigrationFailure, MigrationFailureState, MigrationRunner,
+        DatabaseFailure, DbError, ErabiDatabase, MigrationFailure, MigrationFailureState,
+        MigrationRunner,
         repositories::{
             CheckpointRepositoryError, CrawlExecutionRepository, CrawlExecutionSummary,
             CrawlRunRepository, JobKind, JobRepository, JobState, NewJob, ProgressRepository,
@@ -1746,7 +1747,7 @@ mod tests {
         };
         assert!(matches!(
             error,
-            JobRepositoryError::Database(DbError::Turso(_))
+            JobRepositoryError::Database(DbError::Database(DatabaseFailure::ConstraintViolation))
         ));
         assert_eq!(
             JobRuntimeError::Repository(error).disposition(),

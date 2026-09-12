@@ -10,13 +10,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 type DbCallResult<T, E> = Result<Result<T, E>, WorkerFailure>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkerFailure {
+pub(crate) enum WorkerFailure {
     ShuttingDown,
     Panicked,
 }
 
 #[derive(Debug, thiserror::Error)]
-enum StartupError {
+pub(crate) enum StartupError {
     #[error("worker capacity {capacity} is outside 1..={max}")]
     InvalidCapacity { capacity: usize, max: usize },
     #[error("failed to spawn database worker thread: {0}")]
@@ -33,6 +33,7 @@ enum StartupError {
     ReadinessClosed,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 enum ShutdownError {
     #[error("worker completion was not observable")]
@@ -85,6 +86,18 @@ impl WorkerShared {
     fn install_test_hooks(&self, hooks: TestHooks) {
         let mut installed = recover_lock(&self.test_hooks);
         *installed = Some(Arc::new(hooks));
+    }
+
+    #[cfg(test)]
+    fn install_timing_observer(&self, observer: Arc<TestTimingObserver>) {
+        let mut installed = recover_lock(&self.test_hooks);
+        if let Some(hooks) = installed.as_ref() {
+            *recover_lock(&hooks.timing) = Some(observer);
+        } else {
+            *installed = Some(Arc::new(
+                TestHooks::new(None, None, None, false, None).with_timing(observer),
+            ));
+        }
     }
 
     #[cfg(test)]
@@ -144,12 +157,12 @@ where
 }
 
 #[derive(Clone)]
-struct DbWorkerHandle {
+pub(crate) struct DbWorkerHandle {
     shared: Arc<WorkerShared>,
 }
 
 impl DbWorkerHandle {
-    async fn call<T, E, F>(&self, operation: F) -> DbCallResult<T, E>
+    pub(crate) async fn call<T, E, F>(&self, operation: F) -> DbCallResult<T, E>
     where
         T: Send + 'static,
         E: Send + 'static,
@@ -216,7 +229,8 @@ impl DbWorkerHandle {
     }
 }
 
-struct DbWorker {
+#[allow(dead_code)]
+pub(crate) struct DbWorker {
     handle: DbWorkerHandle,
     join: Option<thread::JoinHandle<()>>,
     completion: Option<oneshot::Receiver<Lifecycle>>,
@@ -224,9 +238,36 @@ struct DbWorker {
 }
 
 impl DbWorker {
-    fn start<F>(capacity: usize, initializer: F) -> Result<Self, StartupError>
+    pub(crate) fn start<F>(capacity: usize, initializer: F) -> Result<Self, StartupError>
     where
         F: FnOnce(&mut rusqlite::Connection) -> Result<(), rusqlite::Error> + Send + 'static,
+    {
+        Self::start_with_opener(capacity, rusqlite::Connection::open_in_memory, initializer)
+    }
+
+    pub(crate) fn start_local<F>(
+        capacity: usize,
+        path: String,
+        initializer: F,
+    ) -> Result<Self, StartupError>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<(), rusqlite::Error> + Send + 'static,
+    {
+        Self::start_with_opener(
+            capacity,
+            move || rusqlite::Connection::open(path),
+            initializer,
+        )
+    }
+
+    fn start_with_opener<F, O>(
+        capacity: usize,
+        opener: O,
+        initializer: F,
+    ) -> Result<Self, StartupError>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<(), rusqlite::Error> + Send + 'static,
+        O: FnOnce() -> Result<rusqlite::Connection, rusqlite::Error> + Send + 'static,
     {
         if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
             return Err(StartupError::InvalidCapacity {
@@ -245,6 +286,7 @@ impl DbWorker {
             .spawn(move || {
                 worker_entry(
                     &worker_shared,
+                    opener,
                     initializer,
                     &ready_sender,
                     completion_sender,
@@ -270,7 +312,7 @@ impl DbWorker {
         }
     }
 
-    fn handle(&self) -> DbWorkerHandle {
+    pub(crate) fn handle(&self) -> DbWorkerHandle {
         self.handle.clone()
     }
 
@@ -279,6 +321,12 @@ impl DbWorker {
         self.handle.shared.install_test_hooks(hooks);
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_timing_observer(&self, observer: Arc<TestTimingObserver>) {
+        self.handle.shared.install_timing_observer(observer);
+    }
+
+    #[allow(dead_code)]
     async fn shutdown(mut self) -> Result<(), ShutdownError> {
         self.handle.begin_shutdown();
 
@@ -322,13 +370,14 @@ impl Drop for DbWorker {
 
 fn worker_entry<F>(
     shared: &WorkerShared,
+    opener: impl FnOnce() -> Result<rusqlite::Connection, rusqlite::Error>,
     initializer: F,
     ready_sender: &std::sync::mpsc::SyncSender<Result<(), StartupError>>,
     completion_sender: oneshot::Sender<Lifecycle>,
 ) where
     F: FnOnce(&mut rusqlite::Connection) -> Result<(), rusqlite::Error> + Send + 'static,
 {
-    let mut connection = match rusqlite::Connection::open_in_memory() {
+    let mut connection = match opener() {
         Ok(connection) => connection,
         Err(error) => {
             let _ = ready_sender.send(Err(StartupError::ConnectionOpen(error)));
@@ -474,6 +523,10 @@ fn worker_loop(
         }
 
         let execution = current_job.as_mut().map(|job| job.execute(connection));
+        #[cfg(test)]
+        if let Some(hooks) = shared.test_hooks() {
+            hooks.completed();
+        }
         match execution {
             Some(JobExecution::Completed) => {
                 let completed = current_job.take();
@@ -578,6 +631,7 @@ struct TestHooks {
     after_dequeue: Option<Arc<TestGate>>,
     panic_after_dequeue: std::sync::atomic::AtomicBool,
     after_completion: Option<Arc<TestGate>>,
+    timing: Mutex<Option<Arc<TestTimingObserver>>>,
 }
 
 #[cfg(test)]
@@ -597,7 +651,13 @@ impl TestHooks {
             after_dequeue,
             panic_after_dequeue: std::sync::atomic::AtomicBool::new(panic_after_dequeue),
             after_completion,
+            timing: Mutex::new(None),
         }
+    }
+
+    fn with_timing(self, observer: Arc<TestTimingObserver>) -> Self {
+        *recover_lock(&self.timing) = Some(observer);
+        self
     }
 
     fn before_acquire(&self) {
@@ -607,6 +667,9 @@ impl TestHooks {
     }
 
     fn accepted(&self) {
+        if let Some(observer) = recover_lock(&self.timing).clone() {
+            observer.accepted();
+        }
         if let Some(admission) = &self.accepted {
             admission.record();
         }
@@ -623,6 +686,9 @@ impl TestHooks {
     }
 
     fn after_dequeue(&self) {
+        if let Some(observer) = recover_lock(&self.timing).clone() {
+            observer.dequeued();
+        }
         if let Some(gate) = &self.after_dequeue {
             gate.block_worker();
         }
@@ -631,6 +697,12 @@ impl TestHooks {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             panic!("injected worker infrastructure panic");
+        }
+    }
+
+    fn completed(&self) {
+        if let Some(observer) = recover_lock(&self.timing).clone() {
+            observer.completed();
         }
     }
 
@@ -683,6 +755,81 @@ struct TestGate {
 struct TestGateState {
     reached: bool,
     released: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TimingSample {
+    pub(crate) queue_wait: std::time::Duration,
+    pub(crate) service_time: std::time::Duration,
+    pub(crate) end_to_end: std::time::Duration,
+}
+
+#[cfg(test)]
+pub(crate) struct TestTimingObserver {
+    state: Mutex<TestTimingState>,
+    wake: Condvar,
+}
+
+#[cfg(test)]
+struct TestTimingState {
+    accepted: VecDeque<std::time::Instant>,
+    dequeued: VecDeque<(std::time::Instant, std::time::Instant)>,
+    samples: Vec<TimingSample>,
+}
+
+#[cfg(test)]
+impl TestTimingObserver {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(TestTimingState {
+                accepted: VecDeque::new(),
+                dequeued: VecDeque::new(),
+                samples: Vec::new(),
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn accepted(&self) {
+        let mut state = recover_lock(&self.state);
+        state.accepted.push_back(std::time::Instant::now());
+    }
+
+    fn dequeued(&self) {
+        let mut state = recover_lock(&self.state);
+        let Some(accepted) = state.accepted.pop_front() else {
+            return;
+        };
+        state
+            .dequeued
+            .push_back((accepted, std::time::Instant::now()));
+    }
+
+    fn completed(&self) {
+        let mut state = recover_lock(&self.state);
+        let Some((accepted, dequeued)) = state.dequeued.pop_front() else {
+            return;
+        };
+        let completed = std::time::Instant::now();
+        state.samples.push(TimingSample {
+            queue_wait: dequeued.saturating_duration_since(accepted),
+            service_time: completed.saturating_duration_since(dequeued),
+            end_to_end: completed.saturating_duration_since(accepted),
+        });
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn wait_for_samples(&self, count: usize) -> Vec<TimingSample> {
+        let mut state = recover_lock(&self.state);
+        while state.samples.len() < count {
+            state = match self.wake.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        state.samples.clone()
+    }
 }
 
 #[cfg(test)]

@@ -635,10 +635,10 @@ dependencies = [
  "erabi-db",
  "erabi-jobs",
  "erabi-observability",
+ "rusqlite",
  "secrecy",
  "thiserror",
  "tokio",
- "turso",
  "url",
 ]
 

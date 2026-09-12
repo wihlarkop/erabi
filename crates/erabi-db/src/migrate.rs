@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use turso::transaction::TransactionBehavior;
+use crate::{SqliteConnection as Connection, SqliteRows, SqliteTransaction as Transaction};
+use rusqlite::TransactionBehavior;
 
 use crate::{DbError, ErabiDatabase, MigrationFailure, MigrationFailureState};
 
@@ -170,11 +171,15 @@ impl MigrationRunner {
     /// Lists applied schema versions without mutating the database.
     ///
     /// # Errors
-    /// Returns a Turso error when schema tracking cannot be read.
+    /// Returns a database error when schema tracking cannot be read.
     pub async fn status(&self, database: &ErabiDatabase) -> Result<Vec<SchemaVersion>, DbError> {
-        let connection = database.connection().await?;
-        connection.execute_batch(BOOTSTRAP_SQL).await?;
-        read_schema_versions(&connection).await
+        database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                connection.execute_batch(BOOTSTRAP_SQL)?;
+                read_schema_versions(&connection)
+            })
+            .await
     }
 
     /// Verifies that recorded migrations exactly match this bundled chain
@@ -185,8 +190,13 @@ impl MigrationRunner {
     /// unknown, reordered, renamed, or checksum-incompatible.
     pub async fn verify(&self, database: &ErabiDatabase) -> Result<(), DbError> {
         self.validate_plan()?;
-        let connection = database.connection().await?;
-        let applied = read_schema_versions(&connection).await?;
+        let closure_runner = self.clone();
+        let applied = database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                closure_runner.read_schema_versions_and_validate(&connection)
+            })
+            .await?;
         self.validate_applied_versions(&applied)?;
         if applied.len() != self.migrations.len() {
             return Err(migration_failure(
@@ -195,6 +205,31 @@ impl MigrationRunner {
                 "recorded migrations do not cover the complete bundled schema chain",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn verify_with_connection(
+        &self,
+        connection: &Connection<'_>,
+    ) -> Result<(), DbError> {
+        self.validate_plan()?;
+        let applied = self.read_schema_versions_and_validate(connection)?;
+        self.validate_applied_versions(&applied)?;
+        if applied.len() != self.migrations.len() {
+            return Err(migration_failure(
+                None,
+                MigrationFailureState::UnsupportedSchema,
+                "recorded migrations do not cover the complete bundled schema chain",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_schema_versions_and_validate(
+        &self,
+        connection: &Connection<'_>,
+    ) -> Result<Vec<SchemaVersion>, DbError> {
+        let applied = read_schema_versions(connection)?;
         for (migration, recorded) in self.migrations.iter().zip(&applied) {
             if recorded.version != migration.version || recorded.name != migration.name {
                 return Err(migration_failure(
@@ -211,7 +246,7 @@ impl MigrationRunner {
                 ));
             }
         }
-        Ok(())
+        Ok(applied)
     }
 
     async fn apply_until(
@@ -220,29 +255,30 @@ impl MigrationRunner {
         last_version: Option<&str>,
     ) -> Result<MigrationReport, DbError> {
         self.validate_plan()?;
-        let mut connection = database.connection().await?;
-        connection.execute_batch(BOOTSTRAP_SQL).await?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
+        let runner = self.clone();
+        let last_version = last_version.map(str::to_owned);
+        database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                connection.execute_batch(BOOTSTRAP_SQL)?;
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = self.apply_in_transaction(&transaction, last_version).await;
-        match result {
-            Ok(report) => transaction
-                .commit()
-                .await
-                .map(|()| report)
-                .map_err(DbError::from),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+                let result = runner.apply_in_transaction(&transaction, last_version.as_deref());
+                match result {
+                    Ok(report) => transaction.commit().map(|()| report).map_err(DbError::from),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
+            .await
     }
 
-    async fn apply_in_transaction(
+    fn apply_in_transaction(
         &self,
-        connection: &turso::Connection,
+        connection: &Transaction<'_>,
         last_version: Option<&str>,
     ) -> Result<MigrationReport, DbError> {
         let lock_time = timestamp();
@@ -251,7 +287,6 @@ impl MigrationRunner {
                 "INSERT INTO migration_lock (lock_key, owner, acquired_at) VALUES (?1, ?2, ?3)",
                 ("schema", "erabi-migrator", lock_time.as_str()),
             )
-            .await
             .map_err(|error| {
                 migration_failure(
                     None,
@@ -260,7 +295,7 @@ impl MigrationRunner {
                 )
             })?;
 
-        let applied = read_schema_versions(connection).await?;
+        let applied = read_schema_versions_transaction(connection)?;
         self.validate_applied_versions(&applied)?;
         let applied = applied
             .into_iter()
@@ -287,7 +322,7 @@ impl MigrationRunner {
                 continue;
             }
 
-            if let Err(error) = execute_script(connection, &migration.sql).await {
+            if let Err(error) = execute_script(connection, &migration.sql) {
                 return Err(migration_failure(
                     Some(&migration.version),
                     MigrationFailureState::Apply,
@@ -305,13 +340,11 @@ impl MigrationRunner {
                         applied_at.as_str(),
                     ),
                 )
-                .await?;
+                ?;
             report.applied.push(migration.version.clone());
         }
 
-        connection
-            .execute("DELETE FROM migration_lock WHERE lock_key = ?1", ["schema"])
-            .await?;
+        connection.execute("DELETE FROM migration_lock WHERE lock_key = ?1", ["schema"])?;
         Ok(report)
     }
 
@@ -362,17 +395,27 @@ impl MigrationRunner {
     }
 }
 
-async fn read_schema_versions(
-    connection: &turso::Connection,
+fn read_schema_versions(connection: &Connection<'_>) -> Result<Vec<SchemaVersion>, DbError> {
+    let rows = connection.query(
+        "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version",
+        (),
+    )?;
+    read_schema_versions_rows(rows)
+}
+
+fn read_schema_versions_transaction(
+    connection: &Transaction<'_>,
 ) -> Result<Vec<SchemaVersion>, DbError> {
-    let mut rows = connection
-        .query(
-            "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version",
-            (),
-        )
-        .await?;
+    let rows = connection.query(
+        "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version",
+        (),
+    )?;
+    read_schema_versions_rows(rows)
+}
+
+fn read_schema_versions_rows(mut rows: SqliteRows) -> Result<Vec<SchemaVersion>, DbError> {
     let mut versions = Vec::new();
-    while let Some(row) = rows.next().await? {
+    while let Some(row) = rows.next()? {
         versions.push(SchemaVersion {
             version: row.get(0)?,
             name: row.get(1)?,
@@ -383,8 +426,8 @@ async fn read_schema_versions(
     Ok(versions)
 }
 
-async fn execute_script(connection: &turso::Connection, script: &str) -> Result<(), turso::Error> {
-    connection.execute_batch(script).await
+fn execute_script(connection: &Transaction<'_>, script: &str) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(script)
 }
 
 fn migration_checksum(migration: &Migration) -> Result<String, DbError> {
@@ -423,8 +466,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let database = ErabiDatabase::in_memory().await?;
         MigrationRunner::default().apply(&database).await?;
-        let connection = database.connection().await?;
-
+        database.call(|raw| {
+        let connection = crate::SqliteConnection::new(raw);
         for (object_type, object_name) in [
             ("table", "job_checkpoints"),
             ("table", "job_progress_events"),
@@ -441,10 +484,9 @@ mod tests {
                 .query(
                     "SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2",
                     (object_type, object_name),
-                )
-                .await?;
+                )?;
             assert!(
-                rows.next().await?.is_some(),
+                rows.next()?.is_some(),
                 "missing {object_type} {object_name}"
             );
         }
@@ -460,21 +502,21 @@ mod tests {
                 VALUES ('event-1', 'job-1', NULL, 1, 'STATUS', '{}', 0);
                 ",
             )
-            .await?;
+            ?;
         assert!(
             connection
                 .execute_batch(
                     "UPDATE job_checkpoints SET checkpoint_json = '{}' WHERE id = 'checkpoint-1'"
                 )
-                .await
                 .is_err()
         );
         assert!(
             connection
                 .execute_batch("DELETE FROM job_progress_events WHERE id = 'event-1'")
-                .await
                 .is_err()
         );
+        Ok::<(), DbError>(())
+        }).await?;
         Ok(())
     }
 }

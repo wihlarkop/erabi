@@ -1,8 +1,8 @@
 use erabi_domain::{CrawlRunId, SourceId};
 
-use crate::{DbError, ErabiDatabase, StoredArtifact};
+use crate::{DbError, ErabiDatabase, SqliteValue, StoredArtifact};
 
-/// Metadata persistence for filesystem artifacts; artifact bytes never enter Turso.
+/// Metadata persistence for filesystem artifacts; artifact bytes never enter SQLite.
 #[derive(Clone, Copy, Debug)]
 pub struct ArtifactRepository<'database> {
     database: &'database ErabiDatabase,
@@ -29,26 +29,33 @@ impl<'database> ArtifactRepository<'database> {
     ) -> Result<(), DbError> {
         let metadata = serde_json::to_string(metadata)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let connection = self.database.connection().await?;
-        connection
-            .execute(
+        let artifact = artifact.clone();
+        let media_type = media_type.map(str::to_owned);
+        let created_at = created_at.to_owned();
+        let byte_size = i64::try_from(artifact.byte_size).map_err(|_| {
+            DbError::Invariant("artifact byte size exceeds SQLite INTEGER range".into())
+        })?;
+        self.database
+            .call(move |raw| -> Result<(), DbError> {
+                let connection = crate::SqliteConnection::new(raw);
+                connection.execute(
                 "INSERT INTO artifacts (id, crawl_run_id, source_id, content_hash, byte_size, media_type, safe_relative_path, created_at, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 (
                     artifact.id.to_string(),
-                    crawl_run_id.map_or(turso::Value::Null, |id| turso::Value::Text(id.to_string())),
-                    source_id.map_or(turso::Value::Null, |id| turso::Value::Text(id.to_string())),
+                    crawl_run_id.map_or(SqliteValue::Null, |id| SqliteValue::Text(id.to_string())),
+                    source_id.map_or(SqliteValue::Null, |id| SqliteValue::Text(id.to_string())),
                     artifact.content_hash.as_str(),
-                    i64::try_from(artifact.byte_size).map_err(|_| {
-                        DbError::Invariant("artifact byte size exceeds Turso INTEGER range".into())
-                    })?,
-                    media_type.map_or(turso::Value::Null, |value| turso::Value::Text(value.to_owned())),
+                    byte_size,
+                    media_type.map_or(SqliteValue::Null, SqliteValue::Text),
                     artifact.safe_relative_path.to_string_lossy().into_owned(),
                     created_at,
                     metadata,
                 ),
-            )
-            .await?;
-        Ok(())
+                )
+                .map(|_| ())
+                .map_err(DbError::from)
+            })
+            .await
     }
 
     /// Reads the safe relative path recorded for an artifact.
@@ -59,12 +66,14 @@ impl<'database> ArtifactRepository<'database> {
         &self,
         id: erabi_domain::ArtifactId,
     ) -> Result<String, DbError> {
-        let connection = self.database.connection().await?;
-        let row = connection
-            .prepare("SELECT safe_relative_path FROM artifacts WHERE id = ?1")
-            .await?
-            .query_row([id.to_string()])
-            .await?;
-        Ok(row.get(0)?)
+        self.database
+            .call(move |raw| -> Result<String, DbError> {
+                let connection = crate::SqliteConnection::new(raw);
+                let mut statement =
+                    connection.prepare("SELECT safe_relative_path FROM artifacts WHERE id = ?1")?;
+                let row = statement.query_row([id.to_string()])?;
+                Ok(row.get(0)?)
+            })
+            .await
     }
 }

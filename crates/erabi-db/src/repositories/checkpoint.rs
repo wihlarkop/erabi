@@ -1,10 +1,8 @@
 //! Bounded, append-only checkpoint evidence for cooperative job recovery.
 
+use crate::{SqliteConnection as Connection, SqliteRow as Row};
+use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
-use turso::{
-    Connection,
-    transaction::{Transaction, TransactionBehavior},
-};
 use uuid::Uuid;
 
 use super::job::{JobId, JobLease};
@@ -225,12 +223,20 @@ pub enum CheckpointRepositoryError {
 }
 
 impl CheckpointRepositoryError {
-    fn database(error: turso::Error) -> Self {
+    fn database(error: rusqlite::Error) -> Self {
         Self::Database(DbError::from(error))
     }
+}
 
-    fn from_db(error: DbError) -> Self {
+impl From<DbError> for CheckpointRepositoryError {
+    fn from(error: DbError) -> Self {
         Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for CheckpointRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
     }
 }
 
@@ -263,35 +269,36 @@ impl<'database> CheckpointRepository<'database> {
         if attempt_id.is_empty() || attempt_id.len() > MAX_ATTEMPT_ID_BYTES {
             return Err(CheckpointRepositoryError::InvalidEnvelope);
         }
-        let mut connection = self
-            .database
-            .connection()
+        let job_id = job_id.clone();
+        let attempt_id = attempt_id.to_owned();
+        let lease = lease.clone();
+        let checkpoint = checkpoint.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(CheckpointRepositoryError::database)?;
+                let result = append_in_transaction(
+                    &transaction,
+                    &job_id,
+                    &attempt_id,
+                    &lease,
+                    &checkpoint,
+                    created_at,
+                );
+                match result {
+                    Ok(record) => transaction
+                        .commit()
+                        .map(|()| record)
+                        .map_err(CheckpointRepositoryError::database),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
             .await
-            .map_err(CheckpointRepositoryError::from_db)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(CheckpointRepositoryError::database)?;
-        let result = append_in_transaction(
-            &transaction,
-            job_id,
-            attempt_id,
-            lease,
-            checkpoint,
-            created_at,
-        )
-        .await;
-        match result {
-            Ok(record) => transaction
-                .commit()
-                .await
-                .map(|()| record)
-                .map_err(CheckpointRepositoryError::database),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
     }
 
     /// Returns all append-only checkpoint evidence in trusted-time order.
@@ -303,12 +310,13 @@ impl<'database> CheckpointRepository<'database> {
         &self,
         job_id: &JobId,
     ) -> Result<Vec<CheckpointRecord>, CheckpointRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        let job_id = job_id.clone();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                records_from_connection(&connection, &job_id)
+            })
             .await
-            .map_err(CheckpointRepositoryError::from_db)?;
-        records_from_connection(&connection, job_id).await
     }
 
     /// Returns the latest checkpoint, if any, without hiding malformed or
@@ -320,12 +328,13 @@ impl<'database> CheckpointRepository<'database> {
         &self,
         job_id: &JobId,
     ) -> Result<Option<CheckpointRecord>, CheckpointRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        let job_id = job_id.clone();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                Ok(records_from_connection(&connection, &job_id)?.pop())
+            })
             .await
-            .map_err(CheckpointRepositoryError::from_db)?;
-        Ok(records_from_connection(&connection, job_id).await?.pop())
     }
 }
 
@@ -333,8 +342,8 @@ impl<'database> CheckpointRepository<'database> {
 /// transaction. Callers may use this boundary to couple the checkpoint with
 /// other durable work; ownership is still verified against the active attempt
 /// and lease before inserting anything.
-pub(crate) async fn append_in_transaction(
-    transaction: &Transaction<'_>,
+pub(crate) fn append_in_transaction(
+    transaction: &impl crate::SqliteExecutor,
     job_id: &JobId,
     attempt_id: &str,
     lease: &JobLease,
@@ -344,9 +353,9 @@ pub(crate) async fn append_in_transaction(
     if attempt_id.is_empty() || attempt_id.len() > MAX_ATTEMPT_ID_BYTES {
         return Err(CheckpointRepositoryError::InvalidEnvelope);
     }
-    ensure_owned_attempt(transaction, job_id, attempt_id, lease, created_at).await?;
+    ensure_owned_attempt(transaction, job_id, attempt_id, lease, created_at)?;
     let mut stored_checkpoint = checkpoint.clone();
-    stored_checkpoint.sequence = next_checkpoint_sequence(transaction, job_id).await?;
+    stored_checkpoint.sequence = next_checkpoint_sequence(transaction, job_id)?;
     let encoded = stored_checkpoint.encode()?;
     let id = Uuid::now_v7().to_string();
     transaction
@@ -354,7 +363,6 @@ pub(crate) async fn append_in_transaction(
             "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             (id.as_str(), job_id.as_str(), attempt_id, encoded.as_str(), created_at),
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
     Ok(CheckpointRecord {
         id,
@@ -365,8 +373,8 @@ pub(crate) async fn append_in_transaction(
     })
 }
 
-async fn ensure_owned_attempt(
-    connection: &Transaction<'_>,
+fn ensure_owned_attempt(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     attempt_id: &str,
     lease: &JobLease,
@@ -377,11 +385,9 @@ async fn ensure_owned_attempt(
             "SELECT state, lease_id, lease_owner, lease_generation, lease_expires_at FROM jobs WHERE id = ?1",
             [job_id.as_str()],
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
     let row = rows
         .next()
-        .await
         .map_err(CheckpointRepositoryError::database)?
         .ok_or(CheckpointRepositoryError::NotFound)?;
     let state: String = row.get(0).map_err(CheckpointRepositoryError::database)?;
@@ -408,11 +414,9 @@ async fn ensure_owned_attempt(
                 lease.owner.as_str(),
             ),
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
     if attempts
         .next()
-        .await
         .map_err(CheckpointRepositoryError::database)?
         .is_none()
     {
@@ -421,12 +425,12 @@ async fn ensure_owned_attempt(
     Ok(())
 }
 
-pub(super) async fn assess_one_stale_job(
-    connection: &Connection,
+pub(super) fn assess_one_stale_job(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     run_id: Option<&str>,
 ) -> Result<CheckpointEnvelopeDisposition, CheckpointRepositoryError> {
-    let records = match records_from_connection(connection, job_id).await {
+    let records = match records_from_connection(connection, job_id) {
         Ok(records) => records,
         Err(
             CheckpointRepositoryError::UnsupportedFormatVersion
@@ -442,7 +446,7 @@ pub(super) async fn assess_one_stale_job(
     let Some(attempt_id) = latest.attempt_id.as_deref() else {
         return Ok(CheckpointEnvelopeDisposition::Invalid);
     };
-    if !active_checkpoint_lineage_is_valid(connection, job_id, attempt_id).await? {
+    if !active_checkpoint_lineage_is_valid(connection, job_id, attempt_id)? {
         return Ok(CheckpointEnvelopeDisposition::Invalid);
     }
     let Some(run_id) = run_id else {
@@ -453,13 +457,8 @@ pub(super) async fn assess_one_stale_job(
             "SELECT snapshot_hash, checkpoint_compatibility_hash FROM crawl_runs WHERE id = ?1",
             [run_id],
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(CheckpointRepositoryError::database)?
-    else {
+    let Some(row) = rows.next().map_err(CheckpointRepositoryError::database)? else {
         return Ok(CheckpointEnvelopeDisposition::Invalid);
     };
     let snapshot_hash: String = row.get(0).map_err(CheckpointRepositoryError::database)?;
@@ -474,8 +473,8 @@ pub(super) async fn assess_one_stale_job(
     })
 }
 
-async fn active_checkpoint_lineage_is_valid(
-    connection: &Connection,
+fn active_checkpoint_lineage_is_valid(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
     attempt_id: &str,
 ) -> Result<bool, CheckpointRepositoryError> {
@@ -484,17 +483,15 @@ async fn active_checkpoint_lineage_is_valid(
             "SELECT 1 FROM jobs AS job JOIN job_attempts AS attempt ON attempt.id = ?1 WHERE job.id = ?2 AND job.state = 'RUNNING' AND attempt.job_id = job.id AND attempt.attempt_number = job.current_attempt AND attempt.outcome = 'RUNNING' AND attempt.lease_id = job.lease_id AND attempt.lease_generation = job.lease_generation AND attempt.worker_id = job.lease_owner LIMIT 1",
             (attempt_id, job_id.as_str()),
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
     Ok(rows
         .next()
-        .await
         .map_err(CheckpointRepositoryError::database)?
         .is_some())
 }
 
-async fn records_from_connection(
-    connection: &Connection,
+fn records_from_connection(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<Vec<CheckpointRecord>, CheckpointRepositoryError> {
     let mut rows = connection
@@ -502,15 +499,10 @@ async fn records_from_connection(
             "SELECT checkpoint.id, checkpoint.job_id, checkpoint.attempt_id, checkpoint.checkpoint_json, checkpoint.created_at, length(checkpoint.checkpoint_json), attempt.job_id FROM job_checkpoints AS checkpoint LEFT JOIN job_attempts AS attempt ON attempt.id = checkpoint.attempt_id WHERE checkpoint.job_id = ?1",
             [job_id.as_str()],
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
     let mut records = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CheckpointRepositoryError::database)?
-    {
-        records.push(record_from_row(&row)?);
+    while let Some(row) = rows.next().map_err(CheckpointRepositoryError::database)? {
+        records.push(record_from_row(row)?);
     }
     records.sort_by(|left, right| {
         left.checkpoint
@@ -526,8 +518,8 @@ async fn records_from_connection(
     Ok(records)
 }
 
-async fn next_checkpoint_sequence(
-    connection: &Transaction<'_>,
+fn next_checkpoint_sequence(
+    connection: &impl crate::SqliteExecutor,
     job_id: &JobId,
 ) -> Result<u64, CheckpointRepositoryError> {
     let mut rows = connection
@@ -535,14 +527,9 @@ async fn next_checkpoint_sequence(
             "SELECT checkpoint_json FROM job_checkpoints WHERE job_id = ?1",
             [job_id.as_str()],
         )
-        .await
         .map_err(CheckpointRepositoryError::database)?;
     let mut maximum = None;
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(CheckpointRepositoryError::database)?
-    {
+    while let Some(row) = rows.next().map_err(CheckpointRepositoryError::database)? {
         let encoded: String = row.get(0).map_err(CheckpointRepositoryError::database)?;
         let checkpoint = CheckpointEnvelope::decode(&encoded, encoded.len())?;
         maximum = Some(maximum.map_or(checkpoint.sequence, |value: u64| {
@@ -556,7 +543,7 @@ async fn next_checkpoint_sequence(
     })
 }
 
-fn record_from_row(row: &turso::Row) -> Result<CheckpointRecord, CheckpointRepositoryError> {
+fn record_from_row(row: &Row) -> Result<CheckpointRecord, CheckpointRepositoryError> {
     let job_id: String = row.get(1).map_err(CheckpointRepositoryError::database)?;
     let attempt_id: Option<String> = row.get(2).map_err(CheckpointRepositoryError::database)?;
     let attempt_job_id: Option<String> = row.get(6).map_err(CheckpointRepositoryError::database)?;
@@ -603,6 +590,32 @@ mod tests {
         let database = ErabiDatabase::in_memory().await?;
         MigrationRunner::default().apply(&database).await?;
         Ok(database)
+    }
+
+    async fn assess(
+        database: &ErabiDatabase,
+        job_id: &JobId,
+        run_id: Option<&str>,
+    ) -> Result<CheckpointEnvelopeDisposition, CheckpointRepositoryError> {
+        let job_id = job_id.clone();
+        let run_id = run_id.map(str::to_owned);
+        database
+            .call(move |raw| {
+                let connection = crate::SqliteConnection::new(raw);
+                assess_one_stale_job(&connection, &job_id, run_id.as_deref())
+            })
+            .await
+    }
+
+    async fn execute_sql<F>(
+        database: &ErabiDatabase,
+        operation: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<(), rusqlite::Error> + Send + 'static,
+    {
+        crate::test_call(database, operation).await?;
+        Ok(())
     }
 
     fn job(max_attempts: u32) -> Result<NewJob, Box<dyn std::error::Error>> {
@@ -826,13 +839,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let jobs = JobRepository::new(&database);
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "INSERT INTO crawl_runs (id, run_type, status, crawler_id, crawler_version_id, snapshot_json, snapshot_hash, checkpoint_compatibility_hash, actor, created_at) VALUES (?1, 'QUICK_SCRAPE', 'RUNNING', NULL, NULL, '{}', ?2, ?3, 'operator', '2026-08-25T00:00:00Z')",
                 ("run-1", "a".repeat(64), "b".repeat(64)),
             )
-            .await?;
+            .map(|_| ())
+        }).await?;
         let mut job = job(2)?;
         job.crawl_run_id = Some("run-1".to_owned());
         jobs.enqueue(&job, 0).await?;
@@ -850,7 +863,7 @@ mod tests {
         )
         .await?;
 
-        let disposition = assess_one_stale_job(&connection, &job.id, Some("run-1")).await?;
+        let disposition = assess(&database, &job.id, Some("run-1")).await?;
         assert_eq!(disposition, CheckpointEnvelopeDisposition::ResumeCandidate);
         let recovery = jobs.recover_stale_jobs(5).await?;
         assert_eq!(recovery.resume_candidates, 1);
@@ -867,13 +880,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database().await?;
         let jobs = JobRepository::new(&database);
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "INSERT INTO crawl_runs (id, run_type, status, crawler_id, crawler_version_id, snapshot_json, snapshot_hash, checkpoint_compatibility_hash, actor, created_at) VALUES (?1, 'QUICK_SCRAPE', 'RUNNING', NULL, NULL, '{}', ?2, ?3, 'operator', '2026-08-25T00:00:00Z')",
                 ("run-mismatch", "a".repeat(64), "c".repeat(64)),
             )
-            .await?;
+            .map(|_| ())
+        }).await?;
         let mut job = job(2)?;
         job.crawl_run_id = Some("run-mismatch".to_owned());
         jobs.enqueue(&job, 0).await?;
@@ -890,7 +903,7 @@ mod tests {
             1,
         )
         .await?;
-        let disposition = assess_one_stale_job(&connection, &job.id, Some("run-mismatch")).await?;
+        let disposition = assess(&database, &job.id, Some("run-mismatch")).await?;
         assert_eq!(disposition, CheckpointEnvelopeDisposition::RestartRequired);
         Ok(())
     }
@@ -923,13 +936,12 @@ mod tests {
             .ok_or("missing-checkpoint job was not acquired")?;
         assert_eq!(second.job.id, without_checkpoint.id);
 
-        let connection = database.connection().await?;
         assert_eq!(
-            assess_one_stale_job(&connection, &with_checkpoint.id, None).await?,
+            assess(&database, &with_checkpoint.id, None).await?,
             CheckpointEnvelopeDisposition::RestartRequired
         );
         assert_eq!(
-            assess_one_stale_job(&connection, &without_checkpoint.id, None).await?,
+            assess(&database, &without_checkpoint.id, None).await?,
             CheckpointEnvelopeDisposition::RestartRequired
         );
         Ok(())
@@ -971,43 +983,43 @@ mod tests {
             .acquire_next("checkpoint-worker", 1, 4)
             .await?
             .ok_or("null-attempt checkpoint job was not acquired")?;
-        let connection = database.connection().await?;
         let encoded = checkpoint("corrupt-lineage")?.encode()?;
-        connection
-            .execute(
+        let first_job_id = first.job.id.to_string();
+        let second_attempt_id = second.attempt.id.clone();
+        let prior_job_id = prior_attempt.id.to_string();
+        let prior_attempt_id = prior_first.attempt.id.clone();
+        let second_job_id = second.job.id.to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 (
                     Uuid::now_v7().to_string(),
-                    first.job.id.as_str(),
-                    second.attempt.id.as_str(),
+                    first_job_id.as_str(),
+                    second_attempt_id.as_str(),
                     encoded.as_str(),
                     1,
                 ),
-            )
-            .await?;
-        connection
-            .execute(
+            ).map(|_| ())?;
+            connection.execute(
                 "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 (
                     Uuid::now_v7().to_string(),
-                    prior_attempt.id.as_str(),
-                    prior_first.attempt.id.as_str(),
+                    prior_job_id.as_str(),
+                    prior_attempt_id.as_str(),
                     encoded.as_str(),
                     1,
                 ),
-            )
-            .await?;
-        connection
-            .execute(
+            ).map(|_| ())?;
+            connection.execute(
                 "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, NULL, ?3, ?4)",
                 (
                     Uuid::now_v7().to_string(),
-                    second.job.id.as_str(),
+                    second_job_id.as_str(),
                     encoded.as_str(),
                     1,
                 ),
-            )
-            .await?;
+            ).map(|_| ())
+        }).await?;
 
         assert!(matches!(
             CheckpointRepository::new(&database)
@@ -1038,7 +1050,6 @@ mod tests {
             .acquire_next("checkpoint-worker", 0, 5)
             .await?
             .ok_or("job was not acquired")?;
-        let connection = database.connection().await?;
         let historical = r#"{
             "schema_version": 1,
             "sequence": 1,
@@ -1053,25 +1064,27 @@ mod tests {
             "artifact_references": [],
             "extraction": {"phase": "NOT_STARTED"}
         }"#;
-        connection
-            .execute(
+        let job_id = job.id.to_string();
+        let attempt_id = acquired.attempt.id.clone();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 (
                     Uuid::now_v7().to_string(),
-                    job.id.as_str(),
-                    acquired.attempt.id.as_str(),
+                    job_id.as_str(),
+                    attempt_id.as_str(),
                     historical,
                     1,
                 ),
-            )
-            .await?;
+            ).map(|_| ())
+        }).await?;
 
         assert!(matches!(
             CheckpointRepository::new(&database).latest(&job.id).await,
             Err(CheckpointRepositoryError::UnsupportedFormatVersion)
         ));
         assert_eq!(
-            assess_one_stale_job(&connection, &job.id, None).await?,
+            assess(&database, &job.id, None).await?,
             CheckpointEnvelopeDisposition::Invalid
         );
         Ok(())
@@ -1088,19 +1101,20 @@ mod tests {
             .acquire_next("checkpoint-worker", 0, 5)
             .await?
             .ok_or("job was not acquired")?;
-        let connection = database.connection().await?;
-        connection
-            .execute(
+        let job_id = job.id.to_string();
+        let attempt_id = acquired.attempt.id.clone();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "INSERT INTO job_checkpoints (id, job_id, attempt_id, checkpoint_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 (
                     Uuid::now_v7().to_string(),
-                    job.id.as_str(),
-                    acquired.attempt.id.as_str(),
+                    job_id.as_str(),
+                    attempt_id.as_str(),
                     "{malformed",
                     1,
                 ),
-            )
-            .await?;
+            ).map(|_| ())
+        }).await?;
 
         assert!(matches!(
             CheckpointRepository::new(&database).latest(&job.id).await,

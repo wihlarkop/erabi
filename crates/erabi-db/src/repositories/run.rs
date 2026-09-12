@@ -1,11 +1,9 @@
+use crate::{SqliteConnection as Connection, SqliteTransaction as Transaction, SqliteValue};
 use erabi_domain::{
     CrawlRunId, CrawlRunSnapshot, CrawlRunStatus, CrawlRunType, RunConfiguration, SourceId,
 };
+use rusqlite::TransactionBehavior;
 use serde_json::Value;
-use turso::{
-    Connection,
-    transaction::{Transaction, TransactionBehavior},
-};
 use uuid::Uuid;
 
 use crate::{DbError, ErabiDatabase};
@@ -18,6 +16,18 @@ pub enum CrawlRunRepositoryError {
     NotFound,
     #[error("durable Crawl Run operation failed")]
     Database(#[source] DbError),
+}
+
+impl From<DbError> for CrawlRunRepositoryError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for CrawlRunRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
 }
 
 /// Persistence operations for immutable Crawl Run snapshots.
@@ -59,20 +69,28 @@ impl<'database> CrawlRunRepository<'database> {
     ) -> Result<(), DbError> {
         let serialized = serde_json::to_string(snapshot)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let mut connection = self.database.connection().await?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-        let result =
-            insert_run_in_transaction(&transaction, id, status, snapshot, serialized.as_str())
-                .await;
-        match result {
-            Ok(()) => transaction.commit().await.map_err(DbError::from),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        let snapshot = snapshot.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let result = insert_run_in_transaction(
+                    &transaction,
+                    id,
+                    status,
+                    &snapshot,
+                    serialized.as_str(),
+                );
+                match result {
+                    Ok(()) => transaction.commit().map_err(DbError::from),
+                    Err(error) => {
+                        let _ = transaction.rollback();
+                        Err(error)
+                    }
+                }
+            })
+            .await
     }
 
     /// Loads the snapshot originally stored for a run.
@@ -96,25 +114,24 @@ impl<'database> CrawlRunRepository<'database> {
     /// Returns `NotFound` for an absent run or a typed corruption error for an
     /// unrecognized durable status.
     pub async fn status(&self, id: CrawlRunId) -> Result<CrawlRunStatus, CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut statement = connection
+                    .prepare("SELECT status FROM crawl_runs WHERE id = ?1")
+                    .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+                let row = statement
+                    .query_row([id.to_string()])
+                    .map_err(|error| match error {
+                        rusqlite::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
+                        other => CrawlRunRepositoryError::Database(DbError::from(other)),
+                    })?;
+                parse_run_status(
+                    &row.get::<String>(0)
+                        .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
+                )
+            })
             .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let row = connection
-            .prepare("SELECT status FROM crawl_runs WHERE id = ?1")
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .query_row([id.to_string()])
-            .await
-            .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
-                other => CrawlRunRepositoryError::Database(DbError::from(other)),
-            })?;
-        parse_run_status(
-            &row.get::<String>(0)
-                .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?,
-        )
     }
 
     /// Moves a run through the execution lifecycle without ever modifying its
@@ -129,12 +146,12 @@ impl<'database> CrawlRunRepository<'database> {
         id: CrawlRunId,
         status: CrawlRunStatus,
     ) -> Result<(), CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                transition_execution_status_in_transaction(&connection, id, status)
+            })
             .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        transition_execution_status_in_transaction(&connection, id, status).await
     }
 
     /// Reopens a terminal same-run recovery continuation. This boundary is
@@ -148,36 +165,29 @@ impl<'database> CrawlRunRepository<'database> {
         &self,
         id: CrawlRunId,
     ) -> Result<(), CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let changed = connection
-            .execute(
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let changed = connection.execute(
                 "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'FAILED', 'CANCELLED', 'PARTIAL_RESULT')",
                 [id.to_string()],
-            )
+                )?;
+                if changed == 1 {
+                    return Ok(());
+                }
+                let exists = connection
+                    .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])?
+                    .next()?
+                    .is_some();
+                Err(if exists {
+                    CrawlRunRepositoryError::Database(DbError::Invariant(
+                        "Crawl Run recovery transition is not legal".into(),
+                    ))
+                } else {
+                    CrawlRunRepositoryError::NotFound
+                })
+            })
             .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
-        if changed == 1 {
-            return Ok(());
-        }
-        let exists = connection
-            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .next()
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .is_some();
-        Err(if exists {
-            CrawlRunRepositoryError::Database(DbError::Invariant(
-                "Crawl Run recovery transition is not legal".into(),
-            ))
-        } else {
-            CrawlRunRepositoryError::NotFound
-        })
     }
 
     /// Reopens a terminal same-run restart action. Unlike ordinary recovery,
@@ -189,36 +199,29 @@ impl<'database> CrawlRunRepository<'database> {
         &self,
         id: CrawlRunId,
     ) -> Result<(), CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let changed = connection
-            .execute(
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let changed = connection.execute(
                 "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'PARTIAL_RESULT')",
                 [id.to_string()],
-            )
+                )?;
+                if changed == 1 {
+                    return Ok(());
+                }
+                let exists = connection
+                    .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])?
+                    .next()?
+                    .is_some();
+                Err(if exists {
+                    CrawlRunRepositoryError::Database(DbError::Invariant(
+                        "Crawl Run restart transition is not legal".into(),
+                    ))
+                } else {
+                    CrawlRunRepositoryError::NotFound
+                })
+            })
             .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
-        if changed == 1 {
-            return Ok(());
-        }
-        let exists = connection
-            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .next()
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .is_some();
-        Err(if exists {
-            CrawlRunRepositoryError::Database(DbError::Invariant(
-                "Crawl Run restart transition is not legal".into(),
-            ))
-        } else {
-            CrawlRunRepositoryError::NotFound
-        })
     }
 
     /// Loads a snapshot using a durable foreign-key value from another
@@ -231,23 +234,17 @@ impl<'database> CrawlRunRepository<'database> {
         &self,
         stored_id: &str,
     ) -> Result<CrawlRunSnapshot, CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let row = connection
-            .prepare(
+        let stored_id = stored_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut statement = connection.prepare(
                 "SELECT snapshot_json, snapshot_hash, checkpoint_compatibility_hash FROM crawl_runs WHERE id = ?1",
-            )
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .query_row([stored_id])
-            .await
-            .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
-                other => CrawlRunRepositoryError::Database(DbError::from(other)),
-            })?;
+                )?;
+                let row = statement.query_row([stored_id.as_str()]).map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
+                    other => CrawlRunRepositoryError::Database(DbError::from(other)),
+                })?;
         let snapshot_json: String = row
             .get(0)
             .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
@@ -273,7 +270,9 @@ impl<'database> CrawlRunRepository<'database> {
                     .into(),
             )));
         }
-        Ok(snapshot)
+                Ok(snapshot)
+            })
+            .await
     }
 
     /// Reads the durable creation audit payload for one Crawl Run.
@@ -288,20 +287,21 @@ impl<'database> CrawlRunRepository<'database> {
         &self,
         id: CrawlRunId,
     ) -> Result<serde_json::Value, DbError> {
-        let connection = self.database.connection().await?;
-        let row = connection
-            .prepare(
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut statement = connection.prepare(
                 "SELECT payload_json FROM audit_events WHERE id = ?1 AND event_type = 'CRAWL_RUN_CREATED'",
-            )
-            .await?
-            .query_row([format!("run:{id}")])
-            .await?;
-        let payload: String = row.get(0)?;
-        serde_json::from_str(&payload).map_err(|error| {
-            DbError::Invariant(format!(
-                "stored Crawl Run audit payload is invalid: {error}"
-            ))
-        })
+                )?;
+                let row = statement.query_row([format!("run:{id}")])?;
+                let payload: String = row.get(0)?;
+                serde_json::from_str(&payload).map_err(|error| {
+                    DbError::Invariant(format!(
+                        "stored Crawl Run audit payload is invalid: {error}"
+                    ))
+                })
+            })
+            .await
     }
 
     /// Reads the recorded timestamp for a Crawl Run's durable creation audit
@@ -314,25 +314,20 @@ impl<'database> CrawlRunRepository<'database> {
         &self,
         stored_id: &str,
     ) -> Result<String, CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let row = connection
-            .prepare(
+        let stored_id = stored_id.to_owned();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let mut statement = connection.prepare(
                 "SELECT occurred_at FROM audit_events WHERE id = ?1 AND event_type = 'CRAWL_RUN_CREATED'",
-            )
+                )?;
+                let row = statement.query_row([format!("run:{stored_id}")]).map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
+                    other => CrawlRunRepositoryError::Database(DbError::from(other)),
+                })?;
+                Ok(row.get(0)?)
+            })
             .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .query_row([format!("run:{stored_id}")])
-            .await
-            .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => CrawlRunRepositoryError::NotFound,
-                other => CrawlRunRepositoryError::Database(DbError::from(other)),
-            })?;
-        row.get(0)
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))
     }
 
     /// Persists one immutable discovery/provenance decision. The existing
@@ -347,26 +342,23 @@ impl<'database> CrawlRunRepository<'database> {
         record: &DiscoveredUrlRecord,
     ) -> Result<(), CrawlRunRepositoryError> {
         validate_discovered_url_record(record).map_err(CrawlRunRepositoryError::Database)?;
-        let connection = self
-            .database
-            .connection()
+        let record = record.clone();
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let run_exists = connection
+                    .query(
+                        "SELECT 1 FROM crawl_runs WHERE id = ?1",
+                        [record.crawl_run_id.to_string()],
+                    )?
+                    .next()?
+                    .is_some();
+                if !run_exists {
+                    return Err(CrawlRunRepositoryError::NotFound);
+                }
+                record_discovered_url_values(&connection, &record)
+            })
             .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let run_exists = connection
-            .query(
-                "SELECT 1 FROM crawl_runs WHERE id = ?1",
-                [record.crawl_run_id.to_string()],
-            )
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .next()
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .is_some();
-        if !run_exists {
-            return Err(CrawlRunRepositoryError::NotFound);
-        }
-        record_discovered_url_values(&connection, record).await
     }
 
     /// Reads durable discovery/provenance decisions in deterministic creation
@@ -381,35 +373,22 @@ impl<'database> CrawlRunRepository<'database> {
         &self,
         id: CrawlRunId,
     ) -> Result<Vec<DiscoveredUrlRecord>, CrawlRunRepositoryError> {
-        let connection = self
-            .database
-            .connection()
-            .await
-            .map_err(CrawlRunRepositoryError::Database)?;
-        let exists = connection
-            .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .next()
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-            .is_some();
-        if !exists {
-            return Err(CrawlRunRepositoryError::NotFound);
-        }
-        let mut rows = connection
-            .query(
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                let exists = connection
+                    .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])?
+                    .next()?
+                    .is_some();
+                if !exists {
+                    return Err(CrawlRunRepositoryError::NotFound);
+                }
+                let mut rows = connection.query(
                 "SELECT id, source_id, raw_href, original_url, canonical_url, status, discovered_at, detail_json FROM discovered_urls WHERE crawl_run_id = ?1 ORDER BY discovered_at COLLATE BINARY, id COLLATE BINARY",
                 [id.to_string()],
-            )
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
+                )?;
         let mut records = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
-        {
+        while let Some(row) = rows.next()? {
             let source_id = row
                 .get::<Option<String>>(1)
                 .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
@@ -457,7 +436,9 @@ impl<'database> CrawlRunRepository<'database> {
             validate_discovered_url_record(&record).map_err(CrawlRunRepositoryError::Database)?;
             records.push(record);
         }
-        Ok(records)
+                Ok(records)
+            })
+            .await
     }
 }
 
@@ -465,7 +446,7 @@ impl<'database> CrawlRunRepository<'database> {
 /// Task 9 uses this to make an admitted child and its logical work state
 /// visible together; no canonicalization or semantic classification happens
 /// here.
-pub(crate) async fn record_discovered_url_in_transaction(
+pub(crate) fn record_discovered_url_in_transaction(
     connection: &Transaction<'_>,
     record: &DiscoveredUrlRecord,
 ) -> Result<(), CrawlRunRepositoryError> {
@@ -475,11 +456,9 @@ pub(crate) async fn record_discovered_url_in_transaction(
             "SELECT crawl_run_id, source_id, raw_href, original_url, canonical_url, status, discovered_at, detail_json FROM discovered_urls WHERE id = ?1",
             [record.id.as_str()],
         )
-        .await
         .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
     if let Some(row) = rows
         .next()
-        .await
         .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
     {
         let persisted_run_id: String = row
@@ -531,10 +510,10 @@ pub(crate) async fn record_discovered_url_in_transaction(
             "discovered URL identity was replayed with conflicting immutable evidence".into(),
         )));
     }
-    record_discovered_url_values(connection, record).await
+    record_discovered_url_values(connection, record)
 }
 
-async fn record_discovered_url_values(
+fn record_discovered_url_values(
     connection: &impl DiscoveredUrlExecutor,
     record: &DiscoveredUrlRecord,
 ) -> Result<(), CrawlRunRepositoryError> {
@@ -547,8 +526,8 @@ async fn record_discovered_url_values(
             (
                 record.id.as_str(),
                 record.crawl_run_id.to_string(),
-                record.source_id.map_or(turso::Value::Null, |id| turso::Value::Text(id.to_string())),
-                record.raw_href.as_deref().map_or(turso::Value::Null, |value| turso::Value::Text(value.to_owned())),
+                record.source_id.map_or(SqliteValue::Null, |id| SqliteValue::Text(id.to_string())),
+                record.raw_href.as_deref().map_or(SqliteValue::Null, |value| SqliteValue::Text(value.to_owned())),
                 record.original_url.as_str(),
                 record.canonical_url.as_str(),
                 record.status.as_str(),
@@ -556,45 +535,43 @@ async fn record_discovered_url_values(
                 detail_json,
             ),
         )
-        .await
         .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
     Ok(())
 }
 
-#[allow(async_fn_in_trait)]
 trait DiscoveredUrlExecutor {
-    async fn execute_discovered_url<P: turso::IntoParams>(
+    fn execute_discovered_url<P: rusqlite::Params>(
         &self,
         sql: &str,
         params: P,
-    ) -> Result<u64, turso::Error>;
+    ) -> Result<usize, rusqlite::Error>;
 }
 
-impl DiscoveredUrlExecutor for Connection {
-    async fn execute_discovered_url<P: turso::IntoParams>(
+impl DiscoveredUrlExecutor for Connection<'_> {
+    fn execute_discovered_url<P: rusqlite::Params>(
         &self,
         sql: &str,
         params: P,
-    ) -> Result<u64, turso::Error> {
-        self.execute(sql, params).await
+    ) -> Result<usize, rusqlite::Error> {
+        self.execute(sql, params)
     }
 }
 
 impl DiscoveredUrlExecutor for Transaction<'_> {
-    async fn execute_discovered_url<P: turso::IntoParams>(
+    fn execute_discovered_url<P: rusqlite::Params>(
         &self,
         sql: &str,
         params: P,
-    ) -> Result<u64, turso::Error> {
-        self.execute(sql, params).await
+    ) -> Result<usize, rusqlite::Error> {
+        self.execute(sql, params)
     }
 }
 
 /// Applies the canonical worker-owned Crawl Run lifecycle transition on an
 /// existing transaction. Job queue failure synchronization uses this exact
 /// boundary so it cannot bypass the run repository's transition rules.
-pub(crate) async fn transition_execution_status_in_transaction(
-    connection: &Connection,
+pub(crate) fn transition_execution_status_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     id: CrawlRunId,
     status: CrawlRunStatus,
 ) -> Result<(), CrawlRunRepositoryError> {
@@ -604,25 +581,25 @@ pub(crate) async fn transition_execution_status_in_transaction(
                 "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING')",
                 [id.to_string()],
             )
-            .await,
+            ,
         CrawlRunStatus::Succeeded => connection
             .execute(
                 "UPDATE crawl_runs SET status = 'SUCCEEDED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED')",
                 [id.to_string()],
             )
-            .await,
+            ,
         CrawlRunStatus::PartialResult => connection
             .execute(
                 "UPDATE crawl_runs SET status = 'PARTIAL_RESULT' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'PARTIAL_RESULT')",
                 [id.to_string()],
             )
-            .await,
+            ,
         CrawlRunStatus::Failed => connection
             .execute(
                 "UPDATE crawl_runs SET status = 'FAILED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'FAILED')",
                 [id.to_string()],
             )
-            .await,
+            ,
         CrawlRunStatus::Queued | CrawlRunStatus::Cancelled => {
             return Err(CrawlRunRepositoryError::Database(DbError::Invariant(
                 "execution workers cannot directly set queued or cancelled run status".into(),
@@ -633,10 +610,8 @@ pub(crate) async fn transition_execution_status_in_transaction(
     if changed != 1 {
         let exists = connection
             .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
-            .await
             .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
             .next()
-            .await
             .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
             .is_some();
         return Err(if exists {
@@ -654,8 +629,8 @@ pub(crate) async fn transition_execution_status_in_transaction(
 /// Unlike the worker lifecycle helper above, this path is intentionally
 /// available to the cancellation/finalization boundary so a durable summary
 /// and `CANCELLED` status can commit together.
-pub(crate) async fn cancel_execution_status_in_transaction(
-    connection: &Connection,
+pub(crate) fn cancel_execution_status_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     id: CrawlRunId,
 ) -> Result<(), CrawlRunRepositoryError> {
     let changed = connection
@@ -663,15 +638,13 @@ pub(crate) async fn cancel_execution_status_in_transaction(
             "UPDATE crawl_runs SET status = 'CANCELLED' WHERE id = ?1 AND status IN ('QUEUED', 'RUNNING', 'CANCELLED')",
             [id.to_string()],
         )
-        .await
+
         .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?;
     if changed != 1 {
         let exists = connection
             .query("SELECT 1 FROM crawl_runs WHERE id = ?1", [id.to_string()])
-            .await
             .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
             .next()
-            .await
             .map_err(|error| CrawlRunRepositoryError::Database(DbError::from(error)))?
             .is_some();
         return Err(if exists {
@@ -724,8 +697,8 @@ fn validate_discovered_url_record(record: &DiscoveredUrlRecord) -> Result<(), Db
     Ok(())
 }
 
-pub(crate) async fn insert_run_in_transaction(
-    connection: &Connection,
+pub(crate) fn insert_run_in_transaction(
+    connection: &impl crate::SqliteExecutor,
     id: CrawlRunId,
     status: CrawlRunStatus,
     snapshot: &CrawlRunSnapshot,
@@ -737,10 +710,10 @@ pub(crate) async fn insert_run_in_transaction(
             crawler_version_id,
             ..
         } => (
-            turso::Value::Text(crawler_id.to_string()),
-            turso::Value::Text(crawler_version_id.to_string()),
+            SqliteValue::Text(crawler_id.to_string()),
+            SqliteValue::Text(crawler_version_id.to_string()),
         ),
-        RunConfiguration::QuickScrape { .. } => (turso::Value::Null, turso::Value::Null),
+        RunConfiguration::QuickScrape { .. } => (SqliteValue::Null, SqliteValue::Null),
     };
     let audit_payload = robots_audit_payload(snapshot)?;
     connection
@@ -759,7 +732,7 @@ pub(crate) async fn insert_run_in_transaction(
                 snapshot.created_at(),
             ),
         )
-        .await?;
+        ?;
     connection
         .execute(
             "INSERT INTO audit_events (id, event_type, actor, occurred_at, entity_type, entity_id, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -773,7 +746,7 @@ pub(crate) async fn insert_run_in_transaction(
                 audit_payload,
             ),
         )
-        .await?;
+        ?;
     Ok(())
 }
 
@@ -896,6 +869,17 @@ mod tests {
         })?)
     }
 
+    async fn execute_sql<T, F>(
+        database: &ErabiDatabase,
+        operation: F,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T, rusqlite::Error> + Send + 'static,
+    {
+        Ok(crate::test_call(database, operation).await?)
+    }
+
     #[tokio::test]
     async fn stored_snapshots_reject_json_and_projection_tampering()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -908,8 +892,7 @@ mod tests {
             .create(run_id, CrawlRunStatus::Queued, &snapshot)
             .await?;
 
-        let connection = database.connection().await?;
-        for assignment in [
+        let assignments = [
             "run_type = run_type",
             "crawler_id = crawler_id",
             "crawler_version_id = crawler_version_id",
@@ -918,33 +901,27 @@ mod tests {
             "checkpoint_compatibility_hash = checkpoint_compatibility_hash",
             "actor = actor",
             "created_at = created_at",
-        ] {
-            assert!(
-                connection
-                    .execute(
-                        format!("UPDATE crawl_runs SET {assignment} WHERE id = ?1"),
-                        [run_id.to_string()],
-                    )
-                    .await
-                    .is_err()
-            );
-        }
-        connection
-            .execute(
+        ];
+        let run_id_string = run_id.to_string();
+        execute_sql(&database, move |connection| {
+            for assignment in assignments {
+                let sql = format!("UPDATE crawl_runs SET {assignment} WHERE id = ?1");
+                if connection.execute(&sql, [run_id_string.as_str()]).is_ok() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            }
+            connection.execute(
                 "UPDATE crawl_runs SET status = 'RUNNING' WHERE id = ?1",
-                [run_id.to_string()],
-            )
-            .await?;
-
-        connection
-            .execute_batch("DROP TRIGGER crawl_runs_snapshot_immutable")
-            .await?;
-        connection
-            .execute(
+                [run_id_string.as_str()],
+            )?;
+            connection.execute_batch("DROP TRIGGER crawl_runs_snapshot_immutable")?;
+            connection.execute(
                 "UPDATE crawl_runs SET snapshot_hash = ?1 WHERE id = ?2",
-                ("0".repeat(64), run_id.to_string()),
-            )
-            .await?;
+                ("0".repeat(64), run_id_string),
+            )?;
+            Ok(())
+        })
+        .await?;
         assert!(matches!(
             repository.snapshot(run_id).await,
             Err(CrawlRunRepositoryError::Database(DbError::Invariant(_)))
@@ -959,15 +936,15 @@ mod tests {
             "decision": "OVERRIDE",
             "reason": " "
         });
-        connection
-            .execute(
+        let invalid_snapshot_json = serde_json::to_string(&invalid_snapshot)?;
+        let invalid_run_id_string = invalid_run_id.to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE crawl_runs SET snapshot_json = ?1 WHERE id = ?2",
-                (
-                    serde_json::to_string(&invalid_snapshot)?,
-                    invalid_run_id.to_string(),
-                ),
+                (invalid_snapshot_json, invalid_run_id_string),
             )
-            .await?;
+        })
+        .await?;
         assert!(matches!(
             repository.snapshot(invalid_run_id).await,
             Err(CrawlRunRepositoryError::Database(DbError::Invariant(_)))
@@ -977,12 +954,14 @@ mod tests {
         repository
             .create(checkpoint_run_id, CrawlRunStatus::Queued, &snapshot)
             .await?;
-        connection
-            .execute(
+        let checkpoint_run_id_string = checkpoint_run_id.to_string();
+        execute_sql(&database, move |connection| {
+            connection.execute(
                 "UPDATE crawl_runs SET checkpoint_compatibility_hash = ?1 WHERE id = ?2",
-                ("f".repeat(64), checkpoint_run_id.to_string()),
+                ("f".repeat(64), checkpoint_run_id_string),
             )
-            .await?;
+        })
+        .await?;
         assert!(matches!(
             repository.snapshot(checkpoint_run_id).await,
             Err(CrawlRunRepositoryError::Database(DbError::Invariant(_)))

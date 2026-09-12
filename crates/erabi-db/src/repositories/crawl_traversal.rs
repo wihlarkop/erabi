@@ -3,11 +3,11 @@
 //! This repository stores semantic decisions made by `SemanticTraversal`; it
 //! deliberately does not canonicalize URLs or select `PageType` transitions.
 
-use erabi_domain::CrawlRunId;
-use turso::{
-    Value, params_from_iter,
-    transaction::{Transaction, TransactionBehavior},
+use crate::{
+    SqliteConnection as Connection, SqliteTransaction as Transaction, SqliteValue as Value,
 };
+use erabi_domain::CrawlRunId;
+use rusqlite::{TransactionBehavior, params_from_iter};
 
 use crate::{DbError, ErabiDatabase};
 
@@ -213,6 +213,18 @@ pub enum CrawlTraversalRepositoryError {
     Discovery(#[source] CrawlRunRepositoryError),
 }
 
+impl From<DbError> for CrawlTraversalRepositoryError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for CrawlTraversalRepositoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(DbError::from(error))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CrawlTraversalRepository<'database> {
     database: &'database ErabiDatabase,
@@ -240,50 +252,54 @@ impl<'database> CrawlTraversalRepository<'database> {
         if control.crawl_run_id != run_id || roots.is_empty() {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            let initialized = tx
+        let roots = roots.to_vec();
+        let control = control.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    let initialized = tx
                 .prepare(
                     "SELECT EXISTS(SELECT 1 FROM crawl_traversal_control WHERE crawl_run_id = ?1)",
                 )
-                .await
+
                 .map_err(db)?
                 .query_row([run_id.to_string()])
-                .await
+
                 .map_err(db)?
                 .get::<i64>(0)
                 .map_err(db)?
                 == 1;
-            if initialized {
-                if read_control(&tx, run_id).await? != *control {
-                    return Err(CrawlTraversalRepositoryError::InvalidState);
-                }
-                for root in roots {
-                    let Some(persisted) =
-                        read_state_by_canonical(&tx, run_id, &root.canonical_url).await?
-                    else {
-                        return Err(CrawlTraversalRepositoryError::InvalidState);
-                    };
-                    if !initial_state_matches(&persisted, root) {
-                        return Err(CrawlTraversalRepositoryError::InvalidState);
+                    if initialized {
+                        if read_control(&tx, run_id)? != control {
+                            return Err(CrawlTraversalRepositoryError::InvalidState);
+                        }
+                        for root in &roots {
+                            let Some(persisted) =
+                                read_state_by_canonical(&tx, run_id, &root.canonical_url)?
+                            else {
+                                return Err(CrawlTraversalRepositoryError::InvalidState);
+                            };
+                            if !initial_state_matches(&persisted, root) {
+                                return Err(CrawlTraversalRepositoryError::InvalidState);
+                            }
+                        }
+                        return Ok(());
                     }
-                }
-                return Ok(());
-            }
-            insert_control(&tx, control).await?;
-            for root in roots {
-                validate_state_ownership(&tx, root, run_id).await?;
-                insert_state(&tx, root).await?;
-            }
-            Ok(())
-        }
-        .await;
-        finish(tx, result).await
+                    insert_control(&tx, &control)?;
+                    for root in &roots {
+                        validate_state_ownership(&tx, root, run_id)?;
+                        insert_state(&tx, root)?;
+                    }
+                    Ok(())
+                })();
+                finish(tx, result)
+            })
+            .await
     }
 
     /// Atomically installs first logical work, scalar control, and the compact
@@ -307,24 +323,38 @@ impl<'database> CrawlTraversalRepository<'database> {
         if control.crawl_run_id != run_id || roots.is_empty() {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let roots = roots.to_vec();
+        let control = control.clone();
+        let job_id = job_id.clone();
+        let attempt_id = attempt_id.to_owned();
+        let lease = lease.clone();
+        let checkpoint = checkpoint.clone();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    insert_control(&tx, &control)?;
+                    for root in &roots {
+                        validate_state_ownership(&tx, root, run_id)?;
+                        insert_state(&tx, root)?;
+                    }
+                    append_in_transaction(
+                        &tx,
+                        &job_id,
+                        &attempt_id,
+                        &lease,
+                        &checkpoint,
+                        created_at,
+                    )
+                    .map_err(CrawlTraversalRepositoryError::Checkpoint)
+                })();
+                finish(tx, result)
+            })
             .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            insert_control(&tx, control).await?;
-            for root in roots {
-                validate_state_ownership(&tx, root, run_id).await?;
-                insert_state(&tx, root).await?;
-            }
-            append_in_transaction(&tx, job_id, attempt_id, lease, checkpoint, created_at)
-                .await
-                .map_err(CrawlTraversalRepositoryError::Checkpoint)
-        }
-        .await;
-        finish(tx, result).await
     }
 
     /// Atomically initializes the logical work projection, exact discovery
@@ -355,70 +385,87 @@ impl<'database> CrawlTraversalRepository<'database> {
         {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            let initialized = tx
+        let roots = roots.to_vec();
+        let evidence = evidence.to_vec();
+        let control = control.clone();
+        let semantic_projection = semantic_projection.clone();
+        let job_id = job_id.clone();
+        let latest_job_id = job_id.clone();
+        let attempt_id = attempt_id.to_owned();
+        let lease = lease.clone();
+        let checkpoint = checkpoint.clone();
+        let checkpoint_record = self
+            .database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    let initialized = tx
                 .prepare(
                     "SELECT EXISTS(SELECT 1 FROM crawl_traversal_control WHERE crawl_run_id = ?1)",
                 )
-                .await
+
                 .map_err(db)?
                 .query_row([run_id.to_string()])
-                .await
+
                 .map_err(db)?
                 .get::<i64>(0)
                 .map_err(db)?
                 == 1;
-            if initialized {
-                let persisted_control = read_control(&tx, run_id).await?;
-                if persisted_control != *control {
-                    return Err(CrawlTraversalRepositoryError::InvalidState);
-                }
-                for record in evidence {
-                    record_discovered_url_in_transaction(&tx, record)
-                        .await
-                        .map_err(CrawlTraversalRepositoryError::Discovery)?;
-                }
-                for root in roots {
-                    let Some(persisted) =
-                        read_state_by_canonical(&tx, run_id, &root.canonical_url).await?
-                    else {
-                        return Err(CrawlTraversalRepositoryError::InvalidState);
-                    };
-                    if !initial_state_matches(&persisted, root) {
-                        return Err(CrawlTraversalRepositoryError::InvalidState);
+                    if initialized {
+                        let persisted_control = read_control(&tx, run_id)?;
+                        if persisted_control != control {
+                            return Err(CrawlTraversalRepositoryError::InvalidState);
+                        }
+                        for record in &evidence {
+                            record_discovered_url_in_transaction(&tx, record)
+                                .map_err(CrawlTraversalRepositoryError::Discovery)?;
+                        }
+                        for root in &roots {
+                            let Some(persisted) =
+                                read_state_by_canonical(&tx, run_id, &root.canonical_url)?
+                            else {
+                                return Err(CrawlTraversalRepositoryError::InvalidState);
+                            };
+                            if !initial_state_matches(&persisted, root) {
+                                return Err(CrawlTraversalRepositoryError::InvalidState);
+                            }
+                        }
+                        return Ok(None);
                     }
-                }
-                return Ok(None);
-            }
-            for record in evidence {
-                record_discovered_url_in_transaction(&tx, record)
-                    .await
-                    .map_err(CrawlTraversalRepositoryError::Discovery)?;
-            }
-            insert_control(&tx, control).await?;
-            for root in roots {
-                validate_state_ownership(&tx, root, run_id).await?;
-                insert_state(&tx, root).await?;
-            }
-            apply_semantic_projection(&tx, run_id, semantic_projection).await?;
-            append_in_transaction(&tx, job_id, attempt_id, lease, checkpoint, created_at)
-                .await
-                .map(Some)
-                .map_err(CrawlTraversalRepositoryError::Checkpoint)
-        }
-        .await;
-        let checkpoint_record = finish(tx, result).await?;
+                    for record in &evidence {
+                        record_discovered_url_in_transaction(&tx, record)
+                            .map_err(CrawlTraversalRepositoryError::Discovery)?;
+                    }
+                    insert_control(&tx, &control)?;
+                    for root in &roots {
+                        validate_state_ownership(&tx, root, run_id)?;
+                        insert_state(&tx, root)?;
+                    }
+                    apply_semantic_projection(&tx, run_id, &semantic_projection)?;
+                    append_in_transaction(
+                        &tx,
+                        &job_id,
+                        &attempt_id,
+                        &lease,
+                        &checkpoint,
+                        created_at,
+                    )
+                    .map(Some)
+                    .map_err(CrawlTraversalRepositoryError::Checkpoint)
+                })();
+                let checkpoint_record = finish(tx, result)?;
+                Ok::<Option<CheckpointRecord>, CrawlTraversalRepositoryError>(checkpoint_record)
+            })
+            .await?;
         if let Some(checkpoint_record) = checkpoint_record {
             return Ok(checkpoint_record);
         }
         CheckpointRepository::new(self.database)
-            .latest(job_id)
+            .latest(&latest_job_id)
             .await
             .map_err(CrawlTraversalRepositoryError::Checkpoint)?
             .ok_or(CrawlTraversalRepositoryError::InvalidState)
@@ -441,22 +488,27 @@ impl<'database> CrawlTraversalRepository<'database> {
         if control.crawl_run_id != run_id {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let new_or_merged_work = new_or_merged_work.to_vec();
+        let control = control.clone();
+        let transition_source_counts = transition_source_counts.to_vec();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    for state in &new_or_merged_work {
+                        validate_state_ownership(&tx, state, run_id)?;
+                        upsert_discovery_state(&tx, state)?;
+                    }
+                    update_control(&tx, &control)?;
+                    replace_transition_counts(&tx, run_id, &transition_source_counts)
+                })();
+                finish(tx, result)
+            })
             .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            for state in new_or_merged_work {
-                validate_state_ownership(&tx, state, run_id).await?;
-                upsert_discovery_state(&tx, state).await?;
-            }
-            update_control(&tx, control).await?;
-            replace_transition_counts(&tx, run_id, transition_source_counts).await
-        }
-        .await;
-        finish(tx, result).await
     }
 
     /// Atomically appends immutable discovery evidence and advances the
@@ -478,27 +530,32 @@ impl<'database> CrawlTraversalRepository<'database> {
         {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let evidence = evidence.to_vec();
+        let new_or_merged_work = new_or_merged_work.to_vec();
+        let control = control.clone();
+        let transition_source_counts = transition_source_counts.to_vec();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    for record in evidence {
+                        record_discovered_url_in_transaction(&tx, &record)
+                            .map_err(CrawlTraversalRepositoryError::Discovery)?;
+                    }
+                    for state in new_or_merged_work {
+                        validate_state_ownership(&tx, &state, run_id)?;
+                        upsert_discovery_state(&tx, &state)?;
+                    }
+                    update_control(&tx, &control)?;
+                    replace_transition_counts(&tx, run_id, &transition_source_counts)
+                })();
+                finish(tx, result)
+            })
             .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            for record in evidence {
-                record_discovered_url_in_transaction(&tx, record)
-                    .await
-                    .map_err(CrawlTraversalRepositoryError::Discovery)?;
-            }
-            for state in new_or_merged_work {
-                validate_state_ownership(&tx, state, run_id).await?;
-                upsert_discovery_state(&tx, state).await?;
-            }
-            update_control(&tx, control).await?;
-            replace_transition_counts(&tx, run_id, transition_source_counts).await
-        }
-        .await;
-        finish(tx, result).await
     }
 
     /// Applies evidence, logical work, semantic state, redirect resolution,
@@ -526,35 +583,43 @@ impl<'database> CrawlTraversalRepository<'database> {
         {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let evidence = evidence.to_vec();
+        let new_or_merged_work = new_or_merged_work.to_vec();
+        let control = control.clone();
+        let transition_source_counts = transition_source_counts.to_vec();
+        let semantic_projection = semantic_projection.clone();
+        let redirects = redirects.to_vec();
+        let in_flight_work = in_flight_work.to_vec();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    for record in evidence {
+                        record_discovered_url_in_transaction(&tx, &record)
+                            .map_err(CrawlTraversalRepositoryError::Discovery)?;
+                    }
+                    for state in &new_or_merged_work {
+                        validate_state_ownership(&tx, state, run_id)?;
+                        upsert_discovery_state(&tx, state)?;
+                    }
+                    // A redirect's final logical state may be newly admitted in this
+                    // same delta. Materialize that state before resolving the alias;
+                    // both mutations remain part of this transaction.
+                    for redirect in &redirects {
+                        reconcile_redirect(&tx, run_id, redirect)?;
+                    }
+                    apply_semantic_projection(&tx, run_id, &semantic_projection)?;
+                    mark_in_flight_work(&tx, run_id, &in_flight_work)?;
+                    update_control(&tx, &control)?;
+                    replace_transition_counts(&tx, run_id, &transition_source_counts)
+                })();
+                finish(tx, result)
+            })
             .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            for record in evidence {
-                record_discovered_url_in_transaction(&tx, record)
-                    .await
-                    .map_err(CrawlTraversalRepositoryError::Discovery)?;
-            }
-            for state in new_or_merged_work {
-                validate_state_ownership(&tx, state, run_id).await?;
-                upsert_discovery_state(&tx, state).await?;
-            }
-            // A redirect's final logical state may be newly admitted in this
-            // same delta. Materialize that state before resolving the alias;
-            // both mutations remain part of this transaction.
-            for redirect in redirects {
-                reconcile_redirect(&tx, run_id, redirect).await?;
-            }
-            apply_semantic_projection(&tx, run_id, semantic_projection).await?;
-            mark_in_flight_work(&tx, run_id, in_flight_work).await?;
-            update_control(&tx, control).await?;
-            replace_transition_counts(&tx, run_id, transition_source_counts).await
-        }
-        .await;
-        finish(tx, result).await
     }
 
     /// Replaces the compact per-source transition budget projection from the
@@ -569,17 +634,20 @@ impl<'database> CrawlTraversalRepository<'database> {
         run_id: CrawlRunId,
         counts: &[CrawlTransitionSourceCount],
     ) -> Result<(), CrawlTraversalRepositoryError> {
-        let mut connection = self.database.connection().await.map_err(db)?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let counts = counts.to_vec();
+        self.database
+            .call(move |raw| {
+                let mut connection = Connection::new(raw);
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(db)?;
+                let result = (|| {
+                    ensure_run(&tx, run_id)?;
+                    replace_transition_counts(&tx, run_id, &counts)
+                })();
+                finish(tx, result)
+            })
             .await
-            .map_err(db)?;
-        let result = async {
-            ensure_run(&tx, run_id).await?;
-            replace_transition_counts(&tx, run_id, counts).await
-        }
-        .await;
-        finish(tx, result).await
     }
 
     /// Returns the deterministic recovery model. Historical execution rows
@@ -593,14 +661,15 @@ impl<'database> CrawlTraversalRepository<'database> {
         &self,
         run_id: CrawlRunId,
     ) -> Result<ReconstructedTraversalState, CrawlTraversalRepositoryError> {
-        let connection = self.database.connection().await.map_err(db)?;
-        let control = read_control(&connection, run_id).await?;
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
+        let control = read_control(&connection, run_id)?;
         let mut rows = connection.query(
             "SELECT id, canonical_url, first_discovered_url_id, requested_url, parent_url_state_id, parent_discovered_url_id, admission_state, preserve_reason, resolved_to_url_state_id, admission_sequence, depth, target_page_type_id, transition_id, pagination, final_canonical_url, current_work_state, work_generation, current_execution_id, seen, sampled, expanded, in_scope, page_type_match_state FROM crawl_url_state WHERE crawl_run_id = ?1 ORDER BY depth ASC NULLS LAST, admission_sequence ASC NULLS LAST, canonical_url COLLATE BINARY ASC, requested_url COLLATE BINARY ASC",
             [run_id.to_string()],
-        ).await.map_err(db)?;
+        ).map_err(db)?;
         let mut work = Vec::new();
-        while let Some(row) = rows.next().await.map_err(db)? {
+        while let Some(row) = rows.next().map_err(db)? {
             let id: String = row.get(0).map_err(db)?;
             let state = CrawlUrlStateRecord {
                 id: id.clone(),
@@ -622,7 +691,7 @@ impl<'database> CrawlTraversalRepository<'database> {
                 current_work_state: optional_work_state(row.get(15).map_err(db)?)?,
                 work_generation: as_u64(row.get::<i64>(16).map_err(db)?)?,
                 current_execution_id: row.get(17).map_err(db)?,
-                seed_provenance: read_seed_provenance(&connection, &id).await?,
+                seed_provenance: read_seed_provenance(&connection, &id)?,
                 seen: row.get::<i64>(18).map_err(db)? == 1,
                 sampled: row.get::<i64>(19).map_err(db)? == 1,
                 expanded: row.get::<i64>(20).map_err(db)? == 1,
@@ -632,14 +701,15 @@ impl<'database> CrawlTraversalRepository<'database> {
             validate_state(&state)?;
             work.push(state);
         }
-        let transition_source_counts = read_transition_counts(&connection, run_id).await?;
-        let page_type_counts = read_page_type_counts(&connection, run_id).await?;
+        let transition_source_counts = read_transition_counts(&connection, run_id)?;
+        let page_type_counts = read_page_type_counts(&connection, run_id)?;
         Ok(ReconstructedTraversalState {
             control,
             work,
             transition_source_counts,
             page_type_counts,
         })
+        }).await
     }
 
     /// Prepares the executable selection for one recovery action. The action
@@ -663,22 +733,26 @@ impl<'database> CrawlTraversalRepository<'database> {
         if action_job_id.as_str().is_empty() || action_attempt_id.is_empty() || now < 0 {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        let mut connection = self.database.connection().await.map_err(db)?;
+        let action_job_id = action_job_id.clone();
+        let action_attempt_id = action_attempt_id.to_owned();
+        let run_id_string = run_id.to_string();
+        self.database.call(move |raw| {
+        let mut connection = Connection::new(raw);
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
+
             .map_err(db)?;
-        let result = async {
+        let result = (|| {
             let action = tx
                 .prepare(
                     "SELECT action_job.parent_job_id, action_job.crawl_run_id, action_job.kind, action_job.state, action_job.current_attempt, action_job.lease_id, action_job.lease_generation, action_job.lease_expires_at, attempt.outcome, attempt.attempt_number, attempt.lease_id, attempt.lease_generation FROM jobs AS action_job JOIN job_attempts AS attempt ON attempt.job_id = action_job.id WHERE action_job.id = ?1 AND attempt.id = ?2",
                 )
-                .await
+
                 .map_err(db)?
                 .query_row((action_job_id.as_str(), action_attempt_id))
-                .await
+
                 .map_err(|error| match error {
-                    turso::Error::QueryReturnedNoRows => {
+                    rusqlite::Error::QueryReturnedNoRows => {
                         CrawlTraversalRepositoryError::InvalidState
                     }
                     other => db(other),
@@ -696,7 +770,7 @@ impl<'database> CrawlTraversalRepository<'database> {
             let attempt_number: i64 = action.get(9).map_err(db)?;
             let attempt_lease_id: String = action.get(10).map_err(db)?;
             let attempt_lease_generation: i64 = action.get(11).map_err(db)?;
-            if action_run_id.as_deref() != Some(run_id.to_string().as_str())
+            if action_run_id.as_deref() != Some(run_id_string.as_str())
                 || kind != action_kind.as_str()
                 || job_state != "RUNNING"
                 || current_attempt != attempt_number
@@ -709,32 +783,29 @@ impl<'database> CrawlTraversalRepository<'database> {
             }
             let source_run_id: Option<String> = tx
                 .prepare("SELECT crawl_run_id FROM jobs WHERE id = ?1")
-                .await
+
                 .map_err(db)?
                 .query_row([source_job_id.as_str()])
-                .await
+
                 .map_err(|error| match error {
-                    turso::Error::QueryReturnedNoRows => {
+                    rusqlite::Error::QueryReturnedNoRows => {
                         CrawlTraversalRepositoryError::InvalidState
                     }
                     other => db(other),
                 })?
                 .get(0)
                 .map_err(db)?;
-            if source_run_id.as_deref() != Some(run_id.to_string().as_str()) {
+            if source_run_id.as_deref() != Some(run_id_string.as_str()) {
                 return Err(CrawlTraversalRepositoryError::InvalidState);
             }
 
-            let existing = tx
+            let mut existing_rows = tx
                 .query(
                     "SELECT source_job_id, crawl_run_id, action_kind FROM crawl_recovery_actions WHERE action_job_id = ?1",
                     [action_job_id.as_str()],
                 )
-                .await
-                .map_err(db)?
-                .next()
-                .await
                 .map_err(db)?;
+            let existing = existing_rows.next().map_err(db)?;
             if let Some(existing) = existing {
                 let existing_source: String = existing.get(0).map_err(db)?;
                 let existing_run: String = existing.get(1).map_err(db)?;
@@ -745,7 +816,7 @@ impl<'database> CrawlTraversalRepository<'database> {
                 {
                     return Err(CrawlTraversalRepositoryError::InvalidState);
                 }
-                let state_ids = read_recovery_action_items(&tx, action_job_id, run_id).await?;
+                let state_ids = read_recovery_action_items(&tx, &action_job_id, run_id)?;
                 return Ok(CrawlRecoveryActionSelection {
                     action_job_id: action_job_id.to_string(),
                     crawl_run_id: run_id,
@@ -764,17 +835,17 @@ impl<'database> CrawlTraversalRepository<'database> {
                     now,
                 ),
             )
-            .await
+
             .map_err(db)?;
 
             let control_exists = tx
                 .prepare(
                     "SELECT EXISTS(SELECT 1 FROM crawl_traversal_control WHERE crawl_run_id = ?1)",
                 )
-                .await
+
                 .map_err(db)?
                 .query_row([run_id.to_string()])
-                .await
+
                 .map_err(db)?
                 .get::<i64>(0)
                 .map_err(db)?
@@ -797,15 +868,16 @@ impl<'database> CrawlTraversalRepository<'database> {
                 }
                 CrawlRecoveryActionKind::RestartFromBeginning => "current_work_state IS NOT NULL",
             };
+            let query = format!("SELECT id, work_generation FROM crawl_url_state WHERE crawl_run_id = ?1 AND admission_state = 'ADMITTED' AND {work_predicate} ORDER BY depth ASC NULLS LAST, admission_sequence ASC NULLS LAST, canonical_url COLLATE BINARY ASC, requested_url COLLATE BINARY ASC");
             let mut rows = tx
                 .query(
-                    format!("SELECT id, work_generation FROM crawl_url_state WHERE crawl_run_id = ?1 AND admission_state = 'ADMITTED' AND {work_predicate} ORDER BY depth ASC NULLS LAST, admission_sequence ASC NULLS LAST, canonical_url COLLATE BINARY ASC, requested_url COLLATE BINARY ASC"),
+                    query.as_str(),
                     [run_id.to_string()],
                 )
-                .await
+
                 .map_err(db)?;
             let mut state_ids = Vec::new();
-            while let Some(row) = rows.next().await.map_err(db)? {
+            while let Some(row) = rows.next().map_err(db)? {
                 let state_id: String = row.get(0).map_err(db)?;
                 let previous_generation = as_u64(row.get::<i64>(1).map_err(db)?)?;
                 let prepared_generation = previous_generation
@@ -821,7 +893,7 @@ impl<'database> CrawlTraversalRepository<'database> {
                             i64_from(previous_generation)?,
                         ),
                     )
-                    .await
+
                     .map_err(db)?;
                 if changed != 1 {
                     return Err(CrawlTraversalRepositoryError::CorruptState);
@@ -836,7 +908,7 @@ impl<'database> CrawlTraversalRepository<'database> {
                         i64_from(prepared_generation)?,
                     ),
                 )
-                .await
+
                 .map_err(db)?;
                 state_ids.push(state_id);
             }
@@ -846,9 +918,9 @@ impl<'database> CrawlTraversalRepository<'database> {
                 action_kind,
                 state_ids,
             })
-        }
-        .await;
-        finish(tx, result).await
+        })();
+        finish(tx, result)
+        }).await
     }
 
     /// # Errors
@@ -857,8 +929,12 @@ impl<'database> CrawlTraversalRepository<'database> {
         &self,
         run_id: CrawlRunId,
     ) -> Result<CrawlTraversalControl, CrawlTraversalRepositoryError> {
-        let connection = self.database.connection().await.map_err(db)?;
-        read_control(&connection, run_id).await
+        self.database
+            .call(move |raw| {
+                let connection = Connection::new(raw);
+                read_control(&connection, run_id)
+            })
+            .await
     }
 
     /// Reads the generation of one current logical work identity before
@@ -872,34 +948,37 @@ impl<'database> CrawlTraversalRepository<'database> {
         run_id: CrawlRunId,
         state_id: &str,
     ) -> Result<u64, CrawlTraversalRepositoryError> {
-        let connection = self.database.connection().await.map_err(db)?;
+        let state_id = state_id.to_owned();
+        self.database.call(move |raw| {
+        let connection = Connection::new(raw);
         let row = connection
             .prepare(
                 "SELECT work_generation FROM crawl_url_state WHERE crawl_run_id = ?1 AND id = ?2 AND admission_state = 'ADMITTED'",
             )
-            .await
+
             .map_err(db)?
-            .query_row((run_id.to_string(), state_id))
-            .await
+            .query_row((run_id.to_string(), state_id.as_str()))
+
             .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => CrawlTraversalRepositoryError::InvalidState,
+                rusqlite::Error::QueryReturnedNoRows => CrawlTraversalRepositoryError::InvalidState,
                 other => db(other),
             })?;
         as_u64(row.get(0).map_err(db)?)
+        }).await
     }
 }
 
 fn db(error: impl Into<DbError>) -> CrawlTraversalRepositoryError {
     CrawlTraversalRepositoryError::Database(error.into())
 }
-async fn finish<T>(
+fn finish<T>(
     tx: Transaction<'_>,
     result: Result<T, CrawlTraversalRepositoryError>,
 ) -> Result<T, CrawlTraversalRepositoryError> {
     match result {
-        Ok(value) => tx.commit().await.map(|()| value).map_err(db),
+        Ok(value) => tx.commit().map(|()| value).map_err(db),
         Err(error) => {
-            let _ = tx.rollback().await;
+            let _ = tx.rollback();
             Err(error)
         }
     }
@@ -1061,16 +1140,14 @@ fn initial_state_matches(persisted: &CrawlUrlStateRecord, expected: &CrawlUrlSta
             .all(|seed_id| persisted.seed_provenance.contains(seed_id))
 }
 
-async fn ensure_run(
-    connection: &turso::Connection,
+fn ensure_run(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
 ) -> Result<(), CrawlTraversalRepositoryError> {
     let row = connection
         .prepare("SELECT EXISTS(SELECT 1 FROM crawl_runs WHERE id = ?1)")
-        .await
         .map_err(db)?
         .query_row([run_id.to_string()])
-        .await
         .map_err(db)?;
     let found: i64 = row.get(0).map_err(db)?;
     if found == 1 {
@@ -1080,8 +1157,8 @@ async fn ensure_run(
     }
 }
 
-async fn validate_state_ownership(
-    connection: &turso::Connection,
+fn validate_state_ownership(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
     run_id: CrawlRunId,
 ) -> Result<(), CrawlTraversalRepositoryError> {
@@ -1090,10 +1167,8 @@ async fn validate_state_ownership(
     }
     let run = connection
         .prepare("SELECT crawler_version_id, snapshot_json FROM crawl_runs WHERE id = ?1")
-        .await
         .map_err(db)?
         .query_row([run_id.to_string()])
-        .await
         .map_err(db)?;
     let version = run.get::<Option<String>>(0).map_err(db)?;
     let selected_seed_ids = if state.seed_provenance.is_empty() {
@@ -1119,10 +1194,10 @@ async fn validate_state_ownership(
         if !owned
             || connection
                 .prepare("SELECT EXISTS(SELECT 1 FROM page_types WHERE id = ?1 AND crawler_version_id = ?2)")
-                .await
+
                 .map_err(db)?
                 .query_row((target_page_type_id, version.as_deref().unwrap_or_default()))
-                .await
+
                 .map_err(db)?
                 .get::<i64>(0)
                 .map_err(db)?
@@ -1135,10 +1210,10 @@ async fn validate_state_ownership(
         && (version.is_none()
             || connection
                 .prepare("SELECT EXISTS(SELECT 1 FROM discovery_transitions WHERE id = ?1 AND crawler_version_id = ?2)")
-                .await
+
                 .map_err(db)?
                 .query_row((transition_id, version.as_deref().unwrap_or_default()))
-                .await
+
                 .map_err(db)?
                 .get::<i64>(0)
                 .map_err(db)?
@@ -1158,10 +1233,8 @@ async fn validate_state_ownership(
                 .prepare(
                     "SELECT EXISTS(SELECT 1 FROM seeds WHERE id = ?1 AND crawler_version_id = ?2)",
                 )
-                .await
                 .map_err(db)?
                 .query_row((seed_id.as_str(), version.as_deref().unwrap_or_default()))
-                .await
                 .map_err(db)?
                 .get::<i64>(0)
                 .map_err(db)?
@@ -1170,12 +1243,12 @@ async fn validate_state_ownership(
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
     }
-    validate_state_relationships(connection, state, run_id).await?;
+    validate_state_relationships(connection, state, run_id)?;
     Ok(())
 }
 
-async fn validate_state_relationships(
-    connection: &turso::Connection,
+fn validate_state_relationships(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
     run_id: CrawlRunId,
 ) -> Result<(), CrawlTraversalRepositoryError> {
@@ -1185,8 +1258,7 @@ async fn validate_state_relationships(
             "SELECT EXISTS(SELECT 1 FROM discovered_urls WHERE crawl_run_id = ?1 AND id = ?2)",
             run_id,
             first_discovered_url_id,
-        )
-        .await?;
+        )?;
     }
     if let Some(parent_discovered_url_id) = state.parent_discovered_url_id.as_deref() {
         require_same_run_reference(
@@ -1194,8 +1266,7 @@ async fn validate_state_relationships(
             "SELECT EXISTS(SELECT 1 FROM discovered_urls WHERE crawl_run_id = ?1 AND id = ?2)",
             run_id,
             parent_discovered_url_id,
-        )
-        .await?;
+        )?;
     }
     if let Some(parent_url_state_id) = state.parent_url_state_id.as_deref() {
         if parent_url_state_id == state.id {
@@ -1206,8 +1277,7 @@ async fn validate_state_relationships(
             "SELECT EXISTS(SELECT 1 FROM crawl_url_state WHERE crawl_run_id = ?1 AND id = ?2)",
             run_id,
             parent_url_state_id,
-        )
-        .await?;
+        )?;
     }
     if let Some(resolved_to_url_state_id) = state.resolved_to_url_state_id.as_deref() {
         if resolved_to_url_state_id == state.id {
@@ -1218,15 +1288,14 @@ async fn validate_state_relationships(
             "SELECT EXISTS(SELECT 1 FROM crawl_url_state WHERE crawl_run_id = ?1 AND id = ?2)",
             run_id,
             resolved_to_url_state_id,
-        )
-        .await?;
+        )?;
     }
     if let Some(current_execution_id) = state.current_execution_id.as_deref() {
         let row = connection
             .prepare(
                 "SELECT EXISTS(SELECT 1 FROM crawl_execution_results WHERE crawl_run_id = ?1 AND id = ?2 AND crawl_url_state_id = ?3 AND work_generation = ?4)",
             )
-            .await
+
             .map_err(db)?
             .query_row((
                 run_id.to_string(),
@@ -1234,7 +1303,7 @@ async fn validate_state_relationships(
                 state.id.as_str(),
                 i64_from(state.work_generation)?,
             ))
-            .await
+
             .map_err(db)?;
         if row.get::<i64>(0).map_err(db)? != 1 {
             return Err(CrawlTraversalRepositoryError::InvalidState);
@@ -1243,18 +1312,16 @@ async fn validate_state_relationships(
     Ok(())
 }
 
-async fn require_same_run_reference(
-    connection: &turso::Connection,
+fn require_same_run_reference(
+    connection: &impl crate::SqliteExecutor,
     query: &str,
     run_id: CrawlRunId,
     reference_id: &str,
 ) -> Result<(), CrawlTraversalRepositoryError> {
     let row = connection
         .prepare(query)
-        .await
         .map_err(db)?
         .query_row((run_id.to_string(), reference_id))
-        .await
         .map_err(db)?;
     if row.get::<i64>(0).map_err(db)? == 1 {
         Ok(())
@@ -1263,8 +1330,8 @@ async fn require_same_run_reference(
     }
 }
 
-async fn apply_semantic_projection(
-    connection: &turso::Connection,
+fn apply_semantic_projection(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
     projection: &CrawlTraversalSemanticProjection,
 ) -> Result<(), CrawlTraversalRepositoryError> {
@@ -1297,7 +1364,7 @@ async fn apply_semantic_projection(
                     value.canonical_url.as_str(),
                 ),
             )
-            .await
+
             .map_err(db)?;
         if changed != 1 {
             return Err(CrawlTraversalRepositoryError::InvalidState);
@@ -1308,9 +1375,8 @@ async fn apply_semantic_projection(
             "SELECT canonical_url FROM crawl_url_state WHERE crawl_run_id = ?1",
             [run_id.to_string()],
         )
-        .await
         .map_err(db)?;
-    while let Some(row) = rows.next().await.map_err(db)? {
+    while let Some(row) = rows.next().map_err(db)? {
         let canonical_url: String = row.get(0).map_err(db)?;
         if !seen.contains(canonical_url.as_str()) {
             return Err(CrawlTraversalRepositoryError::InvalidState);
@@ -1322,7 +1388,6 @@ async fn apply_semantic_projection(
             "DELETE FROM crawl_traversal_page_type_counts WHERE crawl_run_id = ?1",
             [run_id.to_string()],
         )
-        .await
         .map_err(db)?;
     let mut page_types = std::collections::BTreeSet::new();
     for count in &projection.page_type_counts {
@@ -1333,10 +1398,10 @@ async fn apply_semantic_projection(
             .prepare(
                 "SELECT EXISTS(SELECT 1 FROM page_types AS page_type JOIN crawl_runs AS run ON run.id = ?1 WHERE page_type.id = ?2 AND page_type.crawler_version_id = run.crawler_version_id)",
             )
-            .await
+
             .map_err(db)?
             .query_row((run_id.to_string(), count.page_type_id.as_str()))
-            .await
+
             .map_err(db)?
             .get::<i64>(0)
             .map_err(db)?;
@@ -1353,14 +1418,14 @@ async fn apply_semantic_projection(
                     i64_from(count.discovered_count)?,
                 ),
             )
-            .await
+
             .map_err(db)?;
     }
     Ok(())
 }
 
-async fn read_page_type_counts(
-    connection: &turso::Connection,
+fn read_page_type_counts(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
 ) -> Result<Vec<CrawlTraversalPageTypeCounts>, CrawlTraversalRepositoryError> {
     let mut rows = connection
@@ -1368,10 +1433,10 @@ async fn read_page_type_counts(
             "SELECT page_type_id, sampled_count, discovered_count FROM crawl_traversal_page_type_counts WHERE crawl_run_id = ?1 ORDER BY page_type_id COLLATE BINARY",
             [run_id.to_string()],
         )
-        .await
+
         .map_err(db)?;
     let mut counts = Vec::new();
-    while let Some(row) = rows.next().await.map_err(db)? {
+    while let Some(row) = rows.next().map_err(db)? {
         counts.push(CrawlTraversalPageTypeCounts {
             page_type_id: row.get(0).map_err(db)?,
             sampled_count: as_u64(row.get::<i64>(1).map_err(db)?)?,
@@ -1381,7 +1446,7 @@ async fn read_page_type_counts(
     Ok(counts)
 }
 
-async fn read_recovery_action_items(
+fn read_recovery_action_items(
     connection: &Transaction<'_>,
     action_job_id: &JobId,
     run_id: CrawlRunId,
@@ -1391,10 +1456,10 @@ async fn read_recovery_action_items(
             "SELECT item.crawl_url_state_id, item.prepared_work_generation, state.work_generation FROM crawl_recovery_action_items AS item JOIN crawl_url_state AS state ON state.crawl_run_id = item.crawl_run_id AND state.id = item.crawl_url_state_id WHERE item.action_job_id = ?1 AND item.crawl_run_id = ?2 ORDER BY state.depth ASC NULLS LAST, state.admission_sequence ASC NULLS LAST, state.canonical_url COLLATE BINARY ASC, state.requested_url COLLATE BINARY ASC",
             (action_job_id.as_str(), run_id.to_string()),
         )
-        .await
+
         .map_err(db)?;
     let mut state_ids = Vec::new();
-    while let Some(row) = rows.next().await.map_err(db)? {
+    while let Some(row) = rows.next().map_err(db)? {
         let state_id: String = row.get(0).map_err(db)?;
         let prepared_generation = as_u64(row.get::<i64>(1).map_err(db)?)?;
         let current_generation = as_u64(row.get::<i64>(2).map_err(db)?)?;
@@ -1408,7 +1473,7 @@ async fn read_recovery_action_items(
     Ok(state_ids)
 }
 
-async fn mark_in_flight_work(
+fn mark_in_flight_work(
     connection: &Transaction<'_>,
     run_id: CrawlRunId,
     in_flight_work: &[CrawlInFlightWork],
@@ -1422,12 +1487,12 @@ async fn mark_in_flight_work(
             .prepare(
                 "SELECT admission_state, current_work_state, work_generation, current_execution_id FROM crawl_url_state WHERE crawl_run_id = ?1 AND id = ?2",
             )
-            .await
+
             .map_err(db)?
             .query_row((run_id.to_string(), work.state_id.as_str()))
-            .await
+
             .map_err(|error| match error {
-                turso::Error::QueryReturnedNoRows => CrawlTraversalRepositoryError::InvalidState,
+                rusqlite::Error::QueryReturnedNoRows => CrawlTraversalRepositoryError::InvalidState,
                 other => db(other),
             })?;
         let admission_state: String = row.get(0).map_err(db)?;
@@ -1459,7 +1524,7 @@ async fn mark_in_flight_work(
                     i64_from(generation)?,
                 ),
             )
-            .await
+
             .map_err(db)?;
         if changed != 1 {
             return Err(CrawlTraversalRepositoryError::CorruptState);
@@ -1468,8 +1533,8 @@ async fn mark_in_flight_work(
     Ok(())
 }
 
-async fn read_state_by_canonical(
-    connection: &turso::Connection,
+fn read_state_by_canonical(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
     canonical_url: &str,
 ) -> Result<Option<CrawlUrlStateRecord>, CrawlTraversalRepositoryError> {
@@ -1478,9 +1543,9 @@ async fn read_state_by_canonical(
             "SELECT id, canonical_url, first_discovered_url_id, requested_url, parent_url_state_id, parent_discovered_url_id, admission_state, preserve_reason, resolved_to_url_state_id, admission_sequence, depth, target_page_type_id, transition_id, pagination, final_canonical_url, current_work_state, work_generation, current_execution_id, seen, sampled, expanded, in_scope, page_type_match_state FROM crawl_url_state WHERE crawl_run_id = ?1 AND canonical_url = ?2",
             (run_id.to_string(), canonical_url),
         )
-        .await
+
         .map_err(db)?;
-    let Some(row) = rows.next().await.map_err(db)? else {
+    let Some(row) = rows.next().map_err(db)? else {
         return Ok(None);
     };
     let id: String = row.get(0).map_err(db)?;
@@ -1504,7 +1569,7 @@ async fn read_state_by_canonical(
         current_work_state: optional_work_state(row.get(15).map_err(db)?)?,
         work_generation: as_u64(row.get::<i64>(16).map_err(db)?)?,
         current_execution_id: row.get(17).map_err(db)?,
-        seed_provenance: read_seed_provenance(connection, &id).await?,
+        seed_provenance: read_seed_provenance(connection, &id)?,
         seen: row.get::<i64>(18).map_err(db)? == 1,
         sampled: row.get::<i64>(19).map_err(db)? == 1,
         expanded: row.get::<i64>(20).map_err(db)? == 1,
@@ -1515,8 +1580,8 @@ async fn read_state_by_canonical(
     Ok(Some(state))
 }
 
-async fn reconcile_redirect(
-    connection: &turso::Connection,
+fn reconcile_redirect(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
     redirect: &CrawlRedirectReconciliation,
 ) -> Result<(), CrawlTraversalRepositoryError> {
@@ -1528,8 +1593,7 @@ async fn reconcile_redirect(
     {
         return Err(CrawlTraversalRepositoryError::InvalidState);
     }
-    let Some(alias) =
-        read_state_by_canonical(connection, run_id, &redirect.alias_canonical_url).await?
+    let Some(alias) = read_state_by_canonical(connection, run_id, &redirect.alias_canonical_url)?
     else {
         return Err(CrawlTraversalRepositoryError::InvalidState);
     };
@@ -1546,15 +1610,14 @@ async fn reconcile_redirect(
         return Err(CrawlTraversalRepositoryError::InvalidState);
     }
 
-    let final_state =
-        read_state_by_canonical(connection, run_id, &redirect.final_canonical_url).await?;
+    let final_state = read_state_by_canonical(connection, run_id, &redirect.final_canonical_url)?;
     if let Some(final_state) = &final_state {
         if final_state.id != redirect.final_url_state_id
             || final_state.admission_state != CrawlAdmissionState::Admitted
         {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
-        append_seed_provenance(connection, final_state, &alias.seed_provenance).await?;
+        append_seed_provenance(connection, final_state, &alias.seed_provenance)?;
     } else {
         let mut final_state = alias.clone();
         final_state.id.clone_from(&redirect.final_url_state_id);
@@ -1564,7 +1627,7 @@ async fn reconcile_redirect(
         final_state.final_canonical_url = None;
         final_state.current_execution_id = None;
         final_state.seen = true;
-        insert_state(connection, &final_state).await?;
+        insert_state(connection, &final_state)?;
     }
     let changed = connection
         .execute(
@@ -1576,7 +1639,7 @@ async fn reconcile_redirect(
                 run_id.to_string(),
             ),
         )
-        .await
+
         .map_err(db)?;
     if changed != 1 {
         return Err(CrawlTraversalRepositoryError::CorruptState);
@@ -1584,8 +1647,8 @@ async fn reconcile_redirect(
     Ok(())
 }
 
-async fn append_seed_provenance(
-    connection: &turso::Connection,
+fn append_seed_provenance(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
     seed_ids: &[String],
 ) -> Result<(), CrawlTraversalRepositoryError> {
@@ -1596,16 +1659,16 @@ async fn append_seed_provenance(
         }
     }
     for seed_id in merged.into_iter().skip(state.seed_provenance.len()) {
-        insert_seed_provenance_value(connection, state, &seed_id).await?;
+        insert_seed_provenance_value(connection, state, &seed_id)?;
     }
     Ok(())
 }
-async fn insert_state(
-    connection: &turso::Connection,
+fn insert_state(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
 ) -> Result<(), CrawlTraversalRepositoryError> {
     validate_state(state)?;
-    validate_state_ownership(connection, state, state.crawl_run_id).await?;
+    validate_state_ownership(connection, state, state.crawl_run_id)?;
     connection.execute(
         "INSERT INTO crawl_url_state (id,crawl_run_id,canonical_url,first_discovered_url_id,requested_url,parent_url_state_id,parent_discovered_url_id,admission_state,preserve_reason,resolved_to_url_state_id,admission_sequence,depth,target_page_type_id,transition_id,pagination,final_canonical_url,current_work_state,work_generation,current_execution_id,seen,sampled,expanded,in_scope,page_type_match_state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
         params_from_iter(vec![
@@ -1648,29 +1711,29 @@ async fn insert_state(
                 .map_or(Value::Null, |value| Value::Text(value.to_owned())),
         ]),
     )
-    .await
+
     .map_err(db)?;
-    insert_seed_provenance(connection, state).await
+    insert_seed_provenance(connection, state)
 }
-async fn upsert_discovery_state(
-    connection: &turso::Connection,
+fn upsert_discovery_state(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
 ) -> Result<(), CrawlTraversalRepositoryError> {
     validate_state(state)?;
-    validate_state_ownership(connection, state, state.crawl_run_id).await?;
-    let row = connection.prepare("SELECT EXISTS(SELECT 1 FROM crawl_url_state WHERE crawl_run_id=?1 AND canonical_url=?2)").await.map_err(db)?.query_row((state.crawl_run_id.to_string(),state.canonical_url.as_str())).await.map_err(db)?;
+    validate_state_ownership(connection, state, state.crawl_run_id)?;
+    let row = connection.prepare("SELECT EXISTS(SELECT 1 FROM crawl_url_state WHERE crawl_run_id=?1 AND canonical_url=?2)").map_err(db)?.query_row((state.crawl_run_id.to_string(),state.canonical_url.as_str())).map_err(db)?;
     let exists: i64 = row.get(0).map_err(db)?;
     if exists == 0 {
-        insert_state(connection, state).await
+        insert_state(connection, state)
     } else {
         let existing = connection
             .prepare(
                 "SELECT id, admission_state, current_work_state, work_generation FROM crawl_url_state WHERE crawl_run_id = ?1 AND canonical_url = ?2",
             )
-            .await
+
             .map_err(db)?
             .query_row((state.crawl_run_id.to_string(), state.canonical_url.as_str()))
-            .await
+
             .map_err(db)?;
         let existing_id: String = existing.get(0).map_err(db)?;
         let existing_admission: String = existing.get(1).map_err(db)?;
@@ -1711,7 +1774,7 @@ async fn upsert_discovery_state(
                         state.crawl_run_id.to_string(),
                     ),
                 )
-                .await
+
                 .map_err(db)?;
         } else {
             connection
@@ -1725,24 +1788,24 @@ async fn upsert_discovery_state(
                         state.crawl_run_id.to_string(),
                     ),
                 )
-                .await
+
                 .map_err(db)?;
         }
-        insert_seed_provenance(connection, state).await
+        insert_seed_provenance(connection, state)
     }
 }
-async fn insert_seed_provenance(
-    connection: &turso::Connection,
+fn insert_seed_provenance(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
 ) -> Result<(), CrawlTraversalRepositoryError> {
     for seed_id in &state.seed_provenance {
-        insert_seed_provenance_value(connection, state, seed_id).await?;
+        insert_seed_provenance_value(connection, state, seed_id)?;
     }
     Ok(())
 }
 
-async fn insert_seed_provenance_value(
-    connection: &turso::Connection,
+fn insert_seed_provenance_value(
+    connection: &impl crate::SqliteExecutor,
     state: &CrawlUrlStateRecord,
     seed_id: &str,
 ) -> Result<(), CrawlTraversalRepositoryError> {
@@ -1750,13 +1813,13 @@ async fn insert_seed_provenance_value(
         .prepare(
             "SELECT 1 FROM seeds AS seed JOIN crawl_runs AS run ON run.id = ?1 WHERE seed.id = ?2 AND run.crawler_version_id = seed.crawler_version_id",
         )
-        .await
+
         .map_err(db)?
         .query_row((state.crawl_run_id.to_string(), seed_id))
-        .await;
+        ;
     match existing {
         Ok(_) => {}
-        Err(turso::Error::QueryReturnedNoRows) => {
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
             return Err(CrawlTraversalRepositoryError::InvalidState);
         }
         Err(error) => return Err(db(error)),
@@ -1766,23 +1829,23 @@ async fn insert_seed_provenance_value(
         .prepare(
             "SELECT 1 FROM crawl_url_seed_provenance WHERE crawl_url_state_id = ?1 AND seed_id = ?2",
         )
-        .await
+
         .map_err(db)?
         .query_row((state.id.as_str(), seed_id))
-        .await;
+        ;
     match exists {
         Ok(_) => return Ok(()),
-        Err(turso::Error::QueryReturnedNoRows) => {}
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
         Err(error) => return Err(db(error)),
     }
     let row = connection
         .prepare(
             "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM crawl_url_seed_provenance WHERE crawl_url_state_id = ?1",
         )
-        .await
+
         .map_err(db)?
         .query_row([state.id.as_str()])
-        .await
+
         .map_err(db)?;
     let ordinal: i64 = row.get(0).map_err(db)?;
     connection
@@ -1790,22 +1853,22 @@ async fn insert_seed_provenance_value(
             "INSERT INTO crawl_url_seed_provenance (crawl_url_state_id, seed_id, ordinal) VALUES (?1, ?2, ?3)",
             (state.id.as_str(), seed_id, ordinal),
         )
-        .await
+
         .map_err(db)?;
     Ok(())
 }
-async fn insert_control(
-    connection: &turso::Connection,
+fn insert_control(
+    connection: &impl crate::SqliteExecutor,
     control: &CrawlTraversalControl,
 ) -> Result<(), CrawlTraversalRepositoryError> {
-    connection.execute("INSERT INTO crawl_traversal_control (crawl_run_id,consumed_bytes,raw_link_count,duplicate_count,robots_excluded_count,provider_error_count,external_url_count,blocked_url_count,peak_expansion_count,elapsed_millis,time_budget_hit,duration_work_not_expanded,pagination_truncation_count,next_admission_sequence) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", control_values(control)?).await.map_err(db)?;
+    connection.execute("INSERT INTO crawl_traversal_control (crawl_run_id,consumed_bytes,raw_link_count,duplicate_count,robots_excluded_count,provider_error_count,external_url_count,blocked_url_count,peak_expansion_count,elapsed_millis,time_budget_hit,duration_work_not_expanded,pagination_truncation_count,next_admission_sequence) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", control_values(control)?).map_err(db)?;
     Ok(())
 }
-async fn update_control(
-    connection: &turso::Connection,
+fn update_control(
+    connection: &impl crate::SqliteExecutor,
     control: &CrawlTraversalControl,
 ) -> Result<(), CrawlTraversalRepositoryError> {
-    let changed = connection.execute("UPDATE crawl_traversal_control SET consumed_bytes=?1,raw_link_count=?2,duplicate_count=?3,robots_excluded_count=?4,provider_error_count=?5,external_url_count=?6,blocked_url_count=?7,peak_expansion_count=?8,elapsed_millis=?9,time_budget_hit=?10,duration_work_not_expanded=?11,pagination_truncation_count=?12,next_admission_sequence=?13 WHERE crawl_run_id=?14", (i64_from(control.consumed_bytes)?,i64_from(control.raw_link_count)?,i64_from(control.duplicate_count)?,i64_from(control.robots_excluded_count)?,i64_from(control.provider_error_count)?,i64_from(control.external_url_count)?,i64_from(control.blocked_url_count)?,i64_from(control.peak_expansion_count)?,i64_from(control.elapsed_millis)?,i64::from(control.time_budget_hit),i64::from(control.duration_work_not_expanded),i64_from(control.pagination_truncation_count)?,i64_from(control.next_admission_sequence)?,control.crawl_run_id.to_string())).await.map_err(db)?;
+    let changed = connection.execute("UPDATE crawl_traversal_control SET consumed_bytes=?1,raw_link_count=?2,duplicate_count=?3,robots_excluded_count=?4,provider_error_count=?5,external_url_count=?6,blocked_url_count=?7,peak_expansion_count=?8,elapsed_millis=?9,time_budget_hit=?10,duration_work_not_expanded=?11,pagination_truncation_count=?12,next_admission_sequence=?13 WHERE crawl_run_id=?14", (i64_from(control.consumed_bytes)?,i64_from(control.raw_link_count)?,i64_from(control.duplicate_count)?,i64_from(control.robots_excluded_count)?,i64_from(control.provider_error_count)?,i64_from(control.external_url_count)?,i64_from(control.blocked_url_count)?,i64_from(control.peak_expansion_count)?,i64_from(control.elapsed_millis)?,i64::from(control.time_budget_hit),i64::from(control.duration_work_not_expanded),i64_from(control.pagination_truncation_count)?,i64_from(control.next_admission_sequence)?,control.crawl_run_id.to_string())).map_err(db)?;
     if changed == 1 {
         Ok(())
     } else {
@@ -1813,17 +1876,15 @@ async fn update_control(
     }
 }
 
-async fn replace_transition_counts(
-    connection: &turso::Connection,
+fn replace_transition_counts(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
     counts: &[CrawlTransitionSourceCount],
 ) -> Result<(), CrawlTraversalRepositoryError> {
     let version = connection
         .prepare("SELECT crawler_version_id FROM crawl_runs WHERE id = ?1")
-        .await
         .map_err(db)?
         .query_row([run_id.to_string()])
-        .await
         .map_err(db)?
         .get::<Option<String>>(0)
         .map_err(db)?;
@@ -1835,10 +1896,10 @@ async fn replace_transition_counts(
             .prepare(
                 "SELECT EXISTS(SELECT 1 FROM crawl_url_state WHERE crawl_run_id = ?1 AND id = ?2 AND admission_state = 'ADMITTED')",
             )
-            .await
+
             .map_err(db)?
             .query_row((run_id.to_string(), count.source_url_state_id.as_str()))
-            .await
+
             .map_err(db)?
             .get::<i64>(0)
             .map_err(db)?;
@@ -1848,10 +1909,10 @@ async fn replace_transition_counts(
         let transition_exists = if let Some(version_id) = version.as_deref() {
             connection
             .prepare("SELECT EXISTS(SELECT 1 FROM discovery_transitions WHERE id = ?1 AND crawler_version_id = ?2)")
-            .await
+
             .map_err(db)?
             .query_row((count.transition_id.as_str(), version_id))
-            .await
+
             .map_err(db)?
             .get::<i64>(0)
             .map_err(db)?
@@ -1868,7 +1929,6 @@ async fn replace_transition_counts(
             "DELETE FROM crawl_transition_source_counts WHERE crawl_run_id = ?1",
             [run_id.to_string()],
         )
-        .await
         .map_err(db)?;
     for count in counts {
         connection
@@ -1881,14 +1941,14 @@ async fn replace_transition_counts(
                     i64_from(count.eligible_edge_count)?,
                 ),
             )
-            .await
+
             .map_err(db)?;
     }
     Ok(())
 }
 
-async fn read_transition_counts(
-    connection: &turso::Connection,
+fn read_transition_counts(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
 ) -> Result<Vec<CrawlTransitionSourceCount>, CrawlTraversalRepositoryError> {
     let mut rows = connection
@@ -1896,10 +1956,10 @@ async fn read_transition_counts(
             "SELECT transition_id, source_url_state_id, eligible_edge_count FROM crawl_transition_source_counts WHERE crawl_run_id = ?1 ORDER BY transition_id COLLATE BINARY, source_url_state_id COLLATE BINARY",
             [run_id.to_string()],
         )
-        .await
+
         .map_err(db)?;
     let mut counts = Vec::new();
-    while let Some(row) = rows.next().await.map_err(db)? {
+    while let Some(row) = rows.next().map_err(db)? {
         counts.push(CrawlTransitionSourceCount {
             transition_id: row.get(0).map_err(db)?,
             source_url_state_id: row.get(1).map_err(db)?,
@@ -1928,11 +1988,11 @@ fn control_values(
         i64_from(control.next_admission_sequence)?,
     ))
 }
-async fn read_control(
-    connection: &turso::Connection,
+fn read_control(
+    connection: &impl crate::SqliteExecutor,
     run_id: CrawlRunId,
 ) -> Result<CrawlTraversalControl, CrawlTraversalRepositoryError> {
-    let row = connection.prepare("SELECT consumed_bytes,raw_link_count,duplicate_count,robots_excluded_count,provider_error_count,external_url_count,blocked_url_count,peak_expansion_count,elapsed_millis,time_budget_hit,duration_work_not_expanded,pagination_truncation_count,next_admission_sequence FROM crawl_traversal_control WHERE crawl_run_id=?1").await.map_err(db)?.query_row([run_id.to_string()]).await.map_err(|e| match e { turso::Error::QueryReturnedNoRows => CrawlTraversalRepositoryError::CrawlRunNotFound, other => db(other) })?;
+    let row = connection.prepare("SELECT consumed_bytes,raw_link_count,duplicate_count,robots_excluded_count,provider_error_count,external_url_count,blocked_url_count,peak_expansion_count,elapsed_millis,time_budget_hit,duration_work_not_expanded,pagination_truncation_count,next_admission_sequence FROM crawl_traversal_control WHERE crawl_run_id=?1").map_err(db)?.query_row([run_id.to_string()]).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => CrawlTraversalRepositoryError::CrawlRunNotFound, other => db(other) })?;
     Ok(CrawlTraversalControl {
         crawl_run_id: run_id,
         consumed_bytes: as_u64(row.get(0).map_err(db)?)?,
@@ -1950,13 +2010,13 @@ async fn read_control(
         next_admission_sequence: as_u64(row.get(12).map_err(db)?)?,
     })
 }
-async fn read_seed_provenance(
-    connection: &turso::Connection,
+fn read_seed_provenance(
+    connection: &impl crate::SqliteExecutor,
     state_id: &str,
 ) -> Result<Vec<String>, CrawlTraversalRepositoryError> {
-    let mut rows = connection.query("SELECT seed_id FROM crawl_url_seed_provenance WHERE crawl_url_state_id=?1 ORDER BY ordinal ASC, seed_id COLLATE BINARY ASC", [state_id]).await.map_err(db)?;
+    let mut rows = connection.query("SELECT seed_id FROM crawl_url_seed_provenance WHERE crawl_url_state_id=?1 ORDER BY ordinal ASC, seed_id COLLATE BINARY ASC", [state_id]).map_err(db)?;
     let mut values = Vec::new();
-    while let Some(row) = rows.next().await.map_err(db)? {
+    while let Some(row) = rows.next().map_err(db)? {
         values.push(row.get(0).map_err(db)?);
     }
     Ok(values)

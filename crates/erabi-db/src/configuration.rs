@@ -15,8 +15,8 @@ pub enum ConfigurationError {
     Database(#[from] DbError),
 }
 
-impl From<turso::Error> for ConfigurationError {
-    fn from(error: turso::Error) -> Self {
+impl From<rusqlite::Error> for ConfigurationError {
+    fn from(error: rusqlite::Error) -> Self {
         Self::Database(DbError::from(error))
     }
 }
