@@ -5,8 +5,8 @@ use erabi_db::{
 use erabi_domain::{
     CanonicalizationPolicy, CollectionId, CrawlerId, CrawlerVersionId, SeedId, SourceTargetType,
 };
+use rusqlite::Connection;
 use tempfile::TempDir;
-use turso::Connection;
 
 async fn database() -> Result<(TempDir, ErabiDatabase), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -15,13 +15,11 @@ async fn database() -> Result<(TempDir, ErabiDatabase), Box<dyn std::error::Erro
     Ok((directory, database))
 }
 
-async fn raw_connection(directory: &TempDir) -> Result<Connection, Box<dyn std::error::Error>> {
+fn raw_connection(directory: &TempDir) -> Result<Connection, Box<dyn std::error::Error>> {
     let path = directory.path().join("erabi.db");
-    let database = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    let connection = database.connect()?;
-    connection.pragma_update("foreign_keys", "ON").await?;
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
 
@@ -41,16 +39,14 @@ fn source_input(
     })
 }
 
-async fn insert_collection(
+fn insert_collection(
     connection: &Connection,
     id: CollectionId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    connection
-        .execute(
-            "INSERT INTO collections (id, name, description, tags_json) VALUES (?1, ?2, NULL, ?3)",
-            (id.to_string(), "Collection", "[]"),
-        )
-        .await?;
+    connection.execute(
+        "INSERT INTO collections (id, name, description, tags_json) VALUES (?1, ?2, NULL, ?3)",
+        (id.to_string(), "Collection", "[]"),
+    )?;
     Ok(())
 }
 
@@ -76,13 +72,12 @@ async fn creates_and_reuses_by_collection_and_canonical_url_without_overwriting_
     );
     assert_eq!(first.canonical_url.as_str(), "https://example.test/");
     assert_eq!(reused.original_url, first.original_url);
-    let connection = raw_connection(&directory).await?;
-    let row = connection
-        .prepare("SELECT original_url FROM sources WHERE id = ?1")
-        .await?
-        .query_row([first.id.to_string()])
-        .await?;
-    let stored_original: String = row.get(0)?;
+    let connection = raw_connection(&directory)?;
+    let stored_original: String = connection.query_row(
+        "SELECT original_url FROM sources WHERE id = ?1",
+        [first.id.to_string()],
+        |row| row.get(0),
+    )?;
     assert_eq!(stored_original, "HTTPS://Example.test/?utm_source=ignored");
     Ok(())
 }
@@ -90,11 +85,11 @@ async fn creates_and_reuses_by_collection_and_canonical_url_without_overwriting_
 #[tokio::test]
 async fn collection_is_an_identity_dimension() -> Result<(), Box<dyn std::error::Error>> {
     let (directory, database) = database().await?;
-    let connection = raw_connection(&directory).await?;
+    let connection = raw_connection(&directory)?;
     let first_collection = CollectionId::new();
     let second_collection = CollectionId::new();
-    insert_collection(&connection, first_collection).await?;
-    insert_collection(&connection, second_collection).await?;
+    insert_collection(&connection, first_collection)?;
+    insert_collection(&connection, second_collection)?;
 
     let repository = SourceRepository::new(&database);
     let first = repository
@@ -122,19 +117,17 @@ async fn duplicate_identity_fails_closed_instead_of_using_row_order()
     let repository = SourceRepository::new(&database);
     let input = source_input("https://example.test/", None)?;
     let first = repository.create_or_reuse(&input).await?;
-    let connection = raw_connection(&directory).await?;
+    let connection = raw_connection(&directory)?;
     let duplicate_id = erabi_domain::SourceId::new();
-    connection
-        .execute(
-            "INSERT INTO sources (id, collection_id, name, original_url, canonical_url, target_type, status) VALUES (?1, NULL, ?2, ?3, ?4, 'WEB_PAGE', 'ACTIVE')",
-            (
-                duplicate_id.to_string(),
-                "Duplicate",
-                first.original_url.as_str(),
-                first.canonical_url.as_str(),
-            ),
-        )
-        .await?;
+    connection.execute(
+        "INSERT INTO sources (id, collection_id, name, original_url, canonical_url, target_type, status) VALUES (?1, NULL, ?2, ?3, ?4, 'WEB_PAGE', 'ACTIVE')",
+        (
+            duplicate_id.to_string(),
+            "Duplicate",
+            first.original_url.as_str(),
+            first.canonical_url.as_str(),
+        ),
+    )?;
 
     assert!(matches!(
         repository.create_or_reuse(&input).await,
@@ -150,13 +143,11 @@ async fn malformed_persisted_target_type_fails_closed() -> Result<(), Box<dyn st
     let source = repository
         .create_or_reuse(&source_input("https://example.test/", None)?)
         .await?;
-    let connection = raw_connection(&directory).await?;
-    connection
-        .execute(
-            "UPDATE sources SET target_type = 'NOT_A_TARGET' WHERE id = ?1",
-            [source.id.to_string()],
-        )
-        .await?;
+    let connection = raw_connection(&directory)?;
+    connection.execute(
+        "UPDATE sources SET target_type = 'NOT_A_TARGET' WHERE id = ?1",
+        [source.id.to_string()],
+    )?;
 
     assert!(matches!(
         repository.read(source.id).await,
@@ -187,7 +178,7 @@ async fn file_classification_only_changes_source_target_type()
 async fn source_identity_operations_do_not_mutate_crawler_seeds()
 -> Result<(), Box<dyn std::error::Error>> {
     let (directory, database) = database().await?;
-    let connection = raw_connection(&directory).await?;
+    let connection = raw_connection(&directory)?;
     let crawler_id = CrawlerId::new();
     let version_id = CrawlerVersionId::new();
     let seed_id = SeedId::new();
@@ -195,50 +186,41 @@ async fn source_identity_operations_do_not_mutate_crawler_seeds()
     let canonical_url = CanonicalizationPolicy::default()
         .canonicalize(original_url)?
         .canonical_url;
-    connection
-        .execute(
-            "INSERT INTO crawlers (id, name, collection_id, operational_defaults_json, active_published_version_id, active_draft_version_id) VALUES (?1, ?2, NULL, ?3, NULL, ?4)",
-            (
-                crawler_id.to_string(),
-                "Crawler",
-                "{}",
-                version_id.to_string(),
-            ),
-        )
-        .await?;
-    connection
-        .execute(
-            "INSERT INTO crawler_versions (id, crawler_id, state, semantic_configuration_json) VALUES (?1, ?2, 'DRAFT', ?3)",
-            (version_id.to_string(), crawler_id.to_string(), "{}"),
-        )
-        .await?;
-    connection
-        .execute(
-            "INSERT INTO seeds (id, crawler_version_id, original_url, canonical_url, enabled, label, entry_page_type_hint_id) VALUES (?1, ?2, ?3, ?4, 1, ?5, NULL)",
-            (
-                seed_id.to_string(),
-                version_id.to_string(),
-                original_url,
-                canonical_url.as_str(),
-                "kept seed",
-            ),
-        )
-        .await?;
+    connection.execute(
+        "INSERT INTO crawlers (id, name, collection_id, operational_defaults_json, active_published_version_id, active_draft_version_id) VALUES (?1, ?2, NULL, ?3, NULL, ?4)",
+        (
+            crawler_id.to_string(),
+            "Crawler",
+            "{}",
+            version_id.to_string(),
+        ),
+    )?;
+    connection.execute(
+        "INSERT INTO crawler_versions (id, crawler_id, state, semantic_configuration_json) VALUES (?1, ?2, 'DRAFT', ?3)",
+        (version_id.to_string(), crawler_id.to_string(), "{}"),
+    )?;
+    connection.execute(
+        "INSERT INTO seeds (id, crawler_version_id, original_url, canonical_url, enabled, label, entry_page_type_hint_id) VALUES (?1, ?2, ?3, ?4, 1, ?5, NULL)",
+        (
+            seed_id.to_string(),
+            version_id.to_string(),
+            original_url,
+            canonical_url.as_str(),
+            "kept seed",
+        ),
+    )?;
 
     let repository = SourceRepository::new(&database);
     let source = repository
         .create_or_reuse(&source_input(original_url, None)?)
         .await?;
     repository.mark_file_asset(source.id).await?;
-    let row = connection
-        .prepare("SELECT original_url, canonical_url, enabled, label FROM seeds WHERE id = ?1")
-        .await?
-        .query_row([seed_id.to_string()])
-        .await?;
-    let stored_original: String = row.get(0)?;
-    let stored_canonical: String = row.get(1)?;
-    let enabled: i64 = row.get(2)?;
-    let label: String = row.get(3)?;
+    let (stored_original, stored_canonical, enabled, label): (String, String, i64, String) =
+        connection.query_row(
+            "SELECT original_url, canonical_url, enabled, label FROM seeds WHERE id = ?1",
+            [seed_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
     assert_eq!(stored_original, original_url);
     assert_eq!(stored_canonical, canonical_url.as_str());
     assert_eq!(enabled, 1);

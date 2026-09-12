@@ -7,6 +7,7 @@ use erabi_domain::{
     DiscoveryTransition, DiscoveryTransitionEvidence, SelectorCoverageEvidence,
     SelectorCoverageStatus, TestEvidence, TestEvidenceId, TestKind, TransitionBudget,
 };
+use rusqlite::Connection;
 
 async fn setup() -> Result<
     (
@@ -29,14 +30,11 @@ async fn setup() -> Result<
     Ok((directory, database, crawler, version))
 }
 
-async fn raw_connection(
-    directory: &tempfile::TempDir,
-) -> Result<turso::Connection, Box<dyn std::error::Error>> {
+fn raw_connection(directory: &tempfile::TempDir) -> Result<Connection, Box<dyn std::error::Error>> {
     let path = directory.path().join("erabi.db");
-    let database = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    Ok(database.connect()?)
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+    Ok(connection)
 }
 
 fn evidence(version_id: CrawlerVersionId, config_hash: String, executed_at: &str) -> TestEvidence {
@@ -365,12 +363,13 @@ async fn mismatched_projection_and_malformed_payload_fail_closed()
         .await?;
     let mut value = serde_json::to_value(&stored)?;
     value["id"] = serde_json::json!(TestEvidenceId::new().to_string());
-    let raw = raw_connection(&directory).await?;
-    raw.execute(
-        "UPDATE test_evidence SET evidence_json = ?1 WHERE id = ?2",
-        (serde_json::to_string(&value)?, stored.id.to_string()),
-    )
-    .await?;
+    {
+        let raw = raw_connection(&directory)?;
+        raw.execute(
+            "UPDATE test_evidence SET evidence_json = ?1 WHERE id = ?2",
+            (serde_json::to_string(&value)?, stored.id.to_string()),
+        )?;
+    }
     assert!(matches!(
         repository.read(crawler.id(), version.id(), stored.id).await,
         Err(TestEvidenceRepositoryError::CorruptState)
@@ -382,25 +381,29 @@ async fn mismatched_projection_and_malformed_payload_fail_closed()
     let other_version = crawler_repository
         .create_draft(other_crawler.id(), "operator", "unix:1")
         .await?;
-    raw.execute(
-        "UPDATE test_evidence SET evidence_json = ?1, crawler_version_id = ?2 WHERE id = ?3",
-        (
-            serde_json::to_string(&stored)?,
-            other_version.id().to_string(),
-            stored.id.to_string(),
-        ),
-    )
-    .await?;
+    {
+        let raw = raw_connection(&directory)?;
+        raw.execute(
+            "UPDATE test_evidence SET evidence_json = ?1, crawler_version_id = ?2 WHERE id = ?3",
+            (
+                serde_json::to_string(&stored)?,
+                other_version.id().to_string(),
+                stored.id.to_string(),
+            ),
+        )?;
+    }
     assert!(matches!(
         repository.read(crawler.id(), version.id(), stored.id).await,
         Err(TestEvidenceRepositoryError::CorruptState)
     ));
 
-    raw.execute(
-        "UPDATE test_evidence SET crawler_version_id = ?1, executed_at = ?2 WHERE id = ?3",
-        (version.id().to_string(), "unix:9", stored.id.to_string()),
-    )
-    .await?;
+    {
+        let raw = raw_connection(&directory)?;
+        raw.execute(
+            "UPDATE test_evidence SET crawler_version_id = ?1, executed_at = ?2 WHERE id = ?3",
+            (version.id().to_string(), "unix:9", stored.id.to_string()),
+        )?;
+    }
     assert!(matches!(
         repository.read(crawler.id(), version.id(), stored.id).await,
         Err(TestEvidenceRepositoryError::CorruptState)
@@ -408,15 +411,17 @@ async fn mismatched_projection_and_malformed_payload_fail_closed()
 
     let mut bad_version = serde_json::to_value(&stored)?;
     bad_version["schema_version"] = serde_json::json!(2);
-    raw.execute(
-        "UPDATE test_evidence SET evidence_json = ?1, executed_at = ?2 WHERE id = ?3",
-        (
-            serde_json::to_string(&bad_version)?,
-            stored.executed_at.as_str(),
-            stored.id.to_string(),
-        ),
-    )
-    .await?;
+    {
+        let raw = raw_connection(&directory)?;
+        raw.execute(
+            "UPDATE test_evidence SET evidence_json = ?1, executed_at = ?2 WHERE id = ?3",
+            (
+                serde_json::to_string(&bad_version)?,
+                stored.executed_at.as_str(),
+                stored.id.to_string(),
+            ),
+        )?;
+    }
     assert!(matches!(
         repository.read(crawler.id(), version.id(), stored.id).await,
         Err(TestEvidenceRepositoryError::CorruptState)
@@ -431,12 +436,13 @@ async fn mismatched_projection_and_malformed_payload_fail_closed()
     repository
         .persist_if_configuration_matches(crawler.id(), &stored)
         .await?;
-    let raw = raw_connection(&directory).await?;
-    raw.execute(
-        "UPDATE test_evidence SET evidence_json = ?1 WHERE id = ?2",
-        ("not-json", stored.id.to_string()),
-    )
-    .await?;
+    {
+        let raw = raw_connection(&directory)?;
+        raw.execute(
+            "UPDATE test_evidence SET evidence_json = ?1 WHERE id = ?2",
+            ("not-json", stored.id.to_string()),
+        )?;
+    }
     assert!(matches!(
         repository.read(crawler.id(), version.id(), stored.id).await,
         Err(TestEvidenceRepositoryError::CorruptState)

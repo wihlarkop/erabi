@@ -11,6 +11,7 @@ use erabi_domain::{
     VersionValidationContributor, VersionValidationContributorError, VersionValidationIssue,
     VersionValidationRegistry, VersionValidationSeverity,
 };
+use rusqlite::Connection;
 
 struct WarningContributor;
 
@@ -242,11 +243,6 @@ async fn stale_publish_preflight_is_never_authorization() -> Result<(), Box<dyn 
         .await?;
     assert!(preflight.is_publishable());
 
-    let raw_database =
-        turso::Builder::new_local(data_dir.path().join("erabi.db").to_string_lossy().as_ref())
-            .build()
-            .await?;
-    let connection = raw_database.connect()?;
     let mut configuration = serde_json::to_value(
         &repository
             .version(crawler.id(), version.id())
@@ -254,18 +250,18 @@ async fn stale_publish_preflight_is_never_authorization() -> Result<(), Box<dyn 
             .version,
     )?;
     configuration["seeds"][0]["enabled"] = serde_json::json!(false);
-    connection
-        .execute(
+    {
+        let connection = Connection::open(data_dir.path().join("erabi.db"))?;
+        connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        connection.execute(
             "UPDATE crawler_versions SET semantic_configuration_json = ?1 WHERE id = ?2",
             (configuration.to_string(), version.id().to_string()),
-        )
-        .await?;
-    connection
-        .execute(
+        )?;
+        connection.execute(
             "UPDATE seeds SET enabled = 0 WHERE crawler_version_id = ?1",
             [version.id().to_string()],
-        )
-        .await?;
+        )?;
+    }
 
     let result = repository
         .publish(crawler.id(), version.id(), "operator", "unix:3")
@@ -481,20 +477,17 @@ async fn exact_current_evidence_foreign_reference_and_row_identity_corruption_fa
         )
         .await?;
 
-    let raw_database =
-        turso::Builder::new_local(data_dir.path().join("erabi.db").to_string_lossy().as_ref())
-            .build()
-            .await?;
-    let connection = raw_database.connect()?;
     let original = serde_json::to_value(&evidence)?;
     let mut foreign_reference = original.clone();
     foreign_reference["evaluated_page_type_id"] = serde_json::json!(foreign_page_type.id);
-    connection
-        .execute(
+    {
+        let connection = Connection::open(data_dir.path().join("erabi.db"))?;
+        connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        connection.execute(
             "UPDATE test_evidence SET evidence_json = ?1 WHERE id = ?2",
             (foreign_reference.to_string(), evidence.id.to_string()),
-        )
-        .await?;
+        )?;
+    }
     assert!(matches!(
         crawler_repository
             .publish_validation(crawler.id(), version.id())
@@ -504,12 +497,14 @@ async fn exact_current_evidence_foreign_reference_and_row_identity_corruption_fa
 
     let mut mismatched_identity = original;
     mismatched_identity["id"] = serde_json::json!(TestEvidenceId::new());
-    connection
-        .execute(
+    {
+        let connection = Connection::open(data_dir.path().join("erabi.db"))?;
+        connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        connection.execute(
             "UPDATE test_evidence SET evidence_json = ?1 WHERE id = ?2",
             (mismatched_identity.to_string(), evidence.id.to_string()),
-        )
-        .await?;
+        )?;
+    }
     assert!(matches!(
         crawler_repository
             .publish_validation(crawler.id(), version.id())

@@ -32,4 +32,4 @@ uuid = { version = "1.26.0", features = ["v7"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 erabi-observability = { version = "0.1.0", path = "../erabi-observability", features = ["test-support"] }
-turso = { version = "0.7.2", default-features = false }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }

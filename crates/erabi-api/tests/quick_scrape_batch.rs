@@ -24,10 +24,10 @@ use erabi_db::{
     },
 };
 use erabi_domain::{CrawlRunId, CrawlRunType, RobotsDecision, SourceId};
+use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
-use turso::Connection;
 use uuid::Uuid;
 
 const QUICK_SCRAPE_BATCH_MAX_ITEMS: usize = 8;
@@ -96,54 +96,38 @@ fn runtime_with_database(
     })
 }
 
-async fn raw_connection(directory: &TempDir) -> Result<Connection, Box<dyn std::error::Error>> {
+fn raw_connection(directory: &TempDir) -> Result<Connection, Box<dyn std::error::Error>> {
     let path = directory.path().join("erabi.db");
-    let database = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    let connection = database.connect()?;
-    connection.pragma_update("foreign_keys", "ON").await?;
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
 
-async fn durable_counts(
-    directory: &TempDir,
-) -> Result<(i64, i64, i64), Box<dyn std::error::Error>> {
-    let connection = raw_connection(directory).await?;
-    let runs = connection
-        .prepare("SELECT COUNT(*) FROM crawl_runs")
-        .await?
-        .query_row(())
-        .await?;
-    let jobs = connection
-        .prepare("SELECT COUNT(*) FROM jobs")
-        .await?
-        .query_row(())
-        .await?;
-    let sources = connection
-        .prepare("SELECT COUNT(*) FROM sources")
-        .await?
-        .query_row(())
-        .await?;
-    Ok((runs.get(0)?, jobs.get(0)?, sources.get(0)?))
+fn durable_counts(directory: &TempDir) -> Result<(i64, i64, i64), Box<dyn std::error::Error>> {
+    let connection = raw_connection(directory)?;
+    let runs: i64 =
+        connection.query_row("SELECT COUNT(*) FROM crawl_runs", [], |row| row.get(0))?;
+    let jobs: i64 = connection.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+    let sources: i64 =
+        connection.query_row("SELECT COUNT(*) FROM sources", [], |row| row.get(0))?;
+    Ok((runs, jobs, sources))
 }
 
-async fn insert_corrupt_source_for(
+fn insert_corrupt_source_for(
     directory: &TempDir,
     canonical_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = raw_connection(directory).await?;
-    connection
-        .execute(
-            "INSERT INTO sources (id, collection_id, name, original_url, canonical_url, target_type, status) VALUES (?1, NULL, ?2, ?3, ?4, 'WEB_PAGE', 'ACTIVE')",
-            (
-                SourceId::new().to_string(),
-                "Corrupt source",
-                "https://example.test/different",
-                canonical_url,
-            ),
-        )
-        .await?;
+    let connection = raw_connection(directory)?;
+    connection.execute(
+        "INSERT INTO sources (id, collection_id, name, original_url, canonical_url, target_type, status) VALUES (?1, NULL, ?2, ?3, ?4, 'WEB_PAGE', 'ACTIVE')",
+        (
+            SourceId::new().to_string(),
+            "Corrupt source",
+            "https://example.test/different",
+            canonical_url,
+        ),
+    )?;
     Ok(())
 }
 
@@ -278,7 +262,7 @@ async fn duplicate_equivalent_urls_preserve_positions_and_reuse_only_the_source_
         .read(first_source_id)
         .await?;
     assert_eq!(source.id, second_source_id);
-    assert_eq!(durable_counts(&directory).await?, (2, 2, 1));
+    assert_eq!(durable_counts(&directory)?, (2, 2, 1));
     assert_eq!(runtime.probe_calls.load(Ordering::SeqCst), 2);
     Ok(())
 }
@@ -329,7 +313,7 @@ async fn batch_item_bound_is_validated_before_any_submission_and_empty_is_reject
         "TOO_MANY_QUICK_SCRAPE_ITEMS"
     );
     assert_eq!(too_many_runtime.probe_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(durable_counts(&too_many_directory).await?, (0, 0, 0));
+    assert_eq!(durable_counts(&too_many_directory)?, (0, 0, 0));
 
     let (empty_directory, empty_runtime) = file_backed_runtime().await?;
     let empty = empty_runtime
@@ -340,7 +324,7 @@ async fn batch_item_bound_is_validated_before_any_submission_and_empty_is_reject
     assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(empty).await?["code"], "EMPTY_QUICK_SCRAPE_BATCH");
     assert_eq!(empty_runtime.probe_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(durable_counts(&empty_directory).await?, (0, 0, 0));
+    assert_eq!(durable_counts(&empty_directory)?, (0, 0, 0));
     Ok(())
 }
 
@@ -387,7 +371,7 @@ async fn robots_override_reasons_remain_item_local_and_invalid_reason_does_not_r
 async fn systemic_submission_failure_halts_without_admitting_later_items()
 -> Result<(), Box<dyn std::error::Error>> {
     let (directory, database) = file_backed_database().await?;
-    insert_corrupt_source_for(&directory, "https://example.test/system-failure").await?;
+    insert_corrupt_source_for(&directory, "https://example.test/system-failure")?;
     let runtime = runtime_with_database(database)?;
     let response = runtime
         .router
@@ -435,7 +419,7 @@ async fn systemic_submission_failure_halts_without_admitting_later_items()
     assert!(items[1].get("run_id").is_none());
     assert!(items[1].get("job_id").is_none());
     assert!(items[1].get("source_id").is_none());
-    assert_eq!(durable_counts(&directory).await?, (1, 1, 2));
+    assert_eq!(durable_counts(&directory)?, (1, 1, 2));
     assert_eq!(runtime.probe_calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -536,6 +520,6 @@ async fn batch_route_rejects_unknown_fields_oversized_bodies_and_invalid_mutatio
         "CONTENT_TYPE_NOT_ALLOWED"
     );
     assert_eq!(runtime.probe_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(durable_counts(&directory).await?, (0, 0, 0));
+    assert_eq!(durable_counts(&directory)?, (0, 0, 0));
     Ok(())
 }

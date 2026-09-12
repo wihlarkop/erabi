@@ -3,6 +3,7 @@ use erabi_domain::{
     Crawler, CrawlerVersionGuardrails, DiscoveryTransition, DomainScopeKind, DomainScopePolicy,
     PageTypeDiscoveryGuardrails, Seed, TestEvidenceId, TransitionBudget,
 };
+use rusqlite::Connection;
 
 fn transition(
     id: erabi_domain::DiscoveryTransitionId,
@@ -46,14 +47,11 @@ async fn persistent_setup()
     Ok((data_dir, database, crawler))
 }
 
-async fn raw_connection(
-    data_dir: &tempfile::TempDir,
-) -> Result<turso::Connection, Box<dyn std::error::Error>> {
+fn raw_connection(data_dir: &tempfile::TempDir) -> Result<Connection, Box<dyn std::error::Error>> {
     let database_path = data_dir.path().join("erabi.db");
-    let raw_database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    Ok(raw_database.connect()?)
+    let connection = Connection::open(database_path)?;
+    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+    Ok(connection)
 }
 
 async fn seeded_draft(
@@ -318,13 +316,10 @@ async fn full_seed_projection_mismatches_fail_closed_on_reads()
     let repository = CrawlerRepository::new(&database);
     let (version, seed) = seeded_draft(&database, &crawler).await?;
     assert!(repository.version(crawler.id(), version.id()).await.is_ok());
-    raw_connection(&data_dir)
-        .await?
-        .execute(
-            "UPDATE seeds SET enabled = 0 WHERE id = ?1",
-            [seed.id.to_string()],
-        )
-        .await?;
+    raw_connection(&data_dir)?.execute(
+        "UPDATE seeds SET enabled = 0 WHERE id = ?1",
+        [seed.id.to_string()],
+    )?;
     assert!(matches!(
         repository.version(crawler.id(), version.id()).await,
         Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
@@ -333,13 +328,10 @@ async fn full_seed_projection_mismatches_fail_closed_on_reads()
     let (data_dir, database, crawler) = persistent_setup().await?;
     let repository = CrawlerRepository::new(&database);
     let (version, seed) = seeded_draft(&database, &crawler).await?;
-    raw_connection(&data_dir)
-        .await?
-        .execute(
-            "UPDATE seeds SET canonical_url = ?1 WHERE id = ?2",
-            ("https://other.test/", seed.id.to_string()),
-        )
-        .await?;
+    raw_connection(&data_dir)?.execute(
+        "UPDATE seeds SET canonical_url = ?1 WHERE id = ?2",
+        ("https://other.test/", seed.id.to_string()),
+    )?;
     assert!(matches!(
         repository.version(crawler.id(), version.id()).await,
         Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
@@ -348,10 +340,7 @@ async fn full_seed_projection_mismatches_fail_closed_on_reads()
     let (data_dir, database, crawler) = persistent_setup().await?;
     let repository = CrawlerRepository::new(&database);
     let (version, seed) = seeded_draft(&database, &crawler).await?;
-    raw_connection(&data_dir)
-        .await?
-        .execute("DELETE FROM seeds WHERE id = ?1", [seed.id.to_string()])
-        .await?;
+    raw_connection(&data_dir)?.execute("DELETE FROM seeds WHERE id = ?1", [seed.id.to_string()])?;
     assert!(matches!(
         repository.version(crawler.id(), version.id()).await,
         Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)
@@ -364,9 +353,7 @@ async fn full_seed_projection_mismatches_fail_closed_on_reads()
         "https://example.test/extra-original".parse()?,
         "https://example.test/extra-canonical".parse()?,
     );
-    raw_connection(&data_dir)
-        .await?
-        .execute(
+    raw_connection(&data_dir)?.execute(
             "INSERT INTO seeds (id, crawler_version_id, original_url, canonical_url, enabled, label, entry_page_type_hint_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 extra_seed.id.to_string(),
@@ -377,8 +364,7 @@ async fn full_seed_projection_mismatches_fail_closed_on_reads()
                 Option::<String>::None,
                 Option::<String>::None,
             ),
-        )
-        .await?;
+        )?;
     assert!(matches!(
         repository.version(crawler.id(), version.id()).await,
         Err(erabi_db::repositories::CrawlerRepositoryError::CorruptState)

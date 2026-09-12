@@ -8,6 +8,7 @@ use axum::{
 use erabi_api::{AppState, SecurityConfig, build_router};
 use erabi_db::{ErabiDatabase, MigrationRunner, repositories::CrawlerRepository};
 use erabi_domain::{Crawler, CrawlerVersionGuardrails, Seed};
+use rusqlite::Connection;
 use secrecy::SecretString;
 use tower::ServiceExt;
 
@@ -346,17 +347,15 @@ async fn domain_scope_classification_fails_closed_for_corrupt_seed_projection()
     );
     version.add_seed(seed.clone())?;
     repository.save_draft(&version, "operator", "now").await?;
-    let database_path = data_dir.path().join("erabi.db");
-    let raw_database = turso::Builder::new_local(database_path.to_string_lossy().as_ref())
-        .build()
-        .await?;
-    raw_database
-        .connect()?
-        .execute(
+    {
+        let database_path = data_dir.path().join("erabi.db");
+        let connection = Connection::open(database_path)?;
+        connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        connection.execute(
             "UPDATE seeds SET enabled = 0 WHERE id = ?1",
             [seed.id.to_string()],
-        )
-        .await?;
+        )?;
+    }
 
     let response = router
         .oneshot(request(
